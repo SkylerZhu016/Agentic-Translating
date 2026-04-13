@@ -24,3 +24,17 @@
 - `estimateTokens` 测试中混合文本的期望值需仔细计算（将 CJK 与非 CJK 分开统计）
 - npm install 在 Windows 环境下可能出现 tarball 损坏，使用 `registry.npmmirror.com` 镜像可解决
 
+## Task 4 — Mock LLM Fixture
+
+### 实现要点
+- `test/fixtures/mock-llm.ts`: 裸 `http.createServer`，零框架依赖
+- 8 种 behavior 通过 `setBehavior(model, config)` 或 `x-mock-behavior` 请求头配置
+- `resolveBehaviorConfig` 需要同时检查 `x-mock-model` 请求头和请求体中的 `model` 字段（测试通常只发 model 在 body 中）
+- OpenAI SSE 流式格式：`data: {...{delta:{content}}}⏎⏎`，以 `data: [DONE]⏎⏎` 结束
+- 流式 tool_calls 的 delta 中需要 `index` 字段（区分流式/非流式格式）
+- `close()` 需处理 `ERR_SERVER_NOT_RUNNING`（多次 close 场景）
+- HTTP headers 不支持非 ASCII（如中文），CJK 内容需通过 `setBehavior` 而非 header 传递
+
+### 测试覆盖
+- 25 个测试覆盖所有 8 种 behavior + 服务器生命周期 + CORS + 请求日志 + x-mock-behavior header 覆盖
+
