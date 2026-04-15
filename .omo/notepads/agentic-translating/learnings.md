@@ -1,5 +1,44 @@
 ﻿learnings.md has been created
 
+## Task 3 — 契约层
+
+### 结构
+- `src/lib/contracts/types.ts` — 全部领域类型定义（10接口+2联合类型）
+- `src/lib/contracts/schemas.ts` — zod schema + `ALLOWED_TRANSITIONS`（7状态的SessionState类型+Record）
+- `src/lib/contracts/sse.ts` — `encodeSSE(event,data)` + `parseSSEChunk(buffer, opts?)` 纯函数
+- `src/lib/testids.ts` — `TID` 常量对象（5面板分组，34个testid）
+- `src/lib/constants.ts` — 8个运营常量
+
+### SSE解析器关键决策
+- 使用 `split('\n')` + 逐段扫描而非字符遍历
+- 仅 `hasEventContent && !isLastSegment` 时发射事件（防止 `event: x\n` 误触发）
+- `previousPartial` 参数处理跨块截断（调用方存上一次的完整buffer）
+- CRLF在解析前归一化为LF
+- `event` 字段缺失时默认为空字符串 `''`
+- 注释行（以 `:` 开头）静默忽略
+
+### 测试
+- 4个测试文件，62个测试全部通过
+- schemas: 配置CRUD(10正5反) + C2四阶段(4正4反) + replace_text(2正1反) + 状态机(5)
+- sse: encode(3) + parse(15, 含跨块截断3例、CRLF、注释、DONE、多data行)
+- testids: 7个分组断言 + 全值非空检查
+- constants: 9个精确值断言
+
+### 遇到的坑
+- SSE parser 初始实现对 `event: x\n` 以 `\n` 分割后得到 `['event: x', '']`，将尾部空串误判为blank line → 重写为基于 `isLastSegment` 判断
+- `encodeSSE` 对 string 类型数据不 JSON.stringify（与number/object区分）
+
+
+## 2026-07-17 — Wave 1 Task 5: Prompt Assembly (`{{var}}` interpolation + override priority)
+
+- Created `src/lib/prompts/assemble.ts` and `test/prompts/assemble.test.ts`
+- PromptAssemblyError: extends `Error`, exposes `missingVars: string[]`
+- `interpolate(template, vars, options?)`: replaces `{{var}}` patterns; strict mode throws on missing vars; `keepUnknown` mode preserves unknown `{{var}}` with warnings; `warnUnused` warns about extra vars
+- `resolveTranslatorPrompt(agent, defaultTemplate)`: returns `agent.prompt_override` if non-blank, else `defaultTemplate`
+- `buildTranslatorPrompt(template, params)`: returns `{system, user}` message pair; validates all template vars are satisfied; appends `extra_instructions` to system message
+- `buildStagePrompt(stageTemplate, contextJson, stageSchema)`: returns `{system, user}`; system has JSON-only instruction + schema; user has interpolated context
+- All 32 tests passing: happy paths, missing vars, edge cases
+
 ## Task 6 — 纯逻辑守卫工具集
 
 ### Flash 检测
