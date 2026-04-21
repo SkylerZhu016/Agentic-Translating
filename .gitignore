@@ -1,0 +1,6 @@
+node_modules/
+.next/
+data/
+.omo/evidence/
+playwright-report/
+test-results/
