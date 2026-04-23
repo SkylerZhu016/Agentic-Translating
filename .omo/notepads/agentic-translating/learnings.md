@@ -151,4 +151,31 @@
 - npm 在 Windows 上 tarball 解压会出 `TAR_ENTRY_ERROR ENOENT` 警告但不影响最终安装
 - 并行任务（Task 2-7）的源文件会干扰 Task 1 的 typecheck/vitest，需临时清理
 
+## 2026-07-18 — Wave 1 Task 2: DB 层 (better-sqlite3 单例 + 迁移 + schema v1)
+
+### 实现结构
+- `src/lib/db/index.ts`: `getDb()` / `closeDb()` — `globalThis.__db` 单例，`mkdir -p data`，`PRAGMA journal_mode=WAL` + `foreign_keys=ON`
+- `src/lib/db/migrate.ts`: `migrate(db)` — `migrations` 表追踪 version，按 `migrations/*.sql` 文件名序事务执行，幂等
+- `src/lib/db/migrations/0001_init.sql`: 10 张表 (8 domain + migrations meta + sqlite_sequence auto)
+- `src/lib/db/repositories.ts`: 10 个 repository 工厂函数，带类型化的 insert/getById/update/delete/list 方法
+
+### 关键决策
+- **PNPM**: npm 在 Windows + Node v24 下 tarball 反复损坏 → 改用 pnpm。但 pnpm store prune 会误删 `test/db/*.test.ts` 和 `src/lib/db/*.ts` 两次 (文件被 Write tool 创建后被清理) → 教训是写完立即运行 vitest，不要执行 store prune。
+- **Migration SQL 不含事务标记**: 迁移文件内不能带 `BEGIN`/`COMMIT`，因为 `db.transaction()` 已包裹。双重重叠报 "cannot start a transaction within a transaction"。
+- **better-sqlite3 prepare 类型**: `db.prepare<T>()` 的泛型约束 `T extends {} | unknown[]` 导致简单包装函数报 TS2344。解决方案是去掉包装函数，直接调用 `db.prepare(sql)` + 调用处 `row as any`。
+
+### 测试
+- 3 个测试文件，31 个测试全部通过
+- `singleton.test.ts` (5): 同一实例、globalThis 存储、WAL、foreign_keys、data 目录
+- `migrations.test.ts` (15): 表存在、幂等性、列存在、CHECK/UNIQUE 约束、文件 DB 持久化、级联删除 (memory + file DB 双模式)
+- `repositories.test.ts` (11): 每表 CRUD 往返、FK 级联
+
+### 遇到的坑
+- `test/db/` 下的测试文件被 `pnpm store prune` 删除了两次 (因文件不在 git 跟踪中) → 教训是重要文件先 git add，或避免在未 git init 的目录执行 store prune
+- vitest 3.x 找不到 `.bin/vitest` → 使用 `node node_modules/vitest/vitest.mjs run` 直接调用
+- Node v24 没有 prebuilt better-sqlite3 二进制 → 需要 VS2019 BuildTools + Python 3.12 从源码编译 (耗时约 1 分钟)
+- `ON DELETE CASCADE` 在内存 DB 中需要 `PRAGMA foreign_keys=ON` 才生效 (默认为 OFF)
+- `INSERT INTO sessions` 即使有 DEFAULT 值也必须提供所有 `@param` 参数，不能省略 — better-sqlite3 的 named parameters 需要所有 key 都存在
+
+
 
