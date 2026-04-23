@@ -77,3 +77,78 @@
 ### 测试覆盖
 - 25 个测试覆盖所有 8 种 behavior + 服务器生命周期 + CORS + 请求日志 + x-mock-behavior header 覆盖
 
+## Task 7 — 级联匹配器 + replaceText 执行器 + 版本化 (R4 核心)
+
+### 结构
+- `src/lib/editing/matcher.ts` — `cascadingMatch(oldString, fullText): MatchResult` 五级级联
+- `src/lib/editing/replace.ts` — `applyReplacement` (单次) + `applyReplacementBatch` (事务性)
+- `src/lib/editing/versions.ts` — `nextVersionText` + `diffSummary` (纯函数)
+
+### 五级级联匹配
+1. **exact** — 直搜 `indexOf`，CRLF→LF 规范化后匹配，通过 `NormalizedView.toOrig[]` 映射回原文
+2. **trim_end** — 逐行去尾空格后匹配；仅 oldString 含多余尾空而原文没有时触发（反之 exact 已命中）
+3. **trim** — 逐行去首尾空格；覆盖缩进差异
+4. **unicode** — NFC 规范化 + SMART_QUOTE_MAP(curly→straight, nbsp→space)；NFD→NFC 位置映射用 NFD.length 反推
+5. **fuzzy** — 滑动窗口 Levenshtein DP，阈值 `max(2, len/20)`，仅接受唯一最佳（tieCount>1→ambiguous）
+
+### 位置映射 (`NormalizedView`)
+- 核心抽象：`{text, origStart[], origEnd[]}` — 每个规范化字符映射回原文区间
+- CRLF 映射为 LF：`origStart` 指向 `\r`，`origEnd` = start+2
+- trim 跳过的空格不进入 `text`，也不产生映射条目
+- unicode 中层叠映射：先 per-char 替换→中间层，NFC→终层，逆推 `nfdDecop.length` 确定消耗中间字符数
+
+### 匹配后位置映射到原文区间
+- `mapToOriginal(view, matchStart, matchEnd)`：start = `view.origStart[matchStart]`，end = `view.origEnd[matchEnd-1]`
+- 边界处理：matchEnd == view.text.length 时取最后一个 `origEnd` 或回退到最后一个字符
+
+### 多匹配拒绝策略（所有级别一致）
+- 每级统计全部匹配数：>1 → 立即返回 `{status:'ambiguous', matchCount, level}`，禁止取第一个
+- 典型：`"月" in "明月...月下..."` → matchCount=2，exact 级精确计数
+
+### replace 事务性
+- `applyReplacement`: 基于 matcher 结果做替换（exact/trim_end/trim/unicode/fuzzy 均可）
+- `applyReplacementBatch`: 先拷贝全文，顺序应用逐条 edit；任一条失败→整体回滚原文不动（`ok:false, failedIndex`）
+- `old==new` → no-op 跳过（不报错不修改）
+
+### diffSummary 上下文截取
+- 双向扫描找首尾相同前缀/后缀；截取 40 字符前后文
+- 变更片段超过 40 字符时截断+省略号
+
+### 测试
+- 3 个测试文件，74 个测试全部通过
+- matcher: 5 级各正反用例 + CRLF + 多匹配拒绝 + 位置映射完整性
+- replace: 单次替换 11 例 + 事务性批量 11 例 (含 no-op、回滚、CRLF 保留)
+- versions: nextVersionText 2 例 + diffSummary 10 例 (含上下文、中文、空串、超大文本截断)
+
+### 遇到的坑
+- **exact 优先于 trim_end**：`"hello"` in `"hello   \nworld"` = exact 命中（位置 0），不是 trim_end。trim_end/trim 仅在 exact 零匹配时触发。
+- **不同尾空数量不触发 trim_end**：old `"hello  "` (2尾空) 在 full `"hello     "` (5尾空) 中 exact 即命中子串。需 old 尾空多于 full 才能迫使 exact 失败。
+- **"月" count**：计划原文记作 3，实际只有 2 处（"明月" + "月下"）。据实修正为 2。
+- **模糊唯一性**：fuzzy 滑动窗口含多种长度（±maxDist），同一起点不同终点的窗口可能 tieCount>1 → ambiguous。需要较长唯一字符串确保唯一匹配。
+- **diffSummary 超大文本**：1000 字符全替换时 `changed` 片段本身可达 2000 字符 → 需要截断变更片段（MAX_CHANGED=40）。
+- **node_modules 多次损坏**：npm 在 Windows + Node v24 下 better-sqlite3 原生编译失败 → `--ignore-scripts` 跳过；锁定 vitest 3.2.7 版本；杀残留 node 进程才能 rmdir。
+
+## 2026-07-17 — Wave 1 Task 1: 项目脚手架
+
+### 已存在文件
+- 项目空目录 `.omo/` 和 `初步设想.txt` 已存在；部分其他任务的源文件（src/lib/contracts/, src/lib/guards/ 等）也被预先创建
+- 需要清理这些不属于 Task 1 的文件才能通过 typecheck/vitest
+
+### 关键决策
+- `.npmrc` 加 `install-strategy=hoisted` 避免 npm 在 Windows 上使用虚拟 store 导致的 `.bin` 不可访问
+- `package.json` 的 `typecheck` 脚本使用 `node node_modules/typescript/lib/tsc.js --noEmit` 绕过 Windows 上 `.bin/tsc.cmd` 不可执行的问题
+- Tailwind v4 需要 `postcss.config.mjs` 配合 `@tailwindcss/postcss` 插件
+
+### 验证结果
+- `tsc --noEmit`: 通过 (exit 0)
+- `vitest run`: 1 passed (smoke test)
+- `next build`: 编译成功，产出 `.next/`
+- 违禁依赖检查: CLEAN
+- Git commit: `183c7a9 chore(scaffold): Next.js 15 + TS + Tailwind + vitest 项目脚手架`
+
+### 遇到的坑
+- npm 在 Windows 下 `node_modules/.bin/tsc.cmd` 无法被 PowerShell 直接调用（`Get-Command` 找不到），需要 `node node_modules/typescript/lib/tsc.js` 直接调用
+- npm 在 Windows 上 tarball 解压会出 `TAR_ENTRY_ERROR ENOENT` 警告但不影响最终安装
+- 并行任务（Task 2-7）的源文件会干扰 Task 1 的 typecheck/vitest，需临时清理
+
+
