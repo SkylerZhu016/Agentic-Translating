@@ -177,5 +177,35 @@
 - `ON DELETE CASCADE` 在内存 DB 中需要 `PRAGMA foreign_keys=ON` 才生效 (默认为 OFF)
 - `INSERT INTO sessions` 即使有 DEFAULT 值也必须提供所有 `@param` 参数，不能省略 — better-sqlite3 的 named parameters 需要所有 key 都存在
 
+## 2026-07-18 — Wave 2 Task 14: 内置中文提示词种子
+
+### 实现结构
+- `src/lib/db/seed.ts`: `seed(db)` — 幂等插入 5 条 `is_builtin=1` 模板 + `suppress_flash_warning='0'` 设置
+- `test/db/seed.test.ts`: 15 个测试——幂等性、5 类 kind 齐全、每类仅 1 条、变量完整性、C2 schema 字段一致性、模型无关性
+
+### 5 条内置模板
+1. **translator 默认（诗歌级）**: 角色=精通中英双语的资深文学翻译家；变量 `{{source_lang}}/{{target_lang}}/{{source_text}}/{{extra_instructions}}`；忠实原意/意象再现/音韵节奏/保留结构；仅输出译文
+2. **review（审查）**: 三维度评估（意象忠实度/格律合规/语言自然度）；内嵌 `{"assessments":[{"agent_id","strengths","weaknesses","quality_score","keep"}]}`
+3. **filter（筛选）**: quality_score≥5 基准；内嵌 `{"selected_agent_ids","rationale","rejected_agent_ids"}`
+4. **orchestrate（编排）**: 逐段择优+可融合；内嵌 `{"structure_notes","segment_assignments":[{"segment_index","source_agent_id","source_segment","rationale"}]}`
+5. **assemble（组装）**: 拼接+衔接+风格统一+格律校验；内嵌 `{"final_text","notes"}`
+
+### 关键决策
+- **幂等逻辑**: `list().filter(r => r.is_builtin === 1).length > 0` → 跳过。不是对每类 kind 独立判断
+- **settings 在种子内部设置**: 首次 seed 时写入 `suppress_flash_warning='0'`，但 seed 被跳过时不覆盖已存在的值
+- **模型无关**: 全文不出现 OpenAI/Gemini/Claude/DeepSeek 等厂商名（正则 `\b(?:OpenAI|...)` 验证）
+- **严格 JSON 指令**: 四阶段模板均以中文 "严格只输出 JSON" 结尾，并含 `toMatch(/严格只输出/)` 断言
+
+### C2 Schema 逐字一致
+- 所有嵌在提示词中的 JSON schema 字段名与 `src/lib/contracts/schemas.ts` 第 96-136 行完全一致
+- 测试逐字段验证 review(`assessments/agent_id/strengths/weaknesses/quality_score/keep`)、filter、orchestrate、assemble 的字段名
+- 提示词与校验器零漂移=运行时 schema_error 防御
+
+### 测试
+- 15 个测试全部通过（2 个 describe 块：seed 模板 13 项 + settings 2 项）
+- 覆盖幂等（跑 2 次仍各 1 条）、5 类 kind 齐全、变量全部存在、C2 字段一致、JSON 严格指令、模型无关
+
+### 遇到的坑
+- 初始 settings re-seed 测试逻辑有误：空 DB 上先设 `'1'` 再 `seed()` 时因为无 built-in 模板，seed 总是执行的，会覆盖为 `'0'`。修正为：先 seed 设 `'0'` → 手动改 `'1'` → 再 seed（跳过）→ 断言仍是 `'1'`
 
 
