@@ -208,4 +208,35 @@
 ### 遇到的坑
 - 初始 settings re-seed 测试逻辑有误：空 DB 上先设 `'1'` 再 `seed()` 时因为无 built-in 模板，seed 总是执行的，会覆盖为 `'0'`。修正为：先 seed 设 `'0'` → 手动改 `'1'` → 再 seed（跳过）→ 断言仍是 `'1'`
 
+## 2026-07-18 — Wave 2 Task 13: 会话 + 快照服务
+
+### 实现结构
+- `src/lib/services/session-service.ts`: 导出 `createSessionService(db, repos)` 工厂函数
+- `test/services/session-service.test.ts`: 29 个测试全部通过
+
+### 6 个方法
+1. **createSession({sourceText, sourceLang, targetLang})**: 守卫(非空+长度上限+agents≥1)→深拷贝 config_snapshot→事务插入 sessions(draft)+translation_results(pending)
+2. **getSessionFull(id)**: session + results + stages + versions + messages 一气装配；不存在返回 null
+3. **transitionState(id, to)**: assertTransition → updateState；非法抛 InvalidTransitionError；session 不存在抛 Error
+4. **snapshotConfig(snapshot)**: JSON.parse 还原 ConfigSnapshot（隔离于 live 表变化）
+5. **listSessions({limit, offset})**: 默认 limit=20, offset=0；内存分片（SQL 层无分页）
+6. **markInterruptedInFlight()**: 事务中 UPDATE translation_results(status='streaming') → error/Interrupted on startup；stage_outputs(status='running') → stale
+
+### 关键决策
+- **事务**: `createSession` 和 `markInterruptedInFlight` 使用 `db.transaction()` 确保原子性
+- **快照隔离**: buildConfigSnapshot 读 endpoint/agents/coordinator/prompts 后 JSON.stringify 深拷贝；snapshotConfig 只读存储的 JSON，不碰 live 表
+- **NoAgentsConfiguredError**: code='no_agents_configured' 的自定义错误类
+- **deepClone**: JSON.parse(JSON.stringify(obj)) 方式，适合可序列化数据
+
+### 测试策略
+- 每个 `beforeEach`: 新 `:memory:` DB + exec 迁移 SQL + seed 测试数据（1 endpoint, 2 agents, coordinator, 2 prompts）
+- 守卫测试: SourceRequiredError(空+空白), SourceTooLongError(40K ASCII→~10K tokens>8K), NoAgentsConfiguredError(删 agents)
+- 快照隔离: createSession 后 insert agent-3 + upsert coordinator → snapshotConfig 仍返回旧 2 agents + old model
+- 完整链: draft→translating→translated→coordinating→assembled→refining→done 全通过
+- markInterruptedInFlight: 幂等安全，不伤 pending/complete 记录
+
+### 注意
+- `better-sqlite3` 的 `datetime('now')` 只有秒级精度，同一秒内创建的记录 `updated_at` 相同
+- 内存 DB 不支持 WAL 模式（`PRAGMA journal_mode = WAL` 对 `:memory:` 无效）
+- FK 约束在 `:memory:` DB 中需要显式 `PRAGMA foreign_keys = ON`
 
