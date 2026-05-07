@@ -240,3 +240,77 @@
 - 内存 DB 不支持 WAL 模式（`PRAGMA journal_mode = WAL` 对 `:memory:` 无效）
 - FK 约束在 `:memory:` DB 中需要显式 `PRAGMA foreign_keys = ON`
 
+## 2026-07-18 — Wave 2 Task 9: 阶段上下文构建器 + token 预算 + 聊天上下文截断
+
+### 实现结构
+- `src/lib/context/stage-context.ts`: 导出 `buildStageContext` + `buildChatContext`
+- `test/context/stage-context.test.ts`: 13 个测试全部通过
+
+### buildStageContext (C3 累积式)
+- 输入: `(stage, {sourceText, sourceLang, targetLang, translations: TranslationResult[], priorStages: StageOutput[]}, budget?)`
+- 输出: `{json: StageContextJson, truncated: boolean}`
+- `StageContextJson` 结构: `{source: {text,from,to}, translations: [{agent_id,name,model,text}], prior_stages: {review?,filter?,orchestrate?}}`
+- `agent_snapshot` 字段是 JSON 字符串，需 `JSON.parse` 提取 `name` / `model`；解析失败时 fallback 为 'unknown'
+- 非 review/filter/orchestrate 的 stage 自动排除（assemble 不进入 prior_stages）
+
+### 两阶段截断算法
+1. **Phase 1 — 丢弃 rejected 全文**: 解析 filter 阶段 `parsed_output` 的 `rejected_agent_ids`，对应 translation 的 `text` 置空（保留 agent_id/name/model）
+2. **Phase 2 — 从尾截断**: 遍历 translations 数组尾部，用二分查找找最长可保留前缀 + `…[truncated]…` 标记；若纯标记仍超预算则继续往前处理
+- 每轮修改后 `JSON.stringify` + `estimateTokens` 实时重算
+- 纯函数零 IO
+
+### buildChatContext (C4 聊天截断)
+- 输入: `(messages: ChatMessage[], currentText, maxTurns=CHAT_CONTEXT_TURNS)`
+- 输出: `ChatContextMessage[]`
+- 结构: `[{system: 当前最新全文+编辑工具说明}, ...最近 maxTurns 轮]`
+- 超轮丢弃最旧消息，插入 `{role:'system', content:'（早期 N 轮对话已省略，当前文本为最新版本）'}`
+- 保留原始 `role`（user/assistant/tool）
+
+### 常量来源
+- `STAGE_CONTEXT_TOKEN_BUDGET = 6000` (from `src/lib/constants.ts`)
+- `CHAT_CONTEXT_TURNS = 20` (from `src/lib/constants.ts`)
+- `estimateTokens` (from `src/lib/guards/tokens.ts`)
+
+### 关键决策
+- **JSON → estimateTokens**: 用 `JSON.stringify(fullJson)` 再 estimateTokens，比手动累加更准确（含字段名、引号等 overhead）
+- **二分查找截断**: Phase 2 用二分法(`O(log n)`)而非逐字删除(`O(n)`)找最长前缀，适合 2000+ 字符文本
+- **filter 解析**: 仅 `stage=filter` 且 `parsed_output` 含 `rejected_agent_ids` 字段时触发 phase1；解析异常静默跳过
+- **测试数据**: CJK 字符 `翻.repeat(2000)` = 2000 tokens/条，6 条 ≈ 12K tokens，轻松触发 6000 预算
+
+## 2026-07-18 — Wave 2 Task 8: LLM 客户端（OpenAI 兼容）
+
+### 实现结构
+- `src/lib/llm/client.ts` — 裸 `fetch` 实现，零框架依赖
+- `test/llm/client.test.ts` — 27 个 TDD 测试
+
+### 错误类层次
+- `LLMError` 基类: `{code, status?, retryable, message}`
+- `AuthError(401)` / `RateLimitError(429, retryable)` / `ServerError(5xx, retryable)` / `ClientError(other 4xx)` / `ToolsNotSupportedError` / `TimeoutError(retryable)` / `NetworkError(retryable)` / `AbortedError`
+- `normalizeError(response, bodyText)` — 解析 OpenAI 错误格式并映射到对应子类
+- `mapNetworkError(error)` — 处理 fetch 级网络错误
+
+### 流式 SSE 处理
+- 使用 `parseSSEChunk` 解析 delta chunk（传入累积 rawBuffer，按 `processedEventCount` 跳过已处理事件）
+- **content 累加**: 单独维护 `accumulatedContent` 变量（delta.content 拼接），与 rawBuffer 分离；done 事件中返回完整 content
+- **tool_calls delta 合并**: 按 `index` 分桶累积 `id`/`name`/`argumentsFragments[]`；done 时 join 为完整 JSON
+- 3 片段测试用自定义 inline HTTP server 模拟
+
+### 非流式回退
+- 请求 `stream: true` 但服务器返回 `Content-Type: application/json` → 解析为非流式响应，产出单次 text + done 事件
+
+### 关键决策
+- **异步生成器惰性**: async generator 在调用时不执行，需 `.next()` 才启动 fetch。abort 测试需先 `collectStreamEvents()` 再 abort。
+- **AbortSignal.any**: 超时 signal + 外部 signal 合并；catch 块中通过 `timeoutSignal.aborted && !externalSignal?.aborted` 区分 TimeoutError vs AbortedError
+- **LLMError 不二次包装**: `chatCompletion` catch 块中先检查 `error instanceof LLMError` 并直接 re-throw，避免正常化的错误被 `mapNetworkError` 覆盖为 NetworkError
+
+### 测试覆盖
+- 非流式: content/toolCalls/usage 解析
+- 流式: text delta 逐字产出 + done 完整 content
+- tool_calls: 单 chunk + 3 片 delta 合并为完整 JSON
+- 错误映射: 401/429/500/503→分别子类、400→ToolsNotSupportedError、404/400→ClientError
+- 中止: 外部 signal abort → AbortedError、非流式预中止 → AbortedError
+- 非流式回退: `stream:true` + JSON 响应 → 自动回退
+- AbortSignal.any: 超时 → TimeoutError、外部 signal → AbortedError
+- 网络: connection refused → NetworkError、unreachable → TimeoutError/NetworkError
+- 27 测试全部通过
+
