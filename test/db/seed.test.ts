@@ -156,6 +156,18 @@ describe('seed — built-in prompt templates', () => {
         .not.toMatch(vendorPatterns)
     }
   })
+
+  it('templates are fully general — no poetry/hardcoded format terms', () => {
+    seed(db)
+    const repos = createRepositories(db)
+    const builtins = repos.promptTemplates.list().filter(r => r.is_builtin === 1)
+    // Must NOT contain: 五言, 七言, 诗歌, 平仄, 押韵, 格律, 音韵, 五字
+    const poetryPatterns = /(?:五言|七言|诗歌|平仄|押韵|格律|音韵|五字|韵式|诗|词牌|律诗|绝句|古体|近体|新诗|现代诗)/i
+    for (const t of builtins) {
+      expect(t.content, `kind=${t.kind} should not contain poetry-specific terms`)
+        .not.toMatch(poetryPatterns)
+    }
+  })
 })
 
 describe('seed — default settings', () => {
