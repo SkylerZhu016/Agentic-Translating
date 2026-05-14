@@ -92,6 +92,70 @@ export interface ChatMessage {
   created_at: string
 }
 
+// ── DB Row types (full columns from SQL schema) ─────────────────
+
+/** Full sessions row (includes created_at / updated_at) */
+export interface SessionRow {
+  id: string
+  source_text: string
+  source_lang: string
+  target_lang: string
+  state: string
+  config_snapshot: string
+  created_at: string
+  updated_at: string
+}
+
+/** Full translation_results row */
+export interface TranslationResultRow {
+  id: number
+  session_id: string
+  agent_key: string
+  agent_snapshot: string
+  status: 'pending' | 'streaming' | 'complete' | 'error'
+  output_text: string | null
+  error: string | null
+  latency_ms: number | null
+  attempt: number
+  updated_at: string
+}
+
+/** Full stage_outputs row */
+export interface StageOutputRow {
+  id: number
+  session_id: string
+  stage: Stage
+  status: 'pending' | 'running' | 'complete' | 'failed' | 'stale'
+  prompt_used: string | null
+  raw_output: string | null
+  parsed_output: string | null
+  error: string | null
+  created_at: string
+}
+
+/** Full final_versions row */
+export interface FinalVersionRow {
+  id: number
+  session_id: string
+  version_no: number
+  text: string
+  source: 'assemble' | 'edit' | 'restore'
+  created_at: string
+}
+
+/** Full chat_messages row */
+export interface ChatMessageRow {
+  id: number
+  session_id: string
+  role: 'user' | 'assistant' | 'tool'
+  content: string
+  tool_calls: string | null
+  tool_results: string | null
+  version_id: number | null
+  created_at: string
+}
+
+// ────────────────────────────────────────────────────────────────
 /** Deep-frozen config snapshot at session creation */
 export interface ConfigSnapshot {
   endpoint: EndpointConfig | null
