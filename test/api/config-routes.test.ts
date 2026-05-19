@@ -18,8 +18,11 @@ function mockReq(method: string, url: string, body?: unknown): NextRequest {
     body: body !== undefined ? JSON.stringify(body) : undefined,
   })
 
-  // Cast to NextRequest — provides .json() and .nextUrl
-  return req as unknown as NextRequest
+  // Patch nextUrl onto the Request (Next.js App Router provides this)
+  const reqWithNextUrl = req as Request & { nextUrl: URL }
+  reqWithNextUrl.nextUrl = urlObj
+
+  return reqWithNextUrl as unknown as NextRequest
 }
 
 // ── DB setup ───────────────────────────────────────────────────────
@@ -31,10 +34,19 @@ const MIGRATION_SQL = fs.readFileSync(
 function createTestDb() {
   const db = new Database(':memory:')
   db.pragma('foreign_keys = ON')
+
+  // Run domain schema
   db.exec(MIGRATION_SQL)
 
+  // Create migrations tracking table (normally created by migrate() function)
+  db.exec(`CREATE TABLE IF NOT EXISTS migrations (
+    version INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    applied_at TEXT DEFAULT (datetime('now'))
+  )`)
+
   // Insert migration record so migrate() is a no-op when handlers call it
-  db.prepare('INSERT OR REPLACE INTO migrations (version, name) VALUES (?, ?)').run(1, '0001_init.sql')
+  db.prepare('INSERT INTO migrations (version, name) VALUES (?, ?)').run(1, '0001_init.sql')
 
   // Set global singleton so getDb() returns this in-memory instance
   ;(globalThis as Record<string, unknown>).__db = db
