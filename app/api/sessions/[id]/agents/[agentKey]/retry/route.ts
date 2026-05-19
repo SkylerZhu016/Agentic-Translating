@@ -100,7 +100,8 @@ export async function POST(
   };
 
   // ── Mark result as streaming ───────────────────────────────────
-  const trRow = repos.translationResults.getBySessionAndAgent(id, agentKey);
+  let trRow = repos.translationResults.getBySessionAndAgent(id, agentKey);
+  let newAttempt = trRow ? trRow.attempt + 1 : 0;
   if (trRow) {
     repos.translationResults.update({
       id: trRow.id,
@@ -108,7 +109,7 @@ export async function POST(
       output_text: null,
       error: null,
       latency_ms: null,
-      attempt: trRow.attempt + 1,
+      attempt: newAttempt,
     });
   }
 
@@ -175,7 +176,7 @@ export async function POST(
             latency_ms: agentStartTime
               ? Math.round(performance.now() - agentStartTime)
               : null,
-            attempt: trRow.attempt,
+            attempt: newAttempt,
           });
         }
 
@@ -200,7 +201,7 @@ export async function POST(
             output_text: null,
             error: 'Retry pipeline failed',
             latency_ms: null,
-            attempt: trRow.attempt,
+            attempt: newAttempt,
           });
         }
 

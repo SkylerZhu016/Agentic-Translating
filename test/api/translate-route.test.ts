@@ -1,0 +1,590 @@
+// ---------------------------------------------------------------------------
+// Wave 3 Task 17 — Integration tests for translate + retry SSE routes
+// ---------------------------------------------------------------------------
+// Uses :memory: DB, mock LLM (chatCompletion), and SSE event assertion.
+// Covers:
+//   - C1 event sequence validation
+//   - Mixed success/error agent results → correct DB persistence
+//   - Invalid state transition → 409
+//   - Single-agent retry → only specified agent_key updated
+// ---------------------------------------------------------------------------
+
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import Database from 'better-sqlite3';
+import fs from 'fs';
+import path from 'path';
+import { createRepositories, type Repositories } from '../../src/lib/db/repositories';
+import { createSessionService } from '../../src/lib/services/session-service';
+import { parseSSEChunk, type SSEEvent } from '../../src/lib/contracts/sse';
+import type { LLMStreamEvent } from '../../src/lib/llm/client';
+
+// ── Hoisted mocks (must be defined before vi.mock which is hoisted) ────────
+const { mockChatCompletion, mockGetDb } = vi.hoisted(() => ({
+  mockChatCompletion: vi.fn<
+    (
+      endpoint: { baseUrl: string; apiKey: string },
+      request: { model: string; messages: Array<{ role: string; content: string }>; stream?: boolean },
+    ) => Promise<AsyncIterable<LLMStreamEvent>>
+  >(),
+  mockGetDb: vi.fn<() => Database.Database>(),
+}));
+
+vi.mock('@/src/lib/llm/client', async (importOriginal) => {
+  const mod = await importOriginal<typeof import('../../src/lib/llm/client')>();
+  return { ...mod, chatCompletion: mockChatCompletion };
+});
+
+vi.mock('@/src/lib/db', () => ({
+  getDb: mockGetDb,
+}));
+
+// ── Route handlers (imported AFTER mocks are set up) ───────────────────────
+import { POST as translatePost } from '../../app/api/sessions/[id]/translate/route';
+import { POST as retryPost } from '../../app/api/sessions/[id]/agents/[agentKey]/retry/route';
+
+// ── Migration SQL ──────────────────────────────────────────────────────────
+const MIGRATION_SQL = fs.readFileSync(
+  path.join(process.cwd(), 'src/lib/db/migrations/0001_init.sql'),
+  'utf-8',
+);
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+/** Build an async generator that yields one char at a time, then done. */
+async function* mockStream(content: string): AsyncIterable<LLMStreamEvent> {
+  for (const char of content) {
+    yield { type: 'text', content: char };
+    // Yield to event loop so parallel fan-out agents can interleave
+    await new Promise((r) => setTimeout(r, 0));
+  }
+  yield { type: 'done', content };
+}
+
+/** Collect SSE events from a Response body. */
+async function collectSSEEvents(response: Response): Promise<SSEEvent[]> {
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+  }
+  return parseSSEChunk(buffer);
+}
+
+/** Helper to extract data objects from a series of SSE events by event name. */
+function eventsByName(events: SSEEvent[], name: string): unknown[] {
+  return events
+    .filter((e) => e.event === name)
+    .map((e) => {
+      try {
+        return JSON.parse(e.data);
+      } catch {
+        return e.data;
+      }
+    });
+}
+
+/** Create a mock Request with optional body for POST routes. */
+function mockPostRequest(sessionId: string, agentKey?: string): Request {
+  const url = agentKey
+    ? `http://localhost/api/sessions/${sessionId}/agents/${agentKey}/retry`
+    : `http://localhost/api/sessions/${sessionId}/translate`;
+  return new Request(url, { method: 'POST' });
+}
+
+// ── Suite ──────────────────────────────────────────────────────────────────
+
+describe('Translate SSE Route (fanout + retry)', () => {
+  let db: Database.Database;
+  let repos: Repositories;
+  let service: ReturnType<typeof createSessionService>;
+
+  const DEF_SOURCE = {
+    sourceText: 'Hello world',
+    sourceLang: 'English',
+    targetLang: 'Chinese',
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+
+    db = new Database(':memory:');
+    db.pragma('foreign_keys = ON');
+    db.exec(MIGRATION_SQL);
+
+    mockGetDb.mockReturnValue(db);
+
+    repos = createRepositories(db);
+    service = createSessionService(db, repos);
+
+    // ── Seed config ─────────────────────────────────────────────
+    repos.endpoints.insert({
+      name: 'test-ep',
+      base_url: 'https://api.test.com',
+      api_key: 'sk-test',
+    });
+    repos.coordinatorConfig.upsert({
+      endpoint_id: 1,
+      model: 'gpt-4',
+      chat_endpoint_id: 1,
+      chat_model: 'gpt-4-chat',
+    });
+    repos.translatorAgents.insert({
+      name: 'agent-alpha',
+      endpoint_id: 1,
+      model: 'gpt-4',
+      prompt_override: null,
+      sort_order: 0,
+    });
+    repos.translatorAgents.insert({
+      name: 'agent-beta',
+      endpoint_id: 1,
+      model: 'claude-3',
+      prompt_override: null,
+      sort_order: 1,
+    });
+    repos.promptTemplates.insert({
+      kind: 'translator',
+      name: 'default',
+      content: 'Translate from {{source_lang}} to {{target_lang}}: {{source_text}}',
+      is_builtin: 1,
+    });
+    repos.promptTemplates.insert({
+      kind: 'review',
+      name: 'default',
+      content: 'Review this translation',
+      is_builtin: 1,
+    });
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  // =========================================================================
+  // TRANSLATE ROUTE
+  // =========================================================================
+
+  describe('POST /api/sessions/[id]/translate', () => {
+    it('emits full C1 event sequence on success (2 agents)', async () => {
+      // Arrange: both agents succeed
+      mockChatCompletion.mockImplementation(async (_ep, _req) => {
+        return mockStream('translated text');
+      });
+
+      const session = service.createSession(DEF_SOURCE);
+      const req = mockPostRequest(session.id);
+
+      // Act
+      const response = await translatePost(req, {
+        params: Promise.resolve({ id: session.id }),
+      });
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get('content-type')).toBe('text/event-stream');
+
+      const events = await collectSSEEvents(response);
+
+      // Assert: C1 event sequence
+      const agentStarts = eventsByName(events, 'agent_start');
+      expect(agentStarts).toHaveLength(2);
+      const agentKeys = agentStarts.map((s: any) => s.agent_key).sort();
+      expect(agentKeys).toEqual(['agent-alpha', 'agent-beta']);
+
+      // Token events exist (interleaved from parallel agents)
+      const tokens = eventsByName(events, 'token');
+      expect(tokens.length).toBeGreaterThan(0);
+      const tokenAgentKeys = new Set(tokens.map((t: any) => t.agent_key));
+      expect(tokenAgentKeys.has('agent-alpha') || tokenAgentKeys.has('agent-beta')).toBe(true);
+
+      // Agent complete events
+      const completes = eventsByName(events, 'agent_complete');
+      expect(completes).toHaveLength(2);
+      for (const c of completes as any[]) {
+        expect(c.status).toBe('complete');
+        expect(c.content).toBe('translated text');
+      }
+
+      // fanout_complete + done
+      const fanoutComplete = eventsByName(events, 'fanout_complete');
+      expect(fanoutComplete).toHaveLength(1);
+      expect((fanoutComplete[0] as any).succeeded).toBe(2);
+      expect((fanoutComplete[0] as any).failed).toBe(0);
+
+      const doneEvents = eventsByName(events, 'done');
+      expect(doneEvents).toHaveLength(1);
+
+      // Done is last event
+      const lastEvent = events[events.length - 1];
+      expect(lastEvent.event).toBe('done');
+    });
+
+    it('persists translation_results as complete in DB', async () => {
+      mockChatCompletion.mockImplementation(async () => mockStream('你好世界'));
+
+      const session = service.createSession(DEF_SOURCE);
+      const req = mockPostRequest(session.id);
+
+      const response = await translatePost(req, {
+        params: Promise.resolve({ id: session.id }),
+      });
+      await collectSSEEvents(response); // consume stream
+
+      const results = repos.translationResults.listBySession(session.id);
+      expect(results).toHaveLength(2);
+      for (const r of results) {
+        expect(r.status).toBe('complete');
+        expect(r.output_text).toBe('你好世界');
+        expect(r.error).toBeNull();
+        expect(r.latency_ms).toBeGreaterThan(0);
+        expect(r.attempt).toBe(1);
+      }
+    });
+
+    it('handles 1 mock error agent with status=error, rest complete', async () => {
+      let callCount = 0;
+      mockChatCompletion.mockImplementation(async () => {
+        callCount++;
+        if (callCount === 2) {
+          // Second agent errors (non-retryable)
+          throw new Error('Mock agent failure');
+        }
+        return mockStream('success text');
+      });
+
+      const session = service.createSession(DEF_SOURCE);
+      const req = mockPostRequest(session.id);
+
+      const response = await translatePost(req, {
+        params: Promise.resolve({ id: session.id }),
+      });
+      const events = await collectSSEEvents(response);
+
+      // agent_start × 2
+      const starts = eventsByName(events, 'agent_start');
+      expect(starts).toHaveLength(2);
+
+      // agent_complete × 1, agent_error × 1
+      const completes = eventsByName(events, 'agent_complete');
+      expect(completes).toHaveLength(1);
+
+      const errors = eventsByName(events, 'agent_error');
+      expect(errors).toHaveLength(1);
+      expect((errors[0] as any).error).toBe('Mock agent failure');
+
+      // fanout_complete shows 1 succeeded, 1 failed
+      const fanout = eventsByName(events, 'fanout_complete')[0] as any;
+      expect(fanout.succeeded).toBe(1);
+      expect(fanout.failed).toBe(1);
+
+      // done
+      expect(eventsByName(events, 'done')).toHaveLength(1);
+
+      // DB: first agent complete, second error
+      const dbResults = repos.translationResults.listBySession(session.id);
+      const alpha = dbResults.find((r) => r.agent_key === 'agent-alpha')!;
+      expect(alpha.status).toBe('complete');
+      expect(alpha.output_text).toBe('success text');
+
+      const beta = dbResults.find((r) => r.agent_key === 'agent-beta')!;
+      expect(beta.status).toBe('error');
+      expect(beta.error).toBe('Mock agent failure');
+    });
+
+    it('returns 404 for non-existent session', async () => {
+      const req = mockPostRequest('nonexistent-id');
+
+      const response = await translatePost(req, {
+        params: Promise.resolve({ id: 'nonexistent-id' }),
+      });
+
+      expect(response.status).toBe(404);
+      const body = await response.json();
+      expect(body.error).toBe('Session not found');
+    });
+
+    it('returns 409 when state is coordinating (invalid_state_transition)', async () => {
+      const session = service.createSession(DEF_SOURCE);
+      // Transition to translated first, then coordinating
+      service.transitionState(session.id, 'translating');
+      service.transitionState(session.id, 'translated');
+      service.transitionState(session.id, 'coordinating');
+
+      const req = mockPostRequest(session.id);
+      const response = await translatePost(req, {
+        params: Promise.resolve({ id: session.id }),
+      });
+
+      expect(response.status).toBe(409);
+      const body = await response.json();
+      expect(body.code).toBe('invalid_state_transition');
+      expect(body.error).toContain('coordinating');
+    });
+
+    it('allows re-translate from translated state', async () => {
+      mockChatCompletion.mockImplementation(async () => mockStream('re-translated'));
+
+      const session = service.createSession(DEF_SOURCE);
+      // Transition to translated first
+      service.transitionState(session.id, 'translating');
+      service.transitionState(session.id, 'translated');
+
+      const req = mockPostRequest(session.id);
+      const response = await translatePost(req, {
+        params: Promise.resolve({ id: session.id }),
+      });
+
+      expect(response.status).toBe(200);
+      const events = await collectSSEEvents(response);
+      expect(eventsByName(events, 'agent_complete')).toHaveLength(2);
+
+      // State should still be translated (re-translated)
+      const updated = repos.sessions.getById(session.id)!;
+      expect(updated.state).toBe('translated');
+    });
+
+    it('transitions session state from draft to translated', async () => {
+      mockChatCompletion.mockImplementation(async () => mockStream('done'));
+
+      const session = service.createSession(DEF_SOURCE);
+      expect(session.state).toBe('draft');
+
+      const req = mockPostRequest(session.id);
+      const response = await translatePost(req, {
+        params: Promise.resolve({ id: session.id }),
+      });
+      await collectSSEEvents(response);
+
+      const updated = repos.sessions.getById(session.id)!;
+      expect(updated.state).toBe('translated');
+    });
+
+    it('propagates abort signal via ReadableStream cancel', async () => {
+      // LLM mock that produces tokens and checks signal.aborted
+      let aborted = false;
+      mockChatCompletion.mockImplementation(async (_ep, req) => {
+        const signal = req.signal;
+        async function* stuckStream(): AsyncIterable<LLMStreamEvent> {
+          try {
+            while (!signal?.aborted) {
+              yield { type: 'text', content: 'x' };
+              await new Promise((r) => setTimeout(r, 10));
+            }
+            // Signal triggered abort
+            aborted = true;
+            return;
+          } catch {
+            aborted = true;
+          }
+        }
+        return stuckStream();
+      });
+
+      const session = service.createSession(DEF_SOURCE);
+      const req = mockPostRequest(session.id);
+
+      const response = await translatePost(req, {
+        params: Promise.resolve({ id: session.id }),
+      });
+
+      // Start consuming but cancel after a few tokens
+      const reader = response.body!.getReader();
+      const decoder = new TextDecoder();
+
+      // Read first few chunks
+      let totalRead = 0;
+      while (totalRead < 3) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const text = decoder.decode(value, { stream: true });
+        if (text.includes('token')) totalRead++;
+      }
+
+      // Cancel the stream (simulates client disconnect)
+      await reader.cancel();
+
+      // Small wait for abort to propagate
+      await new Promise((r) => setTimeout(r, 100));
+      expect(aborted).toBe(true);
+    });
+
+    it('returns 400 when no agents in snapshot', async () => {
+      // Delete all agents before creating session, or manipulate snapshot
+      const session = service.createSession(DEF_SOURCE);
+
+      // Overwrite the snapshot with empty agents array
+      db.prepare(
+        "UPDATE sessions SET config_snapshot = ? WHERE id = ?",
+      ).run(
+        JSON.stringify({
+          endpoint: { id: 1, name: 'ep', base_url: 'https://x.com', api_key: 'sk', created_at: '' },
+          agents: [],
+          coordinator: null,
+          prompts: {},
+        }),
+        session.id,
+      );
+
+      const req = mockPostRequest(session.id);
+      const response = await translatePost(req, {
+        params: Promise.resolve({ id: session.id }),
+      });
+
+      expect(response.status).toBe(400);
+      const body = await response.json();
+      expect(body.error).toContain('No translator agents');
+    });
+  });
+
+  // =========================================================================
+  // RETRY ROUTE
+  // =========================================================================
+
+  describe('POST /api/sessions/[id]/agents/[agentKey]/retry', () => {
+    it('retries only the specified agent_key', async () => {
+      mockChatCompletion.mockImplementation(async () => mockStream('retry result'));
+
+      const session = service.createSession(DEF_SOURCE);
+      service.transitionState(session.id, 'translating');
+      service.transitionState(session.id, 'translated');
+
+      // Set both results to complete with different content first
+      const alphaRow = repos.translationResults.getBySessionAndAgent(
+        session.id,
+        'agent-alpha',
+      )!;
+      const betaRow = repos.translationResults.getBySessionAndAgent(
+        session.id,
+        'agent-beta',
+      )!;
+      repos.translationResults.update({
+        id: alphaRow.id, status: 'complete', output_text: 'alpha old',
+        error: null, latency_ms: 100, attempt: 1,
+      });
+      repos.translationResults.update({
+        id: betaRow.id, status: 'complete', output_text: 'beta old',
+        error: null, latency_ms: 100, attempt: 1,
+      });
+
+      // Retry agent-alpha only
+      const req = mockPostRequest(session.id, 'agent-alpha');
+      const response = await retryPost(req, {
+        params: Promise.resolve({ id: session.id, agentKey: 'agent-alpha' }),
+      });
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get('content-type')).toBe('text/event-stream');
+
+      const events = await collectSSEEvents(response);
+
+      // Only 1 agent_start (agent-alpha)
+      const starts = eventsByName(events, 'agent_start');
+      expect(starts).toHaveLength(1);
+      expect((starts[0] as any).agent_key).toBe('agent-alpha');
+
+      // Only 1 agent_complete
+      const completes = eventsByName(events, 'agent_complete');
+      expect(completes).toHaveLength(1);
+      expect((completes[0] as any).agent_key).toBe('agent-alpha');
+
+      // fanout_complete → succeeded=1, failed=0
+      const fanout = eventsByName(events, 'fanout_complete')[0] as any;
+      expect(fanout.succeeded).toBe(1);
+      expect(fanout.failed).toBe(0);
+
+      // done
+      expect(eventsByName(events, 'done')).toHaveLength(1);
+
+      // DB: only agent-alpha updated; agent-beta untouched
+      const results = repos.translationResults.listBySession(session.id);
+      const alpha = results.find((r) => r.agent_key === 'agent-alpha')!;
+      expect(alpha.status).toBe('complete');
+      expect(alpha.output_text).toBe('retry result');
+      expect(alpha.attempt).toBe(2); // incremented from 1
+
+      const beta = results.find((r) => r.agent_key === 'agent-beta')!;
+      expect(beta.status).toBe('complete');
+      expect(beta.output_text).toBe('beta old'); // untouched
+      expect(beta.attempt).toBe(1);
+    });
+
+    it('returns 400 when agent_key not in snapshot', async () => {
+      const session = service.createSession(DEF_SOURCE);
+
+      const req = mockPostRequest(session.id, 'nonexistent-agent');
+      const response = await retryPost(req, {
+        params: Promise.resolve({
+          id: session.id,
+          agentKey: 'nonexistent-agent',
+        }),
+      });
+
+      expect(response.status).toBe(400);
+      const body = await response.json();
+      expect(body.error).toContain('not found');
+    });
+
+    it('returns 409 from coordinating state', async () => {
+      const session = service.createSession(DEF_SOURCE);
+      service.transitionState(session.id, 'translating');
+      service.transitionState(session.id, 'translated');
+      service.transitionState(session.id, 'coordinating');
+
+      const req = mockPostRequest(session.id, 'agent-alpha');
+      const response = await retryPost(req, {
+        params: Promise.resolve({
+          id: session.id,
+          agentKey: 'agent-alpha',
+        }),
+      });
+
+      expect(response.status).toBe(409);
+      const body = await response.json();
+      expect(body.code).toBe('invalid_state_transition');
+    });
+
+    it('returns 404 for non-existent session', async () => {
+      const req = mockPostRequest('no-such-session', 'agent-alpha');
+      const response = await retryPost(req, {
+        params: Promise.resolve({
+          id: 'no-such-session',
+          agentKey: 'agent-alpha',
+        }),
+      });
+
+      expect(response.status).toBe(404);
+    });
+
+    it('handles retry agent error and updates DB as error', async () => {
+      mockChatCompletion.mockImplementation(async () => {
+        throw new Error('Retry agent failure');
+      });
+
+      const session = service.createSession(DEF_SOURCE);
+
+      const req = mockPostRequest(session.id, 'agent-alpha');
+      const response = await retryPost(req, {
+        params: Promise.resolve({ id: session.id, agentKey: 'agent-alpha' }),
+      });
+      const events = await collectSSEEvents(response);
+
+      // agent_error emitted
+      const errors = eventsByName(events, 'agent_error');
+      expect(errors).toHaveLength(1);
+      expect((errors[0] as any).error).toBe('Retry agent failure');
+
+      // fanout_complete: succeeded=0, failed=1
+      const fanout = eventsByName(events, 'fanout_complete')[0] as any;
+      expect(fanout.succeeded).toBe(0);
+      expect(fanout.failed).toBe(1);
+
+      // DB: agent-alpha is error
+      const results = repos.translationResults.listBySession(session.id);
+      const alpha = results.find((r) => r.agent_key === 'agent-alpha')!;
+      expect(alpha.status).toBe('error');
+      expect(alpha.error).toBe('Retry agent failure');
+    });
+  });
+});
