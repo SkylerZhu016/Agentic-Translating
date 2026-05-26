@@ -5,15 +5,15 @@
 // ---------------------------------------------------------------------------
 
 import { NextResponse } from 'next/server';
-import { getDb } from '@/lib/db';
-import { createRepositories } from '@/lib/db/repositories';
-import { createSessionService } from '@/lib/services/session-service';
-import { runStage, markDownstreamStale } from '@/lib/orchestration/pipeline';
-import { buildStageContext } from '@/lib/context/stage-context';
-import { chatCompletion } from '@/lib/llm/client';
-import { encodeSSE } from '@/lib/contracts/sse';
-import type { Stage, StageOutput, TranslationResult } from '@/lib/contracts/types';
-import type { SessionContext, StageRunResult } from '@/lib/orchestration/pipeline';
+import { getDb } from '@/src/lib/db';
+import { createRepositories } from '@/src/lib/db/repositories';
+import { createSessionService } from '@/src/lib/services/session-service';
+import { runStage, markDownstreamStale } from '@/src/lib/orchestration/pipeline';
+import { buildStageContext } from '@/src/lib/context/stage-context';
+import { chatCompletion } from '@/src/lib/llm/client';
+import { encodeSSE } from '@/src/lib/contracts/sse';
+import type { Stage, StageOutput, TranslationResult } from '@/src/lib/contracts/types';
+import type { SessionContext, StageRunResult } from '@/src/lib/orchestration/pipeline';
 
 // =============================================================================
 // Constants
@@ -146,7 +146,19 @@ export async function POST(
     }
   }
 
-  // ── 5. Guard: prerequisite ────────────────────────────────────
+  // ── 5. Guard: concurrency (no other stage running for this session) ──
+  const allStages = repos.stageOutputs.listBySession(sessionId);
+  const runningStage = allStages.find(
+    (s) => s.stage !== stage && s.status === 'running',
+  );
+  if (runningStage) {
+    return NextResponse.json(
+      { error: `Stage '${runningStage.stage}' is already running for this session.` },
+      { status: 409 },
+    );
+  }
+
+  // ── 6. Guard: prerequisite ────────────────────────────────────
   const prereq = getPrerequisite(stage);
   if (prereq) {
     const prereqRow = repos.stageOutputs.getBySessionAndStage(sessionId, prereq);
@@ -169,18 +181,6 @@ export async function POST(
         { status: 409 },
       );
     }
-  }
-
-  // ── 6. Guard: concurrency (no other stage running for this session) ──
-  const allStages = repos.stageOutputs.listBySession(sessionId);
-  const runningStage = allStages.find(
-    (s) => s.stage !== stage && s.status === 'running',
-  );
-  if (runningStage) {
-    return NextResponse.json(
-      { error: `Stage '${runningStage.stage}' is already running for this session.` },
-      { status: 409 },
-    );
   }
 
   // ── 7. Mark current stage as 'running' (UPSERT stage_outputs) ──
