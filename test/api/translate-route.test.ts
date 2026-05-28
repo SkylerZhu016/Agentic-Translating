@@ -365,7 +365,7 @@ describe('Translate SSE Route (fanout + retry)', () => {
       // LLM mock that produces tokens and checks signal.aborted
       let aborted = false;
       mockChatCompletion.mockImplementation(async (_ep, req) => {
-        const signal = req.signal;
+        const signal = (req as { signal?: AbortSignal }).signal;
         async function* stuckStream(): AsyncIterable<LLMStreamEvent> {
           try {
             while (!signal?.aborted) {

@@ -9,9 +9,9 @@ import path from 'path'
 
 import { createRepositories } from '../../src/lib/db/repositories'
 import { createSessionService } from '../../src/lib/services/session-service'
-import { createHandlers as createSessionHandlers } from '../../app/api/sessions/route'
-import { createHandlers as createSessionDetailHandlers } from '../../app/api/sessions/[id]/route'
-import { createHandlers as createRestoreHandlers } from '../../app/api/sessions/[id]/versions/[versionNo]/restore/route'
+import { createHandlers as createSessionHandlers } from '../../app/api/sessions/handlers'
+import { createHandlers as createSessionDetailHandlers } from '../../app/api/sessions/[id]/handlers'
+import { createHandlers as createRestoreHandlers } from '../../app/api/sessions/[id]/versions/[versionNo]/restore/handlers'
 
 // ── Inline migration SQL ─────────────────────────────────────────
 const MIGRATION_SQL = fs.readFileSync(

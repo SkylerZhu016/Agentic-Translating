@@ -264,7 +264,7 @@ export async function startMockLLM(
       const created = Math.floor(Date.now() / 1000);
       const model: string =
         (body != null && typeof body === 'object' && 'model' in body
-          ? (body as Record<string, unknown>).model
+          ? ((body as Record<string, unknown>).model as string | undefined)
           : undefined) ?? 'mock-model';
 
       const hasTools =
