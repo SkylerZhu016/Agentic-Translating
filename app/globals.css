@@ -1,1 +1,157 @@
 @import "tailwindcss";
+
+/* ==========================================================================
+   设计 Tokens —— 墨色 × 宣纸（单色浅色主题）
+   Tailwind v4 @theme: 生成颜色/字体/圆角/阴影等工具类
+   ========================================================================== */
+@theme {
+  /* ---- 字体：中文优先（系统宋/黑 + 西文 serif 混搭），离线安全 ---- */
+  --font-serif: "Songti SC", "STSong", "Noto Serif CJK SC", "Source Han Serif SC",
+    "SimSun", Georgia, "Times New Roman", serif;
+  --font-sans: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+    "Noto Sans CJK SC", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "Sarasa Mono SC", "JetBrains Mono", ui-monospace, SFMono-Regular,
+    Menlo, Consolas, "Courier New", monospace;
+
+  /* ---- 色板：宣纸（暖白纸面） ---- */
+  --color-paper: #f7f4ec;        /* 页面基底 */
+  --color-paper-raise: #fdfcf7;  /* 抬升面（卡片/输入） */
+  --color-paper-sink: #efece1;   /* 下沉面（hover/填充） */
+
+  /* ---- 色板：墨色（单色阶） ---- */
+  --color-ink: #1c1a15;          /* 主文 */
+  --color-ink-2: #45413a;        /* 次文 */
+  --color-ink-3: #736d60;        /* 弱文/辅助 */
+  --color-ink-4: #a8a294;        /* 占位/禁用 */
+
+  /* ---- 色板：界（发丝线） ---- */
+  --color-line: #e3ddcb;         /* 常规描边 */
+  --color-line-2: #c9c1ab;       /* 强调描边 */
+
+  /* ---- 圆角刻度：近直角，印刷感 ---- */
+  --radius-xs: 0.125rem;
+  --radius-sm: 0.25rem;
+  --radius-md: 0.375rem;
+  --radius-lg: 0.625rem;
+  --radius-xl: 0.875rem;
+
+  /* ---- 阴影刻度：纸面低对比 ---- */
+  --shadow-card: 0 1px 2px rgb(28 26 21 / 0.05), 0 4px 12px -6px rgb(28 26 21 / 0.08);
+  --shadow-pop: 0 2px 6px rgb(28 26 21 / 0.06), 0 12px 32px -12px rgb(28 26 21 / 0.18);
+  --shadow-modal: 0 4px 12px rgb(28 26 21 / 0.08), 0 28px 72px -20px rgb(28 26 21 / 0.32);
+
+  /* ---- 动效 ---- */
+  --ease-out-soft: cubic-bezier(0.22, 1, 0.36, 1);
+  --animate-rise: rise 0.18s var(--ease-out-soft);
+  --animate-fade: fade 0.16s ease-out;
+
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(6px) scale(0.99); }
+    to { opacity: 1; transform: none; }
+  }
+  @keyframes fade {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  /* ---- 布局常量 ---- */
+  --spacing-topbar: 3.5rem;
+}
+
+/* ==========================================================================
+   基底
+   ========================================================================== */
+@layer base {
+  html {
+    /* 防止移动端字体自动放大 */
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background-color: var(--color-paper);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    /* 宣纸气息：顶部暖光 + 底部淡晕，单色不喧哗 */
+    background-image:
+      radial-gradient(1100px 520px at 85% -12%, rgb(255 255 255 / 0.65), transparent 62%),
+      radial-gradient(900px 480px at -10% 110%, rgb(28 26 21 / 0.035), transparent 60%);
+    background-attachment: fixed;
+    min-height: 100dvh;
+  }
+
+  ::selection {
+    background: var(--color-ink);
+    color: var(--color-paper);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-ink);
+    outline-offset: 2px;
+    border-radius: var(--radius-xs);
+  }
+
+  ::placeholder {
+    color: var(--color-ink-4);
+  }
+
+  /* 细滚动条，融入纸面 */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-line-2) transparent;
+  }
+}
+
+/* ==========================================================================
+   译文专用排版 —— .poem-text
+   等宽草稿 → 译文展示切换时使用：宋体 + 松行距 + 微字距，适合中文成段阅读
+   ========================================================================== */
+@utility poem-text {
+  font-family: var(--font-serif);
+  font-size: 1.0625rem;      /* 17px：中文长文舒适字号 */
+  line-height: 2.05;         /* 松行距，透气 */
+  letter-spacing: 0.045em;   /* 微字距，去拥挤 */
+  color: var(--color-ink);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  hanging-punctuation: first allow-end;
+  font-kerning: normal;
+}
+
+/* 小一号译文（卡片内嵌预览等场景） */
+@utility poem-text-sm {
+  font-family: var(--font-serif);
+  font-size: 0.9375rem;
+  line-height: 1.9;
+  letter-spacing: 0.04em;
+  color: var(--color-ink);
+  white-space: pre-wrap;
+  hanging-punctuation: first allow-end;
+}
+
+/* 书眉式小标签：全大写字距标签（中文用加宽字距实现同等效果） */
+@utility overline-label {
+  font-size: 0.6875rem;
+  font-weight: 500;
+  letter-spacing: 0.22em;
+  color: var(--color-ink-3);
+  text-transform: uppercase;
+}
+
+/* 印章方印：产品标识 */
+@utility seal-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  border-radius: var(--radius-xs);
+  background: var(--color-ink);
+  color: var(--color-paper);
+  font-family: var(--font-serif);
+  font-size: 1rem;
+  line-height: 1;
+  box-shadow: inset 0 0 0 1px rgb(247 244 236 / 0.22);
+  user-select: none;
+}

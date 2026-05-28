@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="8" fill="#1c1a15"/>
+  <rect x="4" y="4" width="56" height="56" rx="5" fill="none" stroke="#f7f4ec" stroke-opacity="0.25" stroke-width="2"/>
+  <text x="32" y="43" font-family="'Songti SC','STSong','SimSun',serif" font-size="34" fill="#f7f4ec" text-anchor="middle">译</text>
+</svg>
