@@ -15,15 +15,15 @@ export const runtime = 'nodejs'
 import { NextRequest } from 'next/server'
 import { getDb } from '@/src/lib/db'
 import { migrate } from '@/src/lib/db/migrate'
-import { createChatHandlers } from '@/src/lib/handlers/chat-handler'
+import { createHandlers } from './handlers'
 
 // ── Lazy singleton — 构建期不触库；首次请求时迁移 + 初始化 ─────────
-let _handlers: ReturnType<typeof createChatHandlers> | null = null
-function prod(): ReturnType<typeof createChatHandlers> {
+let _handlers: ReturnType<typeof createHandlers> | null = null
+function prod(): ReturnType<typeof createHandlers> {
   if (!_handlers) {
     const db = getDb()
     migrate(db)
-    _handlers = createChatHandlers(db)
+    _handlers = createHandlers(db)
   }
   return _handlers
 }

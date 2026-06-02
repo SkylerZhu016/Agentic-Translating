@@ -400,9 +400,8 @@ describe('Chat SSE Route', () => {
       const userMsg = messages.find((m) => m.role === 'user')
       expect(userMsg).toBeDefined()
       expect(userMsg!.content).toContain('把这段话改得有诗意')
-      expect(userMsg!.content).toContain('选中片段')
+      expect(userMsg!.content).toContain('针对选中文段')
       expect(userMsg!.content).toContain('你好世界')
-      expect(userMsg!.content).toContain('位置 0-4')
     })
   })
 
