@@ -28,6 +28,12 @@
   --color-line: #e3ddcb;         /* 常规描边 */
   --color-line-2: #c9c1ab;       /* 强调描边 */
 
+  /* ---- 色板：状态语义（传统设色：墨绿/朱红/琥珀，宣纸显色） ---- */
+  --color-pine: #2e5d45;         /* 墨绿——完成/成功 */
+  --color-moss: #2e5d45;         /* pine 别名（edit-flash / ChatPanel 引用） */
+  --color-cinnabar: #b5442c;     /* 朱红——失败/错误（印泥朱砂） */
+  --color-amber: #a67c1b;        /* 琥珀——过期/需重跑 */
+
   /* ---- 圆角刻度：近直角，印刷感 ---- */
   --radius-xs: 0.125rem;
   --radius-sm: 0.25rem;
@@ -44,6 +50,7 @@
   --ease-out-soft: cubic-bezier(0.22, 1, 0.36, 1);
   --animate-rise: rise 0.18s var(--ease-out-soft);
   --animate-fade: fade 0.16s ease-out;
+  --animate-breathe: breathe 1.5s ease-in-out infinite;
 
   @keyframes rise {
     from { opacity: 0; transform: translateY(6px) scale(0.99); }
@@ -52,6 +59,11 @@
   @keyframes fade {
     from { opacity: 0; }
     to { opacity: 1; }
+  }
+  /* 流式呼吸点：进行态的生命感，不喧哗 */
+  @keyframes breathe {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.3; transform: scale(0.72); }
   }
 
   /* ---- 布局常量 ---- */
@@ -137,6 +149,13 @@
   letter-spacing: 0.22em;
   color: var(--color-ink-3);
   text-transform: uppercase;
+}
+
+/* 编辑落痕：聊天工具替换完成后，在 final-text 中短暂高亮变更片段 */
+@utility edit-flash {
+  background: color-mix(in oklab, var(--color-moss) 15%, transparent);
+  border-radius: var(--radius-xs);
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--color-moss) 20%, transparent);
 }
 
 /* 印章方印：产品标识 */
