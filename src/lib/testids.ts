@@ -12,6 +12,7 @@ export const TID = {
     keyInput: 'key-input',
     saveButton: 'save-button',
     listItem: 'endpoint-list-item',
+    addButton: 'add-endpoint-button',
   },
 
   /** Translator agent cards panel */

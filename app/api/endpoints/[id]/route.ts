@@ -95,7 +95,11 @@ export async function DELETE(
     const allSessions = repos.sessions.list()
     const usedBySessions = findEndpointReferences(id, allSessions)
 
-    if (usedBySessions.length > 0) {
+    // ?force=1 bypasses the session-reference soft lock: sessions hold frozen
+    // config snapshots, so deleting the endpoint does not affect them (E30 loop).
+    const force = req.nextUrl.searchParams.get('force') === '1'
+
+    if (usedBySessions.length > 0 && !force) {
       // Return conflict with references so UI can warn user
       return NextResponse.json(
         {
