@@ -1,41 +1,34 @@
 // ---------------------------------------------------------------------------
-// Stage SSE Route Handler Factory — Wave 3 Task 18
+// Stage SSE handlers — factory extracted from route.ts (Next 15.5 route
+// modules may only export HTTP verbs + route config; tests import this).
+// ---------------------------------------------------------------------------
+// Wave 3 Task 18 — 单阶段 SSE 路由
 //
-// createHandlers(db) returns { POST } for POST /api/sessions/[id]/stages/[stage]/run
-//
-// SSE events (C1): stage_start → stage_delta(orch/assemble only) →
-//   stage_complete | stage_schema_error → done
-//
-// Guards: stage enum, session state, concurrency, prerequisite
-// Completion: UPSERT stage_outputs; markDownstreamStale; assemble→final_versions
+// POST /api/sessions/[id]/stages/[stage]/run →
+//   - 守卫: stage∈{review,filter,orchestrate,assemble}; state∈{translated,coordinating,assembled,refining}
+//   - 前置守卫: runStage prereq missing→409
+//   - 并发守卫: stage_already_running→409
+//   - 读快照+prompts+buildStageContext→runStage(任务11)
+//   - SSE: C1 事件 (stage_start/stage_delta 仅orch+assemble/stage_complete/stage_schema_error/done)
+//   - 完成: UPSERT stage_outputs; markDownstreamStale→下游stale; assemble→insert final_versions+transition assembled
 // ---------------------------------------------------------------------------
 
 import type Database from 'better-sqlite3'
 import { NextResponse } from 'next/server'
-import { createRepositories, type Repositories } from '@/src/lib/db/repositories'
+import { createRepositories } from '@/src/lib/db/repositories'
 import { createSessionService } from '@/src/lib/services/session-service'
 import { runStage, markDownstreamStale } from '@/src/lib/orchestration/pipeline'
 import { buildStageContext } from '@/src/lib/context/stage-context'
 import { chatCompletion } from '@/src/lib/llm/client'
 import { encodeSSE } from '@/src/lib/contracts/sse'
-import type {
-  Stage,
-  StageOutput,
-  TranslationResult,
-  ConfigSnapshot,
-} from '@/src/lib/contracts/types'
+import type { Stage, StageOutput, TranslationResult } from '@/src/lib/contracts/types'
 import type { SessionContext, StageRunResult } from '@/src/lib/orchestration/pipeline'
 
 // =============================================================================
 // Constants
 // =============================================================================
 
-const VALID_STAGES: Set<string> = new Set([
-  'review',
-  'filter',
-  'orchestrate',
-  'assemble',
-])
+const VALID_STAGES: Set<string> = new Set(['review', 'filter', 'orchestrate', 'assemble'])
 
 /** States in which a session may run coordination stages */
 const COORDINATION_RUN_STATES: Set<string> = new Set([
@@ -44,25 +37,6 @@ const COORDINATION_RUN_STATES: Set<string> = new Set([
   'assembled',
   'refining',
 ])
-
-/** Human-readable schema descriptions for prompt_used persistence */
-const SCHEMA_DESCRIPTIONS: Record<Stage, string> = {
-  review:
-    'reviewOutputSchema: { assessments: [{ agent_id, strengths, weaknesses, quality_score, keep }] }',
-  filter:
-    'filterOutputSchema: { selected_agent_ids, rejected_agent_ids, rationale }',
-  orchestrate:
-    'orchestrateOutputSchema: { structure_notes, segment_assignments: [{ segment_index, source_agent_id, source_segment, rationale }] }',
-  assemble: 'assembleOutputSchema: { final_text, notes }',
-}
-
-/** Prerequisite chain for walking back on guard failure */
-const STAGE_PREREQUISITES: Record<Stage, Stage | null> = {
-  review: null,
-  filter: 'review',
-  orchestrate: 'filter',
-  assemble: 'orchestrate',
-}
 
 // =============================================================================
 // Helpers
@@ -101,6 +75,17 @@ function mapStageOutputs(
   }))
 }
 
+/** Get the prerequisite stage for a given stage, or null if none */
+function getPrerequisite(stage: Stage): Stage | null {
+  const PREREQS: Record<Stage, Stage | null> = {
+    review: null,
+    filter: 'review',
+    orchestrate: 'filter',
+    assemble: 'orchestrate',
+  }
+  return PREREQS[stage]
+}
+
 /** Build the prompt_used string for persisting (system + user content) */
 function buildPromptUsed(
   stageTemplate: string,
@@ -124,7 +109,7 @@ function buildPromptUsed(
 // =============================================================================
 
 export function createHandlers(db: Database.Database) {
-  const repos: Repositories = createRepositories(db)
+  const repos = createRepositories(db)
   const service = createSessionService(db, repos)
 
   async function POST(
@@ -133,7 +118,7 @@ export function createHandlers(db: Database.Database) {
   ): Promise<Response> {
     const { id: sessionId, stage: stageParam } = await params
 
-    // ── 0. Validate stage enum ──────────────────────────────────
+    // ── 0. Validate stage enum ────────────────────────────────────
     if (!VALID_STAGES.has(stageParam)) {
       return NextResponse.json(
         {
@@ -144,13 +129,13 @@ export function createHandlers(db: Database.Database) {
     }
     const stage = stageParam as Stage
 
-    // ── 1. Load session ─────────────────────────────────────────
+    // ── 1. Load session ───────────────────────────────────────────
     const session = repos.sessions.getById(sessionId)
     if (!session) {
       return NextResponse.json({ error: 'Session not found' }, { status: 404 })
     }
 
-    // ── 2. Guard: session state ─────────────────────────────────
+    // ── 2. Guard: session state ───────────────────────────────────
     const currentState = session.state
     if (!COORDINATION_RUN_STATES.has(currentState)) {
       return NextResponse.json(
@@ -173,7 +158,7 @@ export function createHandlers(db: Database.Database) {
       }
     }
 
-    // ── 4. Guard: concurrency (no other stage running for this session) ─
+    // ── 4. Guard: concurrency (no other stage running for this session) ──
     const allStages = repos.stageOutputs.listBySession(sessionId)
     const runningStage = allStages.find(
       (s) => s.stage !== stage && s.status === 'running',
@@ -187,24 +172,21 @@ export function createHandlers(db: Database.Database) {
       )
     }
 
-    // ── 5. Guard: prerequisite ──────────────────────────────────
-    const prereq = STAGE_PREREQUISITES[stage]
+    // ── 5. Guard: prerequisite ────────────────────────────────────
+    const prereq = getPrerequisite(stage)
     if (prereq) {
-      const prereqRow = repos.stageOutputs.getBySessionAndStage(
-        sessionId,
-        prereq,
-      )
+      const prereqRow = repos.stageOutputs.getBySessionAndStage(sessionId, prereq)
       if (!prereqRow || prereqRow.status !== 'complete') {
         const missing: string[] = []
-        // Walk back to find the first missing prerequisite
+        // Walk back to find all missing prerequisites
         let cur: Stage | null = stage
         while (cur) {
-          const p: Stage | null = STAGE_PREREQUISITES[cur]
+          const p = getPrerequisite(cur)
           if (!p) break
           const pRow = repos.stageOutputs.getBySessionAndStage(sessionId, p)
           if (!pRow || pRow.status !== 'complete') {
             missing.push(p)
-            break
+            break // Stop at the first missing one
           }
           cur = p
         }
@@ -215,11 +197,8 @@ export function createHandlers(db: Database.Database) {
       }
     }
 
-    // ── 6. Mark current stage as 'running' (UPSERT stage_outputs) ─
-    const existingStageRow = repos.stageOutputs.getBySessionAndStage(
-      sessionId,
-      stage,
-    )
+    // ── 6. Mark current stage as 'running' (UPSERT stage_outputs) ──
+    const existingStageRow = repos.stageOutputs.getBySessionAndStage(sessionId, stage)
     if (existingStageRow) {
       repos.stageOutputs.update({
         id: existingStageRow.id,
@@ -241,17 +220,12 @@ export function createHandlers(db: Database.Database) {
       })
     }
 
-    // ── 7. Build session context from snapshot ──────────────────
-    const snapshot: ConfigSnapshot = service.snapshotConfig(
-      session.config_snapshot,
-    )
+    // ── 7. Build session context from snapshot ────────────────────
+    const snapshot = service.snapshotConfig(session.config_snapshot)
     const endpoint = snapshot.endpoint
     if (!endpoint) {
       // Roll back running status
-      const rollbackRow = repos.stageOutputs.getBySessionAndStage(
-        sessionId,
-        stage,
-      )
+      const rollbackRow = repos.stageOutputs.getBySessionAndStage(sessionId, stage)
       if (rollbackRow) {
         repos.stageOutputs.update({
           id: rollbackRow.id,
@@ -264,8 +238,7 @@ export function createHandlers(db: Database.Database) {
       }
       return NextResponse.json(
         {
-          error:
-            'No LLM endpoint configured. Please configure an endpoint first.',
+          error: 'No LLM endpoint configured. Please configure an endpoint first.',
         },
         { status: 400 },
       )
@@ -279,12 +252,7 @@ export function createHandlers(db: Database.Database) {
 
     // Prompt templates: snapshot has kind→content
     const promptTemplates: Record<string, string> = {}
-    for (const kind of [
-      'review',
-      'filter',
-      'orchestrate',
-      'assemble',
-    ] as const) {
+    for (const kind of ['review', 'filter', 'orchestrate', 'assemble'] as const) {
       promptTemplates[kind] = snapshot.prompts?.[kind] || ''
     }
 
@@ -320,7 +288,7 @@ export function createHandlers(db: Database.Database) {
       promptTemplates,
     }
 
-    // ── 8. Build prompt_used for persistence ────────────────────
+    // ── 8. Build prompt_used for persistence ──────────────────────
     const stageTemplate = promptTemplates[stage] || ''
     const contextResult = buildStageContext(stage, {
       sourceText: sessionContext.sourceText,
@@ -331,15 +299,24 @@ export function createHandlers(db: Database.Database) {
     })
     const contextJson = JSON.stringify(contextResult.json)
 
+    // Human-readable schema description for prompt_used
+    const SCHEMA_DESCRIPTIONS: Record<Stage, string> = {
+      review:
+        'reviewOutputSchema: { assessments: [{ agent_id, strengths, weaknesses, quality_score, keep }] }',
+      filter:
+        'filterOutputSchema: { selected_agent_ids, rejected_agent_ids, rationale }',
+      orchestrate:
+        'orchestrateOutputSchema: { structure_notes, segment_assignments: [{ segment_index, source_agent_id, source_segment, rationale }] }',
+      assemble: 'assembleOutputSchema: { final_text, notes }',
+    }
+
     const promptUsedText = buildPromptUsed(
       stageTemplate,
       contextJson,
       SCHEMA_DESCRIPTIONS[stage],
     )
 
-    // ── 9. SSE Stream ───────────────────────────────────────────
-    const abortSignal = req.signal
-
+    // ── 9. SSE Stream ─────────────────────────────────────────────
     const stream = new ReadableStream({
       async start(controller) {
         let stageResult: StageRunResult | null = null
@@ -357,10 +334,7 @@ export function createHandlers(db: Database.Database) {
               },
               onDelta(s, content) {
                 // Only emit for streaming stages (orchestrate, assemble)
-                sseStream(controller, 'stage_delta', {
-                  stage: s,
-                  content,
-                })
+                sseStream(controller, 'stage_delta', { stage: s, content })
               },
               onStageComplete(_s, _result) {
                 // Handled after runStage returns
@@ -390,7 +364,7 @@ export function createHandlers(db: Database.Database) {
           sseStream(controller, 'stage_error', { stage, error: msg })
         }
 
-        // ── 10. Persist result ───────────────────────────────────
+        // ── 10. Persist result ────────────────────────────────────
         if (stageResult) {
           const parsedOutputStr =
             stageResult.parsed_output != null
@@ -398,10 +372,7 @@ export function createHandlers(db: Database.Database) {
               : null
 
           // UPSERT into stage_outputs
-          const currentRow = repos.stageOutputs.getBySessionAndStage(
-            sessionId,
-            stage,
-          )
+          const currentRow = repos.stageOutputs.getBySessionAndStage(sessionId, stage)
           const upsertStatus: StageOutput['status'] = stageResult.ok
             ? 'complete'
             : 'failed'
@@ -413,9 +384,7 @@ export function createHandlers(db: Database.Database) {
               prompt_used: promptUsedText,
               raw_output: stageResult.raw_text || null,
               parsed_output: parsedOutputStr,
-              error: stageResult.ok
-                ? null
-                : stageResult.detail || null,
+              error: stageResult.ok ? null : stageResult.detail || null,
             })
           } else {
             repos.stageOutputs.insert({
@@ -425,20 +394,15 @@ export function createHandlers(db: Database.Database) {
               prompt_used: promptUsedText,
               raw_output: stageResult.raw_text || null,
               parsed_output: parsedOutputStr,
-              error: stageResult.ok
-                ? null
-                : stageResult.detail || null,
+              error: stageResult.ok ? null : stageResult.detail || null,
             })
           }
 
-          // ── 10a. On success: mark downstream stale ──────────────
+          // ── 10a. On success: mark downstream stale ────────────────
           if (stageResult.ok) {
             const downstreamStages = markDownstreamStale(stage)
             for (const ds of downstreamStages) {
-              const dsRow = repos.stageOutputs.getBySessionAndStage(
-                sessionId,
-                ds,
-              )
+              const dsRow = repos.stageOutputs.getBySessionAndStage(sessionId, ds)
               if (dsRow && dsRow.status !== 'pending') {
                 repos.stageOutputs.update({
                   id: dsRow.id,
@@ -452,27 +416,16 @@ export function createHandlers(db: Database.Database) {
             }
           }
 
-          // ── 10b. Assemble special: insert final_version ─────────
-          if (
-            stage === 'assemble' &&
-            stageResult.ok &&
-            stageResult.parsed_output
-          ) {
-            const data = stageResult.parsed_output as Record<
-              string,
-              unknown
-            >
+          // ── 10b. Assemble special: insert final_version + transition ─
+          if (stage === 'assemble' && stageResult.ok && stageResult.parsed_output) {
+            const data = stageResult.parsed_output as Record<string, unknown>
             const finalText =
-              typeof data.final_text === 'string'
-                ? data.final_text
-                : ''
+              typeof data.final_text === 'string' ? data.final_text : ''
 
             if (finalText) {
               // Determine next version_no (max + 1)
-              const latestVersion =
-                repos.finalVersions.getLatestBySession(sessionId)
-              const nextVersionNo =
-                (latestVersion?.version_no ?? 0) + 1
+              const latestVersion = repos.finalVersions.getLatestBySession(sessionId)
+              const nextVersionNo = (latestVersion?.version_no ?? 0) + 1
 
               repos.finalVersions.insert({
                 session_id: sessionId,
@@ -490,7 +443,7 @@ export function createHandlers(db: Database.Database) {
             }
           }
 
-          // ── 11. Emit final event ───────────────────────────────
+          // ── 11. Emit final event ─────────────────────────────────
           if (stageResult.ok) {
             sseStream(controller, 'stage_complete', {
               stage,
@@ -520,7 +473,7 @@ export function createHandlers(db: Database.Database) {
         controller.close()
       },
       cancel() {
-        // Stream was aborted by client — no cleanup needed
+        // Stream was aborted by client — no cleanup needed beyond abort propagation
       },
     })
 
