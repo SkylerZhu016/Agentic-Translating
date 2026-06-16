@@ -400,8 +400,9 @@ describe('Chat SSE Route', () => {
       const userMsg = messages.find((m) => m.role === 'user')
       expect(userMsg).toBeDefined()
       expect(userMsg!.content).toContain('把这段话改得有诗意')
-      expect(userMsg!.content).toContain('针对选中文段')
+      expect(userMsg!.content).toContain('选中片段')
       expect(userMsg!.content).toContain('你好世界')
+      expect(userMsg!.content).toContain('位置 0-4')
     })
   })
 
@@ -502,6 +503,15 @@ describe('Chat SSE Route', () => {
         expect(editVersion).toBeDefined()
         expect(editVersion!.version_no).toBeGreaterThan(1)
         expect(editVersion!.text).toBe('您好世界')
+
+        // SSE tool_result event must carry version_no = previous + 1
+        const toolResultEvents = events.filter((e) => e.event === 'tool_result')
+        const versionResult = toolResultEvents.find(
+          (e) => typeof (e.data as any).version_no === 'number',
+        )
+        expect(versionResult).toBeDefined()
+        expect((versionResult!.data as any).version_no).toBe(editVersion!.version_no)
+        expect((versionResult!.data as any).ok).toBe(true)
 
         // Verify assistant message linked to version
         const messages = repos.chatMessages.listBySession(sid)
@@ -723,18 +733,33 @@ describe('Chat SSE Route', () => {
       })
 
       expect(resp.status).toBe(200)
-      await readSSEEvents(resp)
+      const events = await readSSEEvents(resp)
 
       // No new version should be created
       const versions = repos.finalVersions.listBySession(sid)
       expect(versions.length).toBe(1) // only the assemble version
       expect(versions[0].source).toBe('assemble')
 
+      // 讨论轮：文本不变 — 唯一版本仍为原始 assembled 文本
+      expect(versions[0].text).toBe('你好世界')
+      expect(versions[0].version_no).toBe(1)
+
       // Assistant message should have null version_id
       const messages = repos.chatMessages.listBySession(sid)
       const assistantMsg = messages.find((m) => m.role === 'assistant')
       expect(assistantMsg).toBeDefined()
       expect(assistantMsg!.version_id).toBeNull()
+
+      // 讨论轮：无 tool_call / tool_result 事件（纯文本响应）
+      const eventNames = events.map((e) => e.event)
+      expect(eventNames).not.toContain('tool_call')
+      expect(eventNames).not.toContain('tool_result')
+
+      // message_complete 应标 kind:'message'，无 version_no
+      const complete = events.find((e) => e.event === 'message_complete')
+      expect(complete).toBeDefined()
+      expect((complete!.data as any).kind).toBe('message')
+      expect((complete!.data as any).version_no).toBeUndefined()
     })
   })
 })

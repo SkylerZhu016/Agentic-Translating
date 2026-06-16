@@ -1,11 +1,13 @@
 // ---------------------------------------------------------------------------
-// Chat SSE handlers — factory extracted from route.ts (Next 15.5 route
-// modules may only export HTTP verbs + route config; tests import this)
+// Chat SSE handlers — canonical co-located handler factory (Wave 3 Task 19).
+//
+// route.ts lazy-singletons createHandlers(db); tests import this directly to
+// avoid the production getDb() call. A thin re-export shim exists at
+// src/lib/handlers/chat-handler.ts for legacy import paths.
 // ---------------------------------------------------------------------------
-// Wave 3 Task 19 — 聊天 SSE 路由（工具循环 + 版本落库）
 //
 // POST {message, selection?:{text,start,end}} →
-//   - Guard: state∈{assembled,refining}→409
+//   - Guard: state∈{assembled,refining}→409 (coordinating→409)
 //   - Context: buildChatContext(最新版本全文+最近20轮)
 //   - Model: snapshot coordinator.chat_model(缺省=coordinator.model)
 //   - SSE: C1 chat events (message_start/delta/tool_call/tool_result/message_complete/done)
@@ -15,7 +17,6 @@
 import type Database from 'better-sqlite3'
 import { NextRequest, NextResponse } from 'next/server'
 import { createRepositories } from '@/src/lib/db/repositories'
-import { createSessionService } from '@/src/lib/services/session-service'
 import { runChatTurn } from '@/src/lib/chat/tool-loop'
 import { buildChatContext } from '@/src/lib/context/stage-context'
 import { encodeSSE } from '@/src/lib/contracts/sse'
@@ -40,7 +41,12 @@ interface ChatRequestBody {
 
 function buildUserMessage(body: ChatRequestBody): string {
   if (body.selection) {
-    return `针对选中文段「${body.selection.text}」：${body.message}`
+    return (
+      `【用户指令】${body.message}\n` +
+      `【选中片段】（位置 ${body.selection.start}-${body.selection.end}）：\n` +
+      `"${body.selection.text}"\n\n` +
+      `请针对以上选中片段进行修改。`
+    )
   }
   return body.message
 }
@@ -72,7 +78,6 @@ function resolveChatConfig(snapshot: ConfigSnapshot): {
 
 export function createHandlers(db: Database.Database) {
   const repos = createRepositories(db)
-  const service = createSessionService(db, repos)
 
   async function POST(
     request: NextRequest,
@@ -186,7 +191,6 @@ export function createHandlers(db: Database.Database) {
         enqueue(encodeSSE('message_start', { session_id: sessionId }))
 
         let fullText = ''
-        let didEdit = false
         let didProtocolFallback = false
 
         try {
@@ -205,7 +209,6 @@ export function createHandlers(db: Database.Database) {
               },
               onToolResult: (ok, resultData) => {
                 if (ok && resultData) {
-                  didEdit = true
                   enqueue(
                     encodeSSE('tool_result', {
                       ok: true,

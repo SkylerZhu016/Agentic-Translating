@@ -3,7 +3,7 @@
 //
 // This file exists for testability — tests import createChatHandlers without
 // triggering production-side getDb() call. The canonical implementation lives
-// at app/api/sessions/[id]/chat/handlers.ts.
+// at app/api/sessions/[id]/chat/handlers.ts (Wave 3 Task 19).
 // ---------------------------------------------------------------------------
 
 export { createHandlers as createChatHandlers } from '@/app/api/sessions/[id]/chat/handlers'
