@@ -4,3 +4,4 @@ data/
 .omo/evidence/
 playwright-report/
 test-results/
+.playwright-mcp/
