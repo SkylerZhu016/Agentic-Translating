@@ -147,10 +147,13 @@ export function buildTranslatorPrompt(
   params: TranslatorPromptParams,
 ): { system: ChatMessageInput; user: ChatMessageInput } {
   // Prepare interpolation variables
+  // extra_instructions 是可选槽位：缺省置空串，使含 {{extra_instructions}} 的
+  // 内置模板在严格插值下不抛 PromptAssemblyError（下方预检同样豁免该变量）。
   const vars: Record<string, string> = {
     source_lang: params.source_lang,
     target_lang: params.target_lang,
     source_text: params.source_text,
+    extra_instructions: params.extra_instructions ?? '',
   }
 
   // Validate all template variables are satisfiable

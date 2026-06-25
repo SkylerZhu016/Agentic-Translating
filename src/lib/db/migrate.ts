@@ -2,7 +2,15 @@ import type Database from 'better-sqlite3'
 import fs from 'fs'
 import path from 'path'
 
-const MIGRATIONS_DIR = path.join(__dirname, 'migrations')
+// Next.js 生产构建会把服务端代码打包进 .next/server，__dirname 不再指向
+// src/lib/db —— 先按 __dirname 解析（测试/开发），不存在时回退到项目根。
+function resolveMigrationsDir(): string {
+  const fromDirname = path.join(__dirname, 'migrations')
+  if (fs.existsSync(fromDirname)) return fromDirname
+  return path.join(process.cwd(), 'src', 'lib', 'db', 'migrations')
+}
+
+const MIGRATIONS_DIR = resolveMigrationsDir()
 
 /**
  * Run all pending migrations against the given database.
