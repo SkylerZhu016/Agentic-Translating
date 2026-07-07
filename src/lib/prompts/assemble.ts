@@ -194,6 +194,11 @@ export function buildTranslatorPrompt(
  * The `system` message is a JSON-only instruction referencing the stage
  * schema. The `user` message contains the stage template interpolated with
  * the provided context JSON.
+ *
+ * Individual variables (source_text, translations, review_output, etc.) are
+ * extracted from the context JSON so the seeded prompt templates (which use
+ * {{source_text}}, {{translations}}, …) interpolate correctly.  The full JSON
+ * is also available as {{context}} for templates that prefer that form.
  */
 export function buildStagePrompt(
   stageTemplate: string,
@@ -212,10 +217,33 @@ export function buildStagePrompt(
     ].join('\n'),
   }
 
-  // Interpolate the stage template — provide {{context}} and any other vars from the JSON
-  const { result: userContent } = interpolate(stageTemplate, {
+  // Parse context JSON to extract individual variables for template interpolation.
+  let ctx: Record<string, unknown> = {}
+  try { ctx = JSON.parse(contextJson) } catch { /* ignore */ }
+  const source = (ctx.source as Record<string, string> | undefined) ?? {}
+  const translations = (ctx.translations as Array<Record<string, unknown>> | undefined) ?? []
+  const priorStages = (ctx.prior_stages as Record<string, { parsed_output?: string } | undefined> | undefined) ?? {}
+
+  // Format translations as a readable list for {{translations}} / {{selected_translations}}
+  const translationsText = translations
+    .map((t, i) => `[${i + 1}] ${(t.name as string) ?? (t.agent_id as string) ?? 'unknown'}\n${(t.text as string) ?? ''}`)
+    .join('\n\n')
+
+  // Provide every variable the seeded prompt templates use
+  const vars: Record<string, string> = {
     context: contextJson,
-  })
+    source_text: source.text ?? '',
+    source_lang: source.from ?? '',
+    target_lang: source.to ?? '',
+    translations: translationsText,
+    selected_translations: translationsText,
+    review_output: (priorStages.review as { parsed_output?: string } | undefined)?.parsed_output ?? '',
+    filter_output: (priorStages.filter as { parsed_output?: string } | undefined)?.parsed_output ?? '',
+    orchestrate_output: (priorStages.orchestrate as { parsed_output?: string } | undefined)?.parsed_output ?? '',
+    extra_instructions: '',
+  }
+
+  const { result: userContent } = interpolate(stageTemplate, vars)
 
   const user: ChatMessageInput = {
     role: 'user',

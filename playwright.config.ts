@@ -47,10 +47,10 @@ export default defineConfig({
     url: `http://localhost:${PORT}`,
     timeout: 180_000, // build can take ~60-90s; allow headroom
     reuseExistingServer: !process.env.CI,
-    port: PORT,
     env: {
       PORT: String(PORT),
       NODE_ENV: 'production', // verify production form (not dev)
+      E2E_TEST: 'true',       // allow test-only routes (e.g. reset-db)
       // Next.js reads NEXT_RUNTIME at instrumentation time; ensure nodejs path.
       NEXT_RUNTIME: 'nodejs',
     },
