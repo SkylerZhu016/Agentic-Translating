@@ -1,7 +1,23 @@
 node_modules/
 .next/
 data/
-.omo/evidence/
+.omo/
 playwright-report/
 test-results/
 .playwright-mcp/
+
+# Build artifacts
+*.tsbuildinfo
+next-env.d.ts
+
+# Logs
+*.log
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# OS
+Thumbs.db
+.DS_Store
