@@ -173,6 +173,8 @@ export function buildTranslatorPrompt(
     systemParts.push('')
     systemParts.push(params.extra_instructions)
   }
+  systemParts.push('')
+  systemParts.push('你可以自由输出。如需添加注释/理由，请在正文后用一行 `---`（markdown 水平分割线）分隔，然后写注释。下游审查者只看正文不看注释，注释仅供人类归档参考。')
   const system: ChatMessageInput = {
     role: 'system',
     content: systemParts.join('\n'),
@@ -191,8 +193,8 @@ export function buildTranslatorPrompt(
 /**
  * Build a `{ system, user }` message pair for a translation stage.
  *
- * The `system` message is a JSON-only instruction referencing the stage
- * schema. The `user` message contains the stage template interpolated with
+ * The `system` message carries the stage goal and free-form output convention.
+ * The `user` message contains the stage template interpolated with
  * the provided context JSON.
  *
  * Individual variables (source_text, translations, review_output, etc.) are
@@ -203,17 +205,14 @@ export function buildTranslatorPrompt(
 export function buildStagePrompt(
   stageTemplate: string,
   contextJson: string,
-  stageSchema: string,
+  stageGoal: string,
 ): { system: ChatMessageInput; user: ChatMessageInput } {
   const system: ChatMessageInput = {
     role: 'system',
     content: [
-      'You must output ONLY valid JSON that conforms to the schema below.',
-      'Do not include any explanation, markdown formatting, or code fences.',
+      stageGoal,
       '',
-      '--- stage_schema ---',
-      stageSchema,
-      '--- end stage_schema ---',
+      '你可以自由输出。如需添加注释/理由，请在正文后用一行 `---`（markdown 水平分割线）分隔，然后写注释。下游审查者只看正文不看注释，注释仅供人类归档参考。',
     ].join('\n'),
   }
 
@@ -222,7 +221,7 @@ export function buildStagePrompt(
   try { ctx = JSON.parse(contextJson) } catch { /* ignore */ }
   const source = (ctx.source as Record<string, string> | undefined) ?? {}
   const translations = (ctx.translations as Array<Record<string, unknown>> | undefined) ?? []
-  const priorStages = (ctx.prior_stages as Record<string, { parsed_output?: string } | undefined> | undefined) ?? {}
+  const priorStages = (ctx.prior_stages as Record<string, { body?: string } | undefined> | undefined) ?? {}
 
   // Format translations as a readable list for {{translations}} / {{selected_translations}}
   const translationsText = translations
@@ -237,9 +236,9 @@ export function buildStagePrompt(
     target_lang: source.to ?? '',
     translations: translationsText,
     selected_translations: translationsText,
-    review_output: (priorStages.review as { parsed_output?: string } | undefined)?.parsed_output ?? '',
-    filter_output: (priorStages.filter as { parsed_output?: string } | undefined)?.parsed_output ?? '',
-    orchestrate_output: (priorStages.orchestrate as { parsed_output?: string } | undefined)?.parsed_output ?? '',
+    review_output: (priorStages.review as { body?: string } | undefined)?.body ?? '',
+    filter_output: (priorStages.filter as { body?: string } | undefined)?.body ?? '',
+    orchestrate_output: (priorStages.orchestrate as { body?: string } | undefined)?.body ?? '',
     extra_instructions: '',
   }
 

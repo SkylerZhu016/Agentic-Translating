@@ -26,9 +26,9 @@ export interface StageContextJson {
   }
   translations: StageContextTranslationEntry[]
   prior_stages: {
-    review?: { parsed_output: string }
-    filter?: { parsed_output: string }
-    orchestrate?: { parsed_output: string }
+    review?: { body: string }
+    filter?: { body: string }
+    orchestrate?: { body: string }
   }
 }
 
@@ -64,7 +64,9 @@ function stageOutputToIndexed(
   const result: StageContextJson['prior_stages'] = {}
   for (const s of stages) {
     if (s.stage === 'review' || s.stage === 'filter' || s.stage === 'orchestrate') {
-      result[s.stage] = { parsed_output: s.parsed_output ?? '' }
+      const raw = s.raw_output ?? ''
+      const body = raw.split('\n---\n')[0].trim()
+      result[s.stage] = { body }
     }
   }
   return result
@@ -72,39 +74,6 @@ function stageOutputToIndexed(
 
 function jsonTokens(json: StageContextJson): number {
   return estimateTokens(JSON.stringify(json))
-}
-
-/**
- * Phase‑1 truncation: for every translation whose agent_id appears in the
- * filter stage's `rejected_agent_ids`, drop the full translation `text`
- * while keeping agent_id / name / model.
- *
- * Returns the number of entries that were cleared (0 if none).
- */
-function dropRejectedTexts(
-  json: StageContextJson,
-  budget: number,
-): number {
-  const filterStage = json.prior_stages.filter
-  if (!filterStage?.parsed_output) return 0
-
-  let rejectedIds: string[]
-  try {
-    const parsed = JSON.parse(filterStage.parsed_output)
-    rejectedIds = parsed.rejected_agent_ids ?? []
-  } catch {
-    return 0
-  }
-  if (rejectedIds.length === 0) return 0
-
-  let cleared = 0
-  for (const t of json.translations) {
-    if (rejectedIds.includes(t.agent_id) && t.text.length > 0) {
-      t.text = ''
-      cleared++
-    }
-  }
-  return cleared
 }
 
 /**
@@ -173,11 +142,9 @@ function truncateFromTail(json: StageContextJson, budget: number): number {
  * Prior stages (`review`, `filter`, `orchestrate`) are indexed by stage name;
  * `assemble` is intentionally excluded.
  *
- * If the serialized JSON exceeds the token budget the function applies a
- * two‑phase reduction:
- *   1. Drop full text of filter‑rejected translations (keep metadata).
- *   2. Truncate remaining translations from the tail, appending a
- *      `…[truncated]…` marker, until the budget is met.
+ * If the serialized JSON exceeds the token budget the function truncates
+ * translations from the tail, appending a `…[truncated]…` marker, until the
+ * budget is met.
  *
  * @param stage       Current coordination stage (unused in building, reserved).
  * @param params      Source text, language pair, translations, prior stages.
@@ -221,13 +188,7 @@ export function buildStageContext(
 
   let truncated = false
 
-  // 3. Phase 1 – drop full text of filter‑rejected translations
-  const cleared = dropRejectedTexts(json, budget)
-  if (cleared > 0) {
-    truncated = true
-  }
-
-  // 4. Phase 2 – truncate from tail
+  // 3. Phase – truncate from tail
   if (jsonTokens(json) > budget) {
     for (let i = json.translations.length - 1; i >= 0; i--) {
       if (jsonTokens(json) <= budget) break

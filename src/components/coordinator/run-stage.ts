@@ -3,26 +3,17 @@
 // ---------------------------------------------------------------------------
 // runStageStream —— POST stages/[stage]/run 的 SSE 客户端
 // 事件序（C1）：stage_start → stage_delta(orch/assemble) →
-//   stage_complete | stage_schema_error | stage_error → done
+//   stage_complete | stage_error → done
 // 解析复用契约层 parseSSEChunk（累积 buffer + 已处理计数跳过重放）
 // ---------------------------------------------------------------------------
 
 import { parseSSEChunk } from '@/src/lib/contracts/sse'
 import type { Stage } from '@/src/lib/contracts/types'
 
-export interface StageSchemaErrorInfo {
-  stage: Stage
-  detail?: string
-  rawText?: string
-  zodError?: string
-  attempt?: number
-}
-
 export interface StageStreamHandlers {
   onStart?: (stage: Stage) => void
   onDelta?: (stage: Stage, content: string) => void
-  onComplete?: (stage: Stage, parsedOutput: unknown) => void
-  onSchemaError?: (info: StageSchemaErrorInfo) => void
+  onComplete?: (stage: Stage, rawText: string | null) => void
   onError?: (stage: Stage, message: string) => void
 }
 
@@ -83,21 +74,7 @@ export async function runStageStream(
             handlers.onDelta?.(evStage, typeof data.content === 'string' ? data.content : '')
             break
           case 'stage_complete':
-            handlers.onComplete?.(evStage, data.parsed_output)
-            break
-          case 'stage_schema_error':
-            handlers.onSchemaError?.({
-              stage: evStage,
-              detail: typeof data.detail === 'string' ? data.detail : undefined,
-              rawText:
-                typeof data.rawText === 'string'
-                  ? data.rawText
-                  : typeof data.raw_text === 'string'
-                    ? data.raw_text
-                    : undefined,
-              zodError: typeof data.zodError === 'string' ? data.zodError : undefined,
-              attempt: typeof data.attempt === 'number' ? data.attempt : undefined,
-            })
+            handlers.onComplete?.(evStage, typeof data.raw_text === 'string' ? data.raw_text : null)
             break
           case 'stage_error':
             handlers.onError?.(

@@ -59,7 +59,6 @@ function mapStageOutputs(
     status: string
     prompt_used: string | null
     raw_output: string | null
-    parsed_output: string | null
     error: string | null
   }>,
 ): StageOutput[] {
@@ -70,7 +69,6 @@ function mapStageOutputs(
     status: r.status as StageOutput['status'],
     prompt_used: r.prompt_used,
     raw_output: r.raw_output,
-    parsed_output: r.parsed_output,
     error: r.error,
   }))
 }
@@ -90,15 +88,11 @@ function getPrerequisite(stage: Stage): Stage | null {
 function buildPromptUsed(
   stageTemplate: string,
   contextJson: string,
-  schemaDesc: string,
+  _schemaDesc: string,
 ): string {
   const system = [
-    'You must output ONLY valid JSON that conforms to the schema below.',
-    'Do not include any explanation, markdown formatting, or code fences.',
-    '',
-    '--- stage_schema ---',
-    schemaDesc,
-    '--- end stage_schema ---',
+    '你可以自由输出。如需添加注释/理由，请在正文后用一行 ---（markdown 水平分割线）分隔，然后写注释。',
+    '下游审查者只看正文不看注释，注释仅供人类归档参考。',
   ].join('\n')
 
   return `SYSTEM:\n${system}\n\nUSER:\n${stageTemplate.replace('{{context}}', contextJson)}`
@@ -205,7 +199,6 @@ export function createHandlers(db: Database.Database) {
         status: 'running',
         prompt_used: null,
         raw_output: null,
-        parsed_output: null,
         error: null,
       })
     } else {
@@ -215,7 +208,6 @@ export function createHandlers(db: Database.Database) {
         status: 'running',
         prompt_used: null,
         raw_output: null,
-        parsed_output: null,
         error: null,
       })
     }
@@ -232,7 +224,6 @@ export function createHandlers(db: Database.Database) {
           status: 'failed',
           prompt_used: null,
           raw_output: null,
-          parsed_output: null,
           error: 'No LLM endpoint configured.',
         })
       }
@@ -278,6 +269,7 @@ export function createHandlers(db: Database.Database) {
     )
 
     const sessionContext: SessionContext = {
+      sessionId,
       sourceText: session.source_text,
       sourceLang: session.source_lang,
       targetLang: session.target_lang,
@@ -339,14 +331,6 @@ export function createHandlers(db: Database.Database) {
               onStageComplete(_s, _result) {
                 // Handled after runStage returns
               },
-              onSchemaError(s, rawText, zodError, attempt) {
-                sseStream(controller, 'stage_schema_error', {
-                  stage: s,
-                  rawText,
-                  zodError,
-                  attempt,
-                })
-              },
               onError(s, error) {
                 sseStream(controller, 'stage_error', {
                   stage: s,
@@ -366,10 +350,18 @@ export function createHandlers(db: Database.Database) {
 
         // ── 10. Persist result ────────────────────────────────────
         if (stageResult) {
-          const parsedOutputStr =
-            stageResult.parsed_output != null
-              ? JSON.stringify(stageResult.parsed_output)
-              : null
+          // ── Assemble: reject empty final_text ──────────────────
+          if (stage === 'assemble' && stageResult.ok) {
+            const finalText = stageResult.final_text
+            if (!finalText || finalText.trim().length === 0) {
+              stageResult = {
+                ...stageResult,
+                ok: false,
+                code: 'assemble_empty',
+                detail: 'assemble produced empty final_text',
+              }
+            }
+          }
 
           // UPSERT into stage_outputs
           const currentRow = repos.stageOutputs.getBySessionAndStage(sessionId, stage)
@@ -383,7 +375,6 @@ export function createHandlers(db: Database.Database) {
               status: upsertStatus,
               prompt_used: promptUsedText,
               raw_output: stageResult.raw_text || null,
-              parsed_output: parsedOutputStr,
               error: stageResult.ok ? null : stageResult.detail || null,
             })
           } else {
@@ -393,7 +384,6 @@ export function createHandlers(db: Database.Database) {
               status: upsertStatus,
               prompt_used: promptUsedText,
               raw_output: stageResult.raw_text || null,
-              parsed_output: parsedOutputStr,
               error: stageResult.ok ? null : stageResult.detail || null,
             })
           }
@@ -409,7 +399,6 @@ export function createHandlers(db: Database.Database) {
                   status: 'stale',
                   prompt_used: dsRow.prompt_used,
                   raw_output: dsRow.raw_output,
-                  parsed_output: dsRow.parsed_output,
                   error: dsRow.error,
                 })
               }
@@ -417,29 +406,25 @@ export function createHandlers(db: Database.Database) {
           }
 
           // ── 10b. Assemble special: insert final_version + transition ─
-          if (stage === 'assemble' && stageResult.ok && stageResult.parsed_output) {
-            const data = stageResult.parsed_output as Record<string, unknown>
-            const finalText =
-              typeof data.final_text === 'string' ? data.final_text : ''
+          if (stage === 'assemble' && stageResult.ok && stageResult.final_text) {
+            const finalText = stageResult.final_text
 
-            if (finalText) {
-              // Determine next version_no (max + 1)
-              const latestVersion = repos.finalVersions.getLatestBySession(sessionId)
-              const nextVersionNo = (latestVersion?.version_no ?? 0) + 1
+            // Determine next version_no (max + 1)
+            const latestVersion = repos.finalVersions.getLatestBySession(sessionId)
+            const nextVersionNo = (latestVersion?.version_no ?? 0) + 1
 
-              repos.finalVersions.insert({
-                session_id: sessionId,
-                version_no: nextVersionNo,
-                text: finalText,
-                source: 'assemble',
-              })
+            repos.finalVersions.insert({
+              session_id: sessionId,
+              version_no: nextVersionNo,
+              text: finalText,
+              source: 'assemble',
+            })
 
-              // Transition state → assembled
-              try {
-                service.transitionState(sessionId, 'assembled')
-              } catch {
-                // State transition may fail if not in coordinating — ignore
-              }
+            // Transition state → assembled
+            try {
+              service.transitionState(sessionId, 'assembled')
+            } catch {
+              // State transition may fail if not in coordinating — ignore
             }
           }
 
@@ -448,24 +433,15 @@ export function createHandlers(db: Database.Database) {
             sseStream(controller, 'stage_complete', {
               stage,
               code: stageResult.code,
-              parsed_output: stageResult.parsed_output,
               raw_text: stageResult.raw_text,
             })
           } else {
             // Emit appropriate error event
-            if (stageResult.code === 'stage_schema_error') {
-              sseStream(controller, 'stage_schema_error', {
-                stage,
-                detail: stageResult.detail,
-                raw_text: stageResult.raw_text,
-              })
-            } else {
-              sseStream(controller, 'stage_error', {
-                stage,
-                code: stageResult.code,
-                detail: stageResult.detail,
-              })
-            }
+            sseStream(controller, 'stage_error', {
+              stage,
+              code: stageResult.code,
+              detail: stageResult.detail,
+            })
           }
         }
 

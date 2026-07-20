@@ -54,11 +54,6 @@ export function CoordinatorPanel() {
       await runStageStream(sessionId, stage, {
         onDelta: (s, content) =>
           setStreamText((prev) => ({ ...prev, [s]: prev[s] + content })),
-        onSchemaError: (info) =>
-          setNotes((prev) => ({
-            ...prev,
-            [info.stage]: `输出未通过校验${info.attempt ? `（第 ${info.attempt} 次）` : ''}，正在自动重试……`,
-          })),
         onError: (s, message) => setNotes((prev) => ({ ...prev, [s]: message })),
       })
 
