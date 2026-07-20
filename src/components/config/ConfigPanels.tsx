@@ -19,6 +19,7 @@ import {
 import { AgentPanel } from './AgentPanel'
 import { CoordinatorPanel } from './CoordinatorPanel'
 import { EndpointPanel } from './EndpointPanel'
+import { PresetPanel } from './PresetPanel'
 import { PromptPanel } from './PromptPanel'
 import { Skeleton, ToastStack, useToasts } from './shared'
 
@@ -79,7 +80,7 @@ export function ConfigPanels() {
       />
 
       {loading ? (
-        <div className="grid max-w-3xl grid-cols-1 gap-5" aria-label="加载中">
+        <div className="mx-auto grid max-w-3xl grid-cols-1 gap-5" aria-label="加载中">
           {(['端点', '翻译 Agent', '统筹', '提示词'] as const).map((t) => (
             <Card key={t} title={t}>
               <div className="space-y-3">
@@ -91,7 +92,7 @@ export function ConfigPanels() {
           ))}
         </div>
       ) : loadError != null ? (
-        <div className="grid max-w-3xl grid-cols-1 gap-5">
+        <div className="mx-auto grid max-w-3xl grid-cols-1 gap-5">
           <Card title="加载失败">
             <p className="text-sm leading-6 text-ink-2">{loadError}</p>
             <Button size="sm" className="mt-3" onClick={() => void loadAll()}>
@@ -100,13 +101,14 @@ export function ConfigPanels() {
           </Card>
         </div>
       ) : (
-        <div className="grid max-w-3xl grid-cols-1 gap-5">
+        <div className="mx-auto grid max-w-3xl grid-cols-1 gap-5">
           <EndpointPanel
             endpoints={endpoints}
             agents={agents}
             notify={push}
             onChanged={refreshEndpoints}
           />
+          <PresetPanel endpoints={endpoints} notify={push} onPresetLoaded={loadAll} />
           <AgentPanel
             agents={agents}
             endpoints={endpoints}

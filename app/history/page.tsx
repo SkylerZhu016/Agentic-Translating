@@ -13,7 +13,7 @@ export default function HistoryPage() {
         description="每次翻译任务完成后，原文、各 Agent 译文与最终版本将在此留存快照，可回溯可恢复。"
       />
 
-      <div className="max-w-3xl">
+      <div className="mx-auto max-w-3xl">
         <Card overline="Sessions" title="历史会话">
           <div className="rounded-sm border border-dashed border-line-2 bg-paper/60 px-4 py-12 text-center text-sm leading-6 text-ink-4">
             暂无历史会话。完成一次翻译后将自动留存。

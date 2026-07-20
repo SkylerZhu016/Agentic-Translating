@@ -66,7 +66,6 @@ export interface StageOutput {
   status: 'pending' | 'running' | 'complete' | 'failed' | 'stale'
   prompt_used: string | null
   raw_output: string | null
-  parsed_output: string | null
   error: string | null
 }
 
@@ -128,7 +127,6 @@ export interface StageOutputRow {
   status: 'pending' | 'running' | 'complete' | 'failed' | 'stale'
   prompt_used: string | null
   raw_output: string | null
-  parsed_output: string | null
   error: string | null
   created_at: string
 }
@@ -162,4 +160,54 @@ export interface ConfigSnapshot {
   agents: TranslatorAgentConfig[]
   coordinator: CoordinatorConfig | null
   prompts: Record<string, string> // kind → content
+}
+
+// ── Preset DB Row types ──────────────────────────────────────────
+
+/** Full config_presets row */
+export interface ConfigPresetRow {
+  id: number
+  name: string
+  description: string | null
+  is_builtin: number
+  created_at: string
+  updated_at: string
+}
+
+/** Full config_preset_agents row */
+export interface ConfigPresetAgentRow {
+  id: number
+  preset_id: number
+  name: string
+  endpoint_id: number | null
+  model: string
+  prompt_override: string | null
+  sort_order: number
+}
+
+/** Full config_preset_coordinator row (singleton per preset via UNIQUE preset_id) */
+export interface ConfigPresetCoordinatorRow {
+  id: number
+  preset_id: number
+  endpoint_id: number | null
+  model: string
+  chat_endpoint_id: number | null
+  chat_model: string
+}
+
+/** Full config_preset_prompts row */
+export interface ConfigPresetPromptRow {
+  id: number
+  preset_id: number
+  kind: 'translator' | 'review' | 'filter' | 'orchestrate' | 'assemble'
+  name: string
+  content: string
+}
+
+/** Aggregated full preset (header row + all child rows) */
+export interface FullPreset {
+  preset: ConfigPresetRow
+  agents: ConfigPresetAgentRow[]
+  coordinator: ConfigPresetCoordinatorRow | null
+  prompts: ConfigPresetPromptRow[]
 }

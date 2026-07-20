@@ -1,4 +1,11 @@
 import type Database from 'better-sqlite3'
+import type {
+  ConfigPresetRow,
+  ConfigPresetAgentRow,
+  ConfigPresetCoordinatorRow,
+  ConfigPresetPromptRow,
+  FullPreset,
+} from '../contracts/types'
 
 // ── Type definitions ──────────────────────────────────────────────
 
@@ -74,7 +81,6 @@ export interface StageOutputRow {
   status: 'pending' | 'running' | 'complete' | 'failed' | 'stale'
   prompt_used: string | null
   raw_output: string | null
-  parsed_output: string | null
   error: string | null
   created_at: string
 }
@@ -239,18 +245,18 @@ export function createTranslationResultsRepo(db: Database.Database) {
 // ── Stage Outputs Repository ──────────────────────────────────────
 
 export function createStageOutputsRepo(db: Database.Database) {
-  const insertStmt = db.prepare('INSERT INTO stage_outputs (session_id, stage, status, prompt_used, raw_output, parsed_output, error) VALUES (@session_id, @stage, @status, @prompt_used, @raw_output, @parsed_output, @error)')
+  const insertStmt = db.prepare('INSERT INTO stage_outputs (session_id, stage, status, prompt_used, raw_output, error) VALUES (@session_id, @stage, @status, @prompt_used, @raw_output, @error)')
   const getByIdStmt = db.prepare('SELECT * FROM stage_outputs WHERE id = ?')
   const getBySessionAndStageStmt = db.prepare('SELECT * FROM stage_outputs WHERE session_id = ? AND stage = ?')
-  const updateStmt = db.prepare("UPDATE stage_outputs SET status = @status, prompt_used = @prompt_used, raw_output = @raw_output, parsed_output = @parsed_output, error = @error WHERE id = @id")
+  const updateStmt = db.prepare("UPDATE stage_outputs SET status = @status, prompt_used = @prompt_used, raw_output = @raw_output, error = @error WHERE id = @id")
   const deleteStmt = db.prepare('DELETE FROM stage_outputs WHERE id = ?')
   const listBySessionStmt = db.prepare('SELECT * FROM stage_outputs WHERE session_id = ? ORDER BY id')
 
   return {
-    insert: (row: Pick<StageOutputRow, 'session_id' | 'stage' | 'status' | 'prompt_used' | 'raw_output' | 'parsed_output' | 'error'>) => insertStmt.run(row as any),
+    insert: (row: Pick<StageOutputRow, 'session_id' | 'stage' | 'status' | 'prompt_used' | 'raw_output' | 'error'>) => insertStmt.run(row as any),
     getById: (id: number) => getByIdStmt.get(id) as StageOutputRow | undefined,
     getBySessionAndStage: (sessionId: string, stage: StageOutputRow['stage']) => getBySessionAndStageStmt.get(sessionId, stage) as StageOutputRow | undefined,
-    update: (row: Pick<StageOutputRow, 'id' | 'status' | 'prompt_used' | 'raw_output' | 'parsed_output' | 'error'>) => updateStmt.run(row as any),
+    update: (row: Pick<StageOutputRow, 'id' | 'status' | 'prompt_used' | 'raw_output' | 'error'>) => updateStmt.run(row as any),
     delete: (id: number) => deleteStmt.run(id),
     listBySession: (sessionId: string) => listBySessionStmt.all(sessionId) as StageOutputRow[],
   }
@@ -296,6 +302,192 @@ export function createChatMessagesRepo(db: Database.Database) {
   }
 }
 
+// ── Presets Repository ────────────────────────────────────────────
+
+export function createPresetsRepo(db: Database.Database) {
+  // config_presets (header)
+  const listStmt = db.prepare('SELECT * FROM config_presets ORDER BY id')
+  const getByIdStmt = db.prepare('SELECT * FROM config_presets WHERE id = ?')
+  const getByNameStmt = db.prepare('SELECT * FROM config_presets WHERE name = ?')
+  const insertStmt = db.prepare('INSERT INTO config_presets (name, description) VALUES (@name, @description)')
+  const updateMetaStmt = db.prepare("UPDATE config_presets SET name = @name, description = @description, updated_at = datetime('now') WHERE id = @id")
+  const deleteStmt = db.prepare('DELETE FROM config_presets WHERE id = ?')
+
+  // child reads
+  const listAgentsStmt = db.prepare('SELECT * FROM config_preset_agents WHERE preset_id = ? ORDER BY sort_order, id')
+  const getCoordinatorStmt = db.prepare('SELECT * FROM config_preset_coordinator WHERE preset_id = ?')
+  const listPromptsStmt = db.prepare('SELECT * FROM config_preset_prompts WHERE preset_id = ? ORDER BY id')
+
+  // child writes (for saveContent)
+  const deleteAgentsStmt = db.prepare('DELETE FROM config_preset_agents WHERE preset_id = ?')
+  const deleteCoordinatorStmt = db.prepare('DELETE FROM config_preset_coordinator WHERE preset_id = ?')
+  const deletePromptsStmt = db.prepare('DELETE FROM config_preset_prompts WHERE preset_id = ?')
+  const insertAgentStmt = db.prepare('INSERT INTO config_preset_agents (preset_id, name, endpoint_id, model, prompt_override, sort_order) VALUES (@preset_id, @name, @endpoint_id, @model, @prompt_override, @sort_order)')
+  const insertCoordinatorStmt = db.prepare('INSERT INTO config_preset_coordinator (preset_id, endpoint_id, model, chat_endpoint_id, chat_model) VALUES (@preset_id, @endpoint_id, @model, @chat_endpoint_id, @chat_model)')
+  const insertPromptStmt = db.prepare('INSERT INTO config_preset_prompts (preset_id, kind, name, content) VALUES (@preset_id, @kind, @name, @content)')
+
+  // cross-table writes (for applyToGlobalConfig)
+  const deleteAllTranslatorAgentsStmt = db.prepare('DELETE FROM translator_agents')
+  const insertTranslatorAgentStmt = db.prepare('INSERT INTO translator_agents (name, endpoint_id, model, prompt_override, sort_order) VALUES (@name, @endpoint_id, @model, @prompt_override, @sort_order)')
+  const upsertCoordinatorStmt = db.prepare(`
+    INSERT INTO coordinator_config (id, endpoint_id, model, chat_endpoint_id, chat_model, updated_at)
+    VALUES (1, @endpoint_id, @model, @chat_endpoint_id, @chat_model, datetime('now'))
+    ON CONFLICT(id) DO UPDATE SET
+      endpoint_id = @endpoint_id,
+      model = @model,
+      chat_endpoint_id = @chat_endpoint_id,
+      chat_model = @chat_model,
+      updated_at = datetime('now')
+  `)
+  const deleteAllPromptTemplatesStmt = db.prepare('DELETE FROM prompt_templates')
+  const insertPromptTemplateStmt = db.prepare('INSERT INTO prompt_templates (kind, name, content, is_builtin) VALUES (@kind, @name, @content, 0)')
+
+  const dedupeName = (baseName: string): string => {
+    let finalName = baseName
+    let n = 2
+    while (getByNameStmt.get(finalName)) {
+      finalName = `${baseName} (${n})`
+      n++
+    }
+    return finalName
+  }
+
+  return {
+    list: () => listStmt.all() as ConfigPresetRow[],
+    getById: (id: number) => getByIdStmt.get(id) as ConfigPresetRow | undefined,
+    getFull: (id: number): FullPreset | null => {
+      const preset = getByIdStmt.get(id) as ConfigPresetRow | undefined
+      if (!preset) return null
+      const agents = listAgentsStmt.all(id) as ConfigPresetAgentRow[]
+      const coordinator = getCoordinatorStmt.get(id) as ConfigPresetCoordinatorRow | undefined
+      const prompts = listPromptsStmt.all(id) as ConfigPresetPromptRow[]
+      return { preset, agents, coordinator: coordinator ?? null, prompts }
+    },
+    create: (name: string, description?: string): number => {
+      const finalName = dedupeName(name)
+      const info = insertStmt.run({ name: finalName, description: description ?? null } as any)
+      return Number(info.lastInsertRowid)
+    },
+    updateMeta: (id: number, name: string, description?: string) => {
+      updateMetaStmt.run({ id, name, description: description ?? null } as any)
+    },
+    saveContent: (
+      id: number,
+      agents: Array<Pick<ConfigPresetAgentRow, 'name' | 'endpoint_id' | 'model' | 'prompt_override' | 'sort_order'>>,
+      coordinator: { endpoint_id: number | null; model: string; chat_endpoint_id: number | null; chat_model: string } | null,
+      prompts: Array<Pick<ConfigPresetPromptRow, 'kind' | 'name' | 'content'>>,
+    ) => {
+      const txn = db.transaction(() => {
+        deleteAgentsStmt.run(id)
+        deleteCoordinatorStmt.run(id)
+        deletePromptsStmt.run(id)
+        for (const a of agents) {
+          insertAgentStmt.run({ preset_id: id, ...a } as any)
+        }
+        if (coordinator) {
+          insertCoordinatorStmt.run({ preset_id: id, ...coordinator } as any)
+        }
+        for (const p of prompts) {
+          insertPromptStmt.run({ preset_id: id, ...p } as any)
+        }
+      })
+      txn()
+    },
+    delete: (id: number) => {
+      deleteStmt.run(id)
+    },
+    duplicate: (srcId: number, newName: string): number => {
+      const src = getByIdStmt.get(srcId) as ConfigPresetRow | undefined
+      if (!src) throw new Error(`Preset ${srcId} not found`)
+      const agents = listAgentsStmt.all(srcId) as ConfigPresetAgentRow[]
+      const coordinator = getCoordinatorStmt.get(srcId) as ConfigPresetCoordinatorRow | undefined
+      const prompts = listPromptsStmt.all(srcId) as ConfigPresetPromptRow[]
+      const finalName = dedupeName(newName)
+      const info = insertStmt.run({ name: finalName, description: src.description } as any)
+      const newId = Number(info.lastInsertRowid)
+      const txn = db.transaction(() => {
+        for (const a of agents) {
+          insertAgentStmt.run({ preset_id: newId, name: a.name, endpoint_id: a.endpoint_id, model: a.model, prompt_override: a.prompt_override, sort_order: a.sort_order } as any)
+        }
+        if (coordinator) {
+          insertCoordinatorStmt.run({ preset_id: newId, endpoint_id: coordinator.endpoint_id, model: coordinator.model, chat_endpoint_id: coordinator.chat_endpoint_id, chat_model: coordinator.chat_model } as any)
+        }
+        for (const p of prompts) {
+          insertPromptStmt.run({ preset_id: newId, kind: p.kind, name: p.name, content: p.content } as any)
+        }
+      })
+      txn()
+      return newId
+    },
+    loadWithValidation: (
+      id: number,
+      existingEndpoints: { id: number }[],
+    ): { valid: boolean; orphanEndpointRefs: { kind: string; agentIndex?: number; endpointId: number }[]; preset: FullPreset } => {
+      const preset = ((): FullPreset => {
+        const full = ((): FullPreset | null => {
+          const row = getByIdStmt.get(id) as ConfigPresetRow | undefined
+          if (!row) return null
+          const agents = listAgentsStmt.all(id) as ConfigPresetAgentRow[]
+          const coordinator = getCoordinatorStmt.get(id) as ConfigPresetCoordinatorRow | undefined
+          const prompts = listPromptsStmt.all(id) as ConfigPresetPromptRow[]
+          return { preset: row, agents, coordinator: coordinator ?? null, prompts }
+        })()
+        if (!full) throw new Error(`Preset ${id} not found`)
+        return full
+      })()
+      const known = new Set(existingEndpoints.map((e) => e.id))
+      const orphanEndpointRefs: { kind: string; agentIndex?: number; endpointId: number }[] = []
+      if (preset.coordinator) {
+        if (preset.coordinator.endpoint_id != null && !known.has(preset.coordinator.endpoint_id)) {
+          orphanEndpointRefs.push({ kind: 'coordinator.endpoint', endpointId: preset.coordinator.endpoint_id })
+        }
+        if (preset.coordinator.chat_endpoint_id != null && !known.has(preset.coordinator.chat_endpoint_id)) {
+          orphanEndpointRefs.push({ kind: 'coordinator.chat_endpoint', endpointId: preset.coordinator.chat_endpoint_id })
+        }
+      }
+      preset.agents.forEach((a, idx) => {
+        if (a.endpoint_id != null && !known.has(a.endpoint_id)) {
+          orphanEndpointRefs.push({ kind: 'agent.endpoint', agentIndex: idx, endpointId: a.endpoint_id })
+        }
+      })
+      return { valid: orphanEndpointRefs.length === 0, orphanEndpointRefs, preset }
+    },
+    applyToGlobalConfig: (id: number, orphanEndpointIds: number[]) => {
+      const full = ((): FullPreset => {
+        const row = getByIdStmt.get(id) as ConfigPresetRow | undefined
+        if (!row) throw new Error(`Preset ${id} not found`)
+        const agents = listAgentsStmt.all(id) as ConfigPresetAgentRow[]
+        const coordinator = getCoordinatorStmt.get(id) as ConfigPresetCoordinatorRow | undefined
+        const prompts = listPromptsStmt.all(id) as ConfigPresetPromptRow[]
+        return { preset: row, agents, coordinator: coordinator ?? null, prompts }
+      })()
+      const orphan = new Set(orphanEndpointIds)
+      const txn = db.transaction(() => {
+        deleteAllTranslatorAgentsStmt.run()
+        for (const a of full.agents) {
+          // translator_agents.endpoint_id is NOT NULL — skip agents referencing orphaned endpoints
+          if (a.endpoint_id != null && orphan.has(a.endpoint_id)) continue
+          insertTranslatorAgentStmt.run({ name: a.name, endpoint_id: a.endpoint_id, model: a.model, prompt_override: a.prompt_override, sort_order: a.sort_order } as any)
+        }
+        const coord = full.coordinator
+        const endpointId = coord && coord.endpoint_id != null && !orphan.has(coord.endpoint_id) ? coord.endpoint_id : null
+        const chatEndpointId = coord && coord.chat_endpoint_id != null && !orphan.has(coord.chat_endpoint_id) ? coord.chat_endpoint_id : null
+        upsertCoordinatorStmt.run({
+          endpoint_id: endpointId,
+          model: coord?.model ?? '',
+          chat_endpoint_id: chatEndpointId,
+          chat_model: coord?.chat_model ?? '',
+        } as any)
+        deleteAllPromptTemplatesStmt.run()
+        for (const p of full.prompts) {
+          insertPromptTemplateStmt.run({ kind: p.kind, name: p.name, content: p.content } as any)
+        }
+      })
+      txn()
+    },
+  }
+}
+
 // ── Combined repo accessor ────────────────────────────────────────
 
 export interface Repositories {
@@ -309,6 +501,7 @@ export interface Repositories {
   stageOutputs: ReturnType<typeof createStageOutputsRepo>
   finalVersions: ReturnType<typeof createFinalVersionsRepo>
   chatMessages: ReturnType<typeof createChatMessagesRepo>
+  presets: ReturnType<typeof createPresetsRepo>
 }
 
 export function createRepositories(db: Database.Database): Repositories {
@@ -323,5 +516,6 @@ export function createRepositories(db: Database.Database): Repositories {
     stageOutputs: createStageOutputsRepo(db),
     finalVersions: createFinalVersionsRepo(db),
     chatMessages: createChatMessagesRepo(db),
+    presets: createPresetsRepo(db),
   }
 }

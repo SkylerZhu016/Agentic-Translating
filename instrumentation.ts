@@ -3,6 +3,9 @@
 // seed() 幂等：已有内置模板时跳过；仅在 nodejs runtime 下执行
 // ---------------------------------------------------------------------------
 
+import fs from 'fs'
+import path from 'path'
+
 export async function register() {
   if (process.env.NEXT_RUNTIME === 'nodejs') {
     const { getDb } = await import('@/src/lib/db')
@@ -11,5 +14,9 @@ export async function register() {
     const db = getDb()
     migrate(db)
     seed(db)
+
+    // Ensure run artifacts directory exists
+    const runsDir = path.resolve(process.cwd(), 'data', 'runs')
+    fs.mkdirSync(runsDir, { recursive: true })
   }
 }

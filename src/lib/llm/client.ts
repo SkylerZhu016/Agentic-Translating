@@ -328,6 +328,7 @@ async function nonStreamCompletion(
   const choice = (body.choices as Array<Record<string, unknown>>)?.[0];
   const message = choice?.message as Record<string, unknown> | undefined;
   const content = (message?.content as string) ?? '';
+  // reasoning_content/thinking intentionally discarded — not included in response
 
   // Extract tool calls
   let toolCalls: ChatCompletionResponse['toolCalls'] | undefined;
@@ -395,6 +396,7 @@ async function* streamCompletion(
     const choice = (body.choices as Array<Record<string, unknown>>)?.[0];
     const message = choice?.message as Record<string, unknown> | undefined;
     const content = (message?.content as string) ?? '';
+    // reasoning_content/thinking intentionally discarded — not accumulated
 
     // Emit as text event
     if (content) {
@@ -502,6 +504,7 @@ async function* streamCompletion(
           if (!deltaObj) continue;
 
           // ---- Text delta ----
+          // reasoning_content/thinking intentionally discarded — not accumulated
           if (typeof deltaObj.content === 'string' && deltaObj.content.length > 0) {
             accumulatedContent += deltaObj.content;
             yield { type: 'text', content: deltaObj.content };
