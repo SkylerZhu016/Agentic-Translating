@@ -156,6 +156,7 @@ export async function POST(
       try {
         const summary = await runFanOut([singleAgent], callbacks, chatCompletion, {
           signal: controller.signal,
+          sessionId: id,
         });
 
         // ── Persist result to DB ─────────────────────────────────

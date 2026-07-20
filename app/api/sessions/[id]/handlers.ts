@@ -6,6 +6,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import Database from 'better-sqlite3'
 import { createRepositories } from '@/src/lib/db/repositories'
 import { createSessionService } from '@/src/lib/services/session-service'
+import { deleteRunArtifacts } from '@/src/lib/storage/run-artifacts'
 
 export function createHandlers(db: Database.Database) {
   const repos = createRepositories(db)
@@ -46,6 +47,24 @@ export function createHandlers(db: Database.Database) {
         },
         { status: 200 },
       )
+    },
+
+    // ────────────────────────────────────────────────────────────
+    // DELETE /api/sessions/:id — delete session + cascade txt artifacts
+    // ────────────────────────────────────────────────────────────
+    async DELETE(
+      _request: NextRequest,
+      { params }: { params: Promise<{ id: string }> },
+    ) {
+      const { id } = await params
+
+      // Clean up txt artifacts (best-effort, never throws)
+      deleteRunArtifacts(id)
+
+      // Delete session from DB (cascades to child records)
+      repos.sessions.delete(id)
+
+      return new NextResponse(null, { status: 204 })
     },
   }
 }

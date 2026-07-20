@@ -18,3 +18,8 @@ export const GET = (
   req: NextRequest,
   ctx: { params: Promise<{ id: string }> },
 ) => prod().GET(req, ctx)
+
+export const DELETE = (
+  req: NextRequest,
+  ctx: { params: Promise<{ id: string }> },
+) => prod().DELETE(req, ctx)

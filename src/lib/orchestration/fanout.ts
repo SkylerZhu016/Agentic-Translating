@@ -14,6 +14,7 @@ import {
   RETRY_DELAYS_MS,
   AGENT_TIMEOUT_MS,
 } from '../constants';
+import { writeRunArtifact } from '../storage/run-artifacts';
 import type {
   ChatCompletionRequest,
   ChatCompletionResponse,
@@ -78,6 +79,8 @@ export interface FanOutOptions {
   signal?: AbortSignal;
   /** Concurrency counter for testing (mutated in-place) */
   concurrencyCounter?: ConcurrencyCounter;
+  /** Session ID for writing draft txt artifacts */
+  sessionId?: string;
 }
 
 /** Retryable error: has a `retryable` property that is true */
@@ -160,6 +163,7 @@ async function runOneAgent(
   llmCall: LLMCaller,
   signal: AbortSignal,
   counter?: ConcurrencyCounter,
+  sessionId?: string,
 ): Promise<AgentResult> {
   const maxRetries = RETRY_DELAYS_MS.length;
 
@@ -217,6 +221,11 @@ async function runOneAgent(
             accumulatedContent = event.content;
           }
         }
+      }
+
+      // Write draft txt artifact (best-effort)
+      if (sessionId) {
+        writeRunArtifact(sessionId, `draft-${agent.agentKey}`, accumulatedContent);
       }
 
       const result: AgentResult = {
@@ -335,6 +344,7 @@ export async function runFanOut(
         llmCall,
         signal,
         opts.concurrencyCounter,
+        opts.sessionId,
       );
       return result;
     } catch {
