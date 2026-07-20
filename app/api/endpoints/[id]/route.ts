@@ -110,7 +110,22 @@ export async function DELETE(
       )
     }
 
-    repos.endpoints.delete(id)
+    // When force=1, temporarily disable FK enforcement so the endpoint can be
+    // deleted even if preset snapshot tables (config_preset_agents,
+    // config_preset_coordinator) still reference it. Preset snapshots are
+    // historical references — they intentionally retain stale endpoint_ids so
+    // the load-with-validation orphan check can detect them later.
+    if (force) {
+      const db = ensureDb().db
+      db.pragma('foreign_keys = OFF')
+      try {
+        repos.endpoints.delete(id)
+      } finally {
+        db.pragma('foreign_keys = ON')
+      }
+    } else {
+      repos.endpoints.delete(id)
+    }
     return NextResponse.json({ success: true })
   } catch (e) {
     return NextResponse.json({ error: 'Failed to delete endpoint' }, { status: 500 })

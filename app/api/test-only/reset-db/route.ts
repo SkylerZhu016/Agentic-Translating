@@ -26,6 +26,9 @@ import { migrate } from '@/src/lib/db/migrate'
 import { seed } from '@/src/lib/db/seed'
 
 // Domain tables in FK-safe deletion order (children before parents).
+// Includes preset child tables (config_preset_*) so that seed() can re-insert
+// the 默认预设 without hitting a UNIQUE constraint violation on repeated
+// resets. FK enforcement is OFF during deletion, but order is kept logical.
 const DOMAIN_TABLES = [
   'chat_messages',
   'final_versions',
@@ -36,6 +39,10 @@ const DOMAIN_TABLES = [
   'coordinator_config',
   'translator_agents',
   'prompt_templates',
+  'config_preset_prompts',
+  'config_preset_coordinator',
+  'config_preset_agents',
+  'config_presets',
   'endpoints',
 ] as const
 

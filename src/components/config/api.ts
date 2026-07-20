@@ -3,6 +3,8 @@
 // 统一错误形状：ApiError{ status, payload }，message 取自服务端 error 字段
 // ---------------------------------------------------------------------------
 
+import type { ConfigPresetRow, FullPreset } from '@/src/lib/contracts/types'
+
 export interface Endpoint {
   id: number
   name: string
@@ -31,6 +33,12 @@ export interface CoordinatorConfig {
   /** PUT 响应可能附带 flash 警告（R2） */
   warning?: string
   warning_id?: string
+}
+
+/** POST /api/presets/{id}/load 响应形状 */
+export interface LoadPresetResult {
+  applied: boolean
+  warnings?: { kind: string; agentIndex?: number; endpointId: number }[]
 }
 
 export type PromptKind = 'translator' | 'review' | 'filter' | 'orchestrate' | 'assemble'
@@ -162,5 +170,31 @@ export const configApi = {
   resetPrompts: () =>
     request<{ success: true; prompts: PromptTemplate[] }>('/api/prompts/reset', {
       method: 'POST',
+    }),
+
+  // ── 预设 ──────────────────────────────────────────────
+  listPresets: () => request<ConfigPresetRow[]>('/api/presets'),
+  getPreset: (id: number) => request<FullPreset>(`/api/presets/${id}`),
+  createPreset: (opts: {
+    name: string
+    description?: string
+    fromCurrentConfig?: boolean
+    fromPresetId?: number
+  }) => request<{ id: number }>('/api/presets', { method: 'POST', body: JSON.stringify(opts) }),
+  updatePreset: (
+    id: number,
+    body: {
+      name?: string
+      description?: string
+      agents?: any[]
+      coordinator?: any
+      prompts?: any[]
+    },
+  ) => request<void>(`/api/presets/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
+  deletePreset: (id: number) => request<void>(`/api/presets/${id}`, { method: 'DELETE' }),
+  loadPreset: (id: number, force?: boolean) =>
+    request<LoadPresetResult>(`/api/presets/${id}/load`, {
+      method: 'POST',
+      body: JSON.stringify({ force: force === true }),
     }),
 }
