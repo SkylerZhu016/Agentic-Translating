@@ -41,7 +41,7 @@ describe('DB Migrations — In-Memory DB', () => {
     expect(tables).toContain('migrations')
   })
 
-  it('creates all 8 tables', () => {
+  it('creates all domain tables', () => {
     migrate(db)
     const tables = listTables(db)
     expect(tables).toContain('endpoints')
@@ -54,16 +54,38 @@ describe('DB Migrations — In-Memory DB', () => {
     expect(tables).toContain('stage_outputs')
     expect(tables).toContain('final_versions')
     expect(tables).toContain('chat_messages')
-    // 8 domain tables + migrations meta table + sqlite_sequence (AUTOINCREMENT) = 10
-    expect(tables.length).toBeGreaterThanOrEqual(9)
+    // Migration 0002 adds preset tables
+    expect(tables).toContain('config_presets')
+    expect(tables).toContain('config_preset_agents')
+    expect(tables).toContain('config_preset_coordinator')
+    expect(tables).toContain('config_preset_prompts')
+    // 10 domain tables + migrations meta table + sqlite_sequence (AUTOINCREMENT) = 12+
+    expect(tables.length).toBeGreaterThanOrEqual(12)
   })
 
   it('is idempotent — 3x migrate → 1 version', () => {
     migrate(db); migrate(db); migrate(db)
     const version = (db.prepare('SELECT MAX(version) as v FROM migrations').get() as { v: number | null }).v
-    expect(version).toBe(1)
+    expect(version).toBe(2)
     const count = (db.prepare('SELECT COUNT(*) as c FROM migrations').get() as { c: number }).c
-    expect(count).toBe(1)
+    expect(count).toBe(2)
+  })
+
+  it('creates config_presets and child tables (migration 0002)', () => {
+    migrate(db)
+    const tables = listTables(db)
+    expect(tables).toContain('config_presets')
+    expect(tables).toContain('config_preset_agents')
+    expect(tables).toContain('config_preset_coordinator')
+    expect(tables).toContain('config_preset_prompts')
+  })
+
+  it('drops parsed_output column from stage_outputs (migration 0002)', () => {
+    migrate(db)
+    const cols = db.prepare("PRAGMA table_info('stage_outputs')").all() as { name: string }[]
+    const names = cols.map((c) => c.name)
+    expect(names).not.toContain('parsed_output')
+    expect(names).toContain('raw_output')
   })
 
   it('has correct endpoints columns', () => {
@@ -124,8 +146,9 @@ describe('DB Migrations — File DB', () => {
     db2.pragma('foreign_keys = ON')
     migrate(db2)
     const v = (db2.prepare('SELECT MAX(version) as v FROM migrations').get() as { v: number | null }).v
-    expect(v).toBe(1)
+    expect(v).toBe(2)
     expect(listTables(db2)).toContain('endpoints')
+    expect(listTables(db2)).toContain('config_presets')
     db2.close()
   })
 })

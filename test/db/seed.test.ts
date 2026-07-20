@@ -30,6 +30,14 @@ describe('seed — built-in prompt templates', () => {
     expect(builtins.length).toBe(5)
   })
 
+  it('also seeds the default builtin preset on first call', () => {
+    seed(db)
+    const presets = db.prepare('SELECT * FROM config_presets WHERE is_builtin = 1').all() as { id: number; name: string; is_builtin: number }[]
+    expect(presets.length).toBeGreaterThanOrEqual(1)
+    expect(presets[0].name).toBe('默认预设')
+    expect(presets[0].is_builtin).toBe(1)
+  })
+
   it('is idempotent — second seed call inserts no duplicates', () => {
     seed(db)
     seed(db)
@@ -87,62 +95,55 @@ describe('seed — built-in prompt templates', () => {
     expect(row.content).toContain('{{extra_instructions}}')
   })
 
-  it('review template contains C2 schema field names', () => {
+  it('review template instructs free-form output with --- separator', () => {
     seed(db)
     const repos = createRepositories(db)
     const row = repos.promptTemplates.listByKind('review')[0]
     expect(row).toBeDefined()
-    // C2 review schema field names (exact match from contracts/schemas.ts)
-    expect(row.content).toContain('"assessments"')
-    expect(row.content).toContain('"agent_id"')
-    expect(row.content).toContain('"strengths"')
-    expect(row.content).toContain('"weaknesses"')
-    expect(row.content).toContain('"quality_score"')
-    expect(row.content).toContain('"keep"')
+    // Free-form output convention: body + --- + notes
+    expect(row.content).toContain('---')
+    expect(row.content).toMatch(/自由输出|审查意见/)
   })
 
-  it('filter template contains C2 schema field names', () => {
+  it('filter template instructs free-form output with --- separator', () => {
     seed(db)
     const repos = createRepositories(db)
     const row = repos.promptTemplates.listByKind('filter')[0]
     expect(row).toBeDefined()
-    expect(row.content).toContain('"selected_agent_ids"')
-    expect(row.content).toContain('"rationale"')
-    expect(row.content).toContain('"rejected_agent_ids"')
+    expect(row.content).toContain('---')
+    expect(row.content).toMatch(/自由输出|筛选/)
   })
 
-  it('orchestrate template contains C2 schema field names', () => {
+  it('orchestrate template instructs free-form output with --- separator', () => {
     seed(db)
     const repos = createRepositories(db)
     const row = repos.promptTemplates.listByKind('orchestrate')[0]
     expect(row).toBeDefined()
-    expect(row.content).toContain('"structure_notes"')
-    expect(row.content).toContain('"segment_assignments"')
-    expect(row.content).toContain('"segment_index"')
-    expect(row.content).toContain('"source_agent_id"')
-    expect(row.content).toContain('"source_segment"')
-    expect(row.content).toContain('"rationale"')
+    expect(row.content).toContain('---')
+    expect(row.content).toMatch(/自由输出|编排/)
   })
 
-  it('assemble template contains C2 schema field names', () => {
+  it('assemble template instructs free-form output with --- separator', () => {
     seed(db)
     const repos = createRepositories(db)
     const row = repos.promptTemplates.listByKind('assemble')[0]
     expect(row).toBeDefined()
-    expect(row.content).toContain('"final_text"')
-    expect(row.content).toContain('"notes"')
+    expect(row.content).toContain('---')
+    expect(row.content).toMatch(/自由输出|最终译文/)
   })
 
-  it('all four stage templates instruct "strictly output JSON only"', () => {
+  it('all four stage templates instruct free-form output (no strict JSON)', () => {
     seed(db)
     const repos = createRepositories(db)
     const stageKinds: PromptTemplateRow['kind'][] = ['review', 'filter', 'orchestrate', 'assemble']
     for (const kind of stageKinds) {
       const row = repos.promptTemplates.listByKind(kind)[0]
-      // Each stage template must contain the instruction to output JSON only
-      // Check for the Chinese phrase "严格只输出" (strictly output only)
-      expect(row.content, `kind=${kind} should contain strict-JSON instruction`)
-        .toMatch(/严格只输出/)
+      // Each stage template must instruct free-form output (NOT strict JSON)
+      expect(row.content, `kind=${kind} should NOT contain strict-JSON instruction`)
+        .not.toMatch(/严格只输出/)
+      // And must contain the free-form output clause
+      expect(row.content, `kind=${kind} should contain free-form output clause`)
+        .toMatch(/自由输出/)
     }
   })
 

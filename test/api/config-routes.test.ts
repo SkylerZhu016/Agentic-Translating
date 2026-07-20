@@ -26,8 +26,12 @@ function mockReq(method: string, url: string, body?: unknown): NextRequest {
 }
 
 // ── DB setup ───────────────────────────────────────────────────────
-const MIGRATION_SQL = fs.readFileSync(
+const MIGRATION_SQL_0001 = fs.readFileSync(
   path.join(process.cwd(), 'src/lib/db/migrations/0001_init.sql'),
+  'utf-8',
+)
+const MIGRATION_SQL_0002 = fs.readFileSync(
+  path.join(process.cwd(), 'src/lib/db/migrations/0002_presets_and_drop_parsed_output.sql'),
   'utf-8',
 )
 
@@ -36,7 +40,8 @@ function createTestDb() {
   db.pragma('foreign_keys = ON')
 
   // Run domain schema
-  db.exec(MIGRATION_SQL)
+  db.exec(MIGRATION_SQL_0001)
+  db.exec(MIGRATION_SQL_0002)
 
   // Create migrations tracking table (normally created by migrate() function)
   db.exec(`CREATE TABLE IF NOT EXISTS migrations (
@@ -45,8 +50,9 @@ function createTestDb() {
     applied_at TEXT DEFAULT (datetime('now'))
   )`)
 
-  // Insert migration record so migrate() is a no-op when handlers call it
+  // Insert migration records so migrate() is a no-op when handlers call it
   db.prepare('INSERT INTO migrations (version, name) VALUES (?, ?)').run(1, '0001_init.sql')
+  db.prepare('INSERT INTO migrations (version, name) VALUES (?, ?)').run(2, '0002_presets_and_drop_parsed_output.sql')
 
   // Set global singleton so getDb() returns this in-memory instance
   ;(globalThis as Record<string, unknown>).__db = db

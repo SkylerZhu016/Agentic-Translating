@@ -153,13 +153,13 @@ describe('Repositories — CRUD round-trip', () => {
     sessRepo.insert({ id: 's1', source_text: 'Hello', source_lang: '英文', target_lang: '中文', state: 'draft', config_snapshot: '{}' })
 
     const repo = createRepositories(db).stageOutputs
-    const r = repo.insert({ session_id: 's1', stage: 'review', status: 'pending', prompt_used: null, raw_output: null, parsed_output: null, error: null })
+    const r = repo.insert({ session_id: 's1', stage: 'review', status: 'pending', prompt_used: null, raw_output: null, error: null })
     const id = r.lastInsertRowid as number
 
     expect(repo.getById(id)!.stage).toBe('review')
     expect(repo.getBySessionAndStage('s1', 'review')!.status).toBe('pending')
 
-    repo.update({ id, status: 'complete', prompt_used: 'prompt', raw_output: 'raw', parsed_output: '{}', error: null })
+    repo.update({ id, status: 'complete', prompt_used: 'prompt', raw_output: 'raw', error: null })
     expect(repo.getById(id)!.status).toBe('complete')
 
     expect(repo.listBySession('s1').length).toBe(1)
@@ -217,7 +217,7 @@ describe('Repositories — CRUD round-trip', () => {
     repos.sessions.insert({ id: 's1', source_text: 'Hello', source_lang: '英文', target_lang: '中文', state: 'draft', config_snapshot: '{}' })
 
     repos.translationResults.insert({ session_id: 's1', agent_key: 'a1', agent_snapshot: '{}', status: 'pending', output_text: null, error: null, latency_ms: null, attempt: 0 })
-    repos.stageOutputs.insert({ session_id: 's1', stage: 'review', status: 'pending', prompt_used: null, raw_output: null, parsed_output: null, error: null })
+    repos.stageOutputs.insert({ session_id: 's1', stage: 'review', status: 'pending', prompt_used: null, raw_output: null, error: null })
     repos.finalVersions.insert({ session_id: 's1', version_no: 1, text: 't', source: 'assemble' })
     repos.chatMessages.insert({ session_id: 's1', role: 'user', content: 'hi', tool_calls: null, tool_results: null, version_id: null })
 

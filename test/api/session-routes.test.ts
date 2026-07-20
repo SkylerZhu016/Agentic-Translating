@@ -13,20 +13,24 @@ import { createHandlers as createSessionHandlers } from '../../app/api/sessions/
 import { createHandlers as createSessionDetailHandlers } from '../../app/api/sessions/[id]/handlers'
 import { createHandlers as createRestoreHandlers } from '../../app/api/sessions/[id]/versions/[versionNo]/restore/handlers'
 
-// ── Inline migration SQL ─────────────────────────────────────────
-const MIGRATION_SQL = fs.readFileSync(
+// 鈹€鈹€ Inline migration SQL 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+const MIGRATION_SQL_0001 = fs.readFileSync(
   path.join(process.cwd(), 'src/lib/db/migrations/0001_init.sql'),
   'utf-8',
 )
+const MIGRATION_SQL_0002 = fs.readFileSync(
+  path.join(process.cwd(), 'src/lib/db/migrations/0002_presets_and_drop_parsed_output.sql'),
+  'utf-8',
+)
 
-// ── Shared test data ──────────────────────────────────────────────
+// 鈹€鈹€ Shared test data 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 const DEF_INPUT = {
   sourceText: 'Hello world',
   sourceLang: 'English',
   targetLang: 'Chinese',
 }
 
-// ── Helper to seed baseline config (endpoint, agents, coordinator) ─
+// 鈹€鈹€ Helper to seed baseline config (endpoint, agents, coordinator) 鈹€
 function seedBaseline(repos: ReturnType<typeof createRepositories>): void {
   repos.endpoints.insert({
     name: 'test-ep',
@@ -68,7 +72,7 @@ function seedBaseline(repos: ReturnType<typeof createRepositories>): void {
 }
 
 // ==================================================================
-// POST /api/sessions — createSession
+// POST /api/sessions 鈥?createSession
 // ==================================================================
 describe('POST /api/sessions', () => {
   let db: Database.Database
@@ -78,7 +82,7 @@ describe('POST /api/sessions', () => {
   beforeEach(() => {
     db = new Database(':memory:')
     db.pragma('foreign_keys = ON')
-    db.exec(MIGRATION_SQL)
+    db.exec(MIGRATION_SQL_0001); db.exec(MIGRATION_SQL_0002)
     repos = createRepositories(db)
     seedBaseline(repos)
     POST = createSessionHandlers(db).POST
@@ -170,7 +174,7 @@ describe('POST /api/sessions', () => {
 })
 
 // ==================================================================
-// GET /api/sessions — listSessions
+// GET /api/sessions 鈥?listSessions
 // ==================================================================
 describe('GET /api/sessions', () => {
   let db: Database.Database
@@ -181,7 +185,7 @@ describe('GET /api/sessions', () => {
   beforeEach(() => {
     db = new Database(':memory:')
     db.pragma('foreign_keys = ON')
-    db.exec(MIGRATION_SQL)
+    db.exec(MIGRATION_SQL_0001); db.exec(MIGRATION_SQL_0002)
     repos = createRepositories(db)
     seedBaseline(repos)
     service = createSessionService(db, repos)
@@ -241,7 +245,7 @@ describe('GET /api/sessions', () => {
 })
 
 // ==================================================================
-// GET /api/sessions/:id — getSessionFull
+// GET /api/sessions/:id 鈥?getSessionFull
 // ==================================================================
 describe('GET /api/sessions/:id', () => {
   let db: Database.Database
@@ -252,7 +256,7 @@ describe('GET /api/sessions/:id', () => {
   beforeEach(() => {
     db = new Database(':memory:')
     db.pragma('foreign_keys = ON')
-    db.exec(MIGRATION_SQL)
+    db.exec(MIGRATION_SQL_0001); db.exec(MIGRATION_SQL_0002)
     repos = createRepositories(db)
     seedBaseline(repos)
     service = createSessionService(db, repos)
@@ -281,7 +285,6 @@ describe('GET /api/sessions/:id', () => {
       status: 'pending',
       prompt_used: null,
       raw_output: null,
-      parsed_output: null,
       error: null,
     })
     repos.finalVersions.insert({
@@ -339,7 +342,7 @@ describe('GET /api/sessions/:id', () => {
 })
 
 // ==================================================================
-// POST /api/sessions/:id/versions/:versionNo/restore — version restore
+// POST /api/sessions/:id/versions/:versionNo/restore 鈥?version restore
 // ==================================================================
 describe('POST /api/sessions/:id/versions/:versionNo/restore', () => {
   let db: Database.Database
@@ -350,7 +353,7 @@ describe('POST /api/sessions/:id/versions/:versionNo/restore', () => {
   beforeEach(() => {
     db = new Database(':memory:')
     db.pragma('foreign_keys = ON')
-    db.exec(MIGRATION_SQL)
+    db.exec(MIGRATION_SQL_0001); db.exec(MIGRATION_SQL_0002)
     repos = createRepositories(db)
     seedBaseline(repos)
     service = createSessionService(db, repos)
@@ -378,7 +381,7 @@ describe('POST /api/sessions/:id/versions/:versionNo/restore', () => {
       source: 'edit',
     })
 
-    // Restore version 1 → should create version 3
+    // Restore version 1 鈫?should create version 3
     const req = new NextRequest(
       `http://localhost/api/sessions/${s.id}/versions/1/restore`,
       { method: 'POST' },

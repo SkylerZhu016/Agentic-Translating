@@ -111,7 +111,10 @@ async function runAllStages(page: Page, request: APIRequestContext): Promise<voi
         ])
         break
       case 'assemble':
-        jsonContent = buildAssembleOutput(FINAL_TEXT, 'assembled with original text placeholder')
+        // Notes must NOT contain the substring "original text" — otherwise it
+        // appears twice in the JSON string (in final_text AND notes), causing
+        // the editing matcher to reject the tool_call replacement as ambiguous.
+        jsonContent = buildAssembleOutput(FINAL_TEXT, 'assembled from two segments.')
         break
     }
     await setMockBehavior(request, { behavior: 'json_content', model: COORD_MODEL, jsonContent })

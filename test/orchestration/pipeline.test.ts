@@ -1,24 +1,20 @@
 /**
- * pipeline.test.ts — TDD for 四阶段管道运行器 (Wave 2 Task 11)
+ * pipeline.test.ts — TDD for 四阶段管道运行器
  *
  * Covers:
- *   - extractJson: clean JSON, markdown fence, prose-wrapped, nested brackets
  *   - markDownstreamStale: all 4 stages → correct downstream list
  *   - Stage ordering guard: prerequisite missing → stage_prerequisite_missing
- *   - All 4 stages with valid JSON → parsed_output matches C2 schemas
- *   - Malformed JSON → auto retry (2 total requests) → still bad → stage_schema_error
- *   - Malformed JSON → retry succeeds → ok
- *   - JSON inside ```json ... ``` fence → correctly extracted and parsed
- *   - Callbacks: onStageStart, onDelta, onStageComplete, onSchemaError, onError, onAssembled
- *   - Assemble success → callbacks.onAssembled(finalText)
+ *   - All 4 stages return raw_text correctly
+ *   - Assemble stage extracts final_text from raw response
+ *   - Callbacks: onStageStart, onDelta, onStageComplete, onError, onAssembled
+ *   - Assemble success → callbacks.onAssembled(finalText) with split extraction
  *
  * Uses an injectable mock LLM caller — no HTTP server needed.
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   runStage,
-  extractJson,
   markDownstreamStale,
   type StageRunResult,
   type SessionContext,
@@ -27,7 +23,6 @@ import {
 } from '../../src/lib/orchestration/pipeline';
 import type { Stage, StageOutput, TranslationResult } from '../../src/lib/contracts/types';
 import type { ChatCompletionResponse, ChatCompletionRequest } from '../../src/lib/llm/client';
-import { reviewOutputSchema, filterOutputSchema, orchestrateOutputSchema, assembleOutputSchema } from '../../src/lib/contracts/schemas';
 
 // =============================================================================
 // Helpers
@@ -42,7 +37,6 @@ function stageOut(overrides: Partial<StageOutput> = {}): StageOutput {
     status: 'complete',
     prompt_used: null,
     raw_output: null,
-    parsed_output: null,
     error: null,
     ...overrides,
   };
@@ -67,6 +61,7 @@ function trans(overrides: Partial<TranslationResult> = {}): TranslationResult {
 /** Create a minimal SessionContext */
 function makeCtx(overrides: Partial<SessionContext> = {}): SessionContext {
   return {
+    sessionId: 'sess_01J',
     sourceText: 'Hello world',
     sourceLang: 'en',
     targetLang: 'zh',
@@ -108,86 +103,6 @@ function mockStreamLLM(content: string): LLMCaller {
   } as any);
 }
 
-/** Create a mock LLM caller that fails on first call, succeeds on second */
-function mockRetryLLM(firstContent: string, secondContent: string): LLMCaller {
-  let callCount = 0;
-  return vi.fn(async (
-    _endpoint: { baseUrl: string; apiKey: string },
-    _request: ChatCompletionRequest,
-  ) => {
-    callCount++;
-    const content = callCount === 1 ? firstContent : secondContent;
-    const response: ChatCompletionResponse = { content };
-    return response;
-  });
-}
-
-// =============================================================================
-// extractJson
-// =============================================================================
-
-describe('extractJson', () => {
-  it('returns clean JSON unchanged', () => {
-    const json = '{"key":"value"}';
-    expect(extractJson(json)).toBe(json);
-  });
-
-  it('extracts JSON from markdown code fence (```json ... ```)', () => {
-    const raw = '```json\n{"key":"value"}\n```';
-    expect(extractJson(raw)).toBe('{"key":"value"}');
-  });
-
-  it('extracts JSON from generic code fence (``` ... ```)', () => {
-    const raw = '```\n{"key":"value"}\n```';
-    expect(extractJson(raw)).toBe('{"key":"value"}');
-  });
-
-  it('extracts JSON object surrounded by prose before', () => {
-    const raw = 'Here is your result:\n{"ok":true,"data":{"nested":"yes"}}\nHope this helps!';
-    expect(extractJson(raw)).toBe('{"ok":true,"data":{"nested":"yes"}}');
-  });
-
-  it('extracts JSON array from prose', () => {
-    const raw = 'Results: [1, 2, 3] end.';
-    expect(extractJson(raw)).toBe('[1, 2, 3]');
-  });
-
-  it('handles nested objects and arrays correctly', () => {
-    const raw = 'Some text {"a": [1, {"b": "c"}, [2, 3]], "d": {"e": "f"}} trailing text';
-    expect(extractJson(raw)).toBe('{"a": [1, {"b": "c"}, [2, 3]], "d": {"e": "f"}}');
-  });
-
-  it('returns empty string when no JSON found', () => {
-    expect(extractJson('no json here at all')).toBe('');
-  });
-
-  it('handles JSON with string values containing { and }', () => {
-    const raw = '{"greeting": "hello {world}"}';
-    expect(extractJson(raw)).toBe('{"greeting": "hello {world}"}');
-  });
-
-  it('handles JSON with escaped quotes', () => {
-    const raw = '{"quote": "he said \\"hello\\""}';
-    expect(extractJson(raw)).toBe('{"quote": "he said \\"hello\\""}');
-  });
-
-  it('handles JSON with escaped backslashes', () => {
-    const raw = '{"path": "C:\\\\Users\\\\test"}';
-    expect(extractJson(raw)).toBe('{"path": "C:\\\\Users\\\\test"}');
-  });
-
-  it('handles unclosed brackets gracefully', () => {
-    const raw = '{"key": "value"';
-    // Bracket never closes; no valid JSON extractable
-    expect(extractJson(raw)).toBe('');
-  });
-
-  it('picks the first valid JSON when multiple objects exist', () => {
-    const raw = '{"first":1} and {"second":2}';
-    expect(extractJson(raw)).toBe('{"first":1}');
-  });
-});
-
 // =============================================================================
 // markDownstreamStale
 // =============================================================================
@@ -216,7 +131,7 @@ describe('markDownstreamStale', () => {
 
 describe('stage prerequisite guard', () => {
   it('review has no prerequisite — runs normally', async () => {
-    const llm = mockLLM(JSON.stringify({ assessments: [{ agent_id: 'a1', strengths: [], weaknesses: [], quality_score: 5, keep: true }] }));
+    const llm = mockLLM('some output text');
     const ctx = makeCtx({ priorStages: [] });
 
     const result = await runStage('review', ctx, {}, llm);
@@ -224,7 +139,7 @@ describe('stage prerequisite guard', () => {
   });
 
   it('filter without complete review → stage_prerequisite_missing', async () => {
-    const llm = mockLLM('{}');
+    const llm = mockLLM('output');
     const ctx = makeCtx({ priorStages: [] });
 
     const result = await runStage('filter', ctx, {}, llm);
@@ -234,7 +149,7 @@ describe('stage prerequisite guard', () => {
   });
 
   it('orchestrate without complete filter → stage_prerequisite_missing', async () => {
-    const llm = mockLLM('{}');
+    const llm = mockLLM('output');
     const ctx = makeCtx({
       priorStages: [stageOut({ stage: 'review', status: 'complete' })],
     });
@@ -246,7 +161,7 @@ describe('stage prerequisite guard', () => {
   });
 
   it('assemble without complete orchestrate → stage_prerequisite_missing', async () => {
-    const llm = mockLLM('{}');
+    const llm = mockLLM('output');
     const ctx = makeCtx({
       priorStages: [
         stageOut({ stage: 'review', status: 'complete' }),
@@ -261,64 +176,38 @@ describe('stage prerequisite guard', () => {
   });
 
   it('filter with complete review → proceeds (no prereq error)', async () => {
-    const llm = mockLLM(JSON.stringify({ selected_agent_ids: ['a1'], rejected_agent_ids: [], rationale: 'ok' }));
+    const llm = mockLLM('some output for filter');
     const ctx = makeCtx({
       priorStages: [stageOut({ stage: 'review', status: 'complete' })],
     });
 
     const result = await runStage('filter', ctx, {}, llm);
-    // Should not be prereq error — may be schema or success
+    // Should not be prereq error
     expect(result.code).not.toBe('stage_prerequisite_missing');
   });
 });
 
 // =============================================================================
-// All 4 stages — success paths with valid JSON
+// All 4 stages — success paths
 // =============================================================================
 
 describe('runStage — success paths', () => {
   describe('review stage', () => {
-    it('returns ok with parsed_output matching reviewOutputSchema', async () => {
-      const validReview = {
-        assessments: [
-          { agent_id: 'agent1', strengths: ['good flow'], weaknesses: ['missed nuance'], quality_score: 7, keep: true },
-          { agent_id: 'agent2', strengths: ['accurate'], weaknesses: ['stiff'], quality_score: 5, keep: false },
-        ],
-      };
-      const llm = mockLLM(JSON.stringify(validReview));
+    it('returns ok with raw_text', async () => {
+      const llm = mockLLM('review analysis output');
       const ctx = makeCtx();
 
       const result = await runStage('review', ctx, {}, llm);
       expect(result.ok).toBe(true);
       expect(result.code).toBe('success');
-      expect(result.parsed_output).toEqual(validReview);
+      expect(result.raw_text).toBe('review analysis output');
       expect(llm).toHaveBeenCalledTimes(1);
-    });
-
-    it('parsed_output passes zod safeParse for reviewOutputSchema', async () => {
-      const data = {
-        assessments: [
-          { agent_id: 'a1', strengths: [], weaknesses: [], quality_score: 1, keep: true },
-        ],
-      };
-      const llm = mockLLM(JSON.stringify(data));
-      const ctx = makeCtx();
-
-      const result = await runStage('review', ctx, {}, llm);
-      expect(result.ok).toBe(true);
-      const parseResult = reviewOutputSchema.safeParse(result.parsed_output);
-      expect(parseResult.success).toBe(true);
     });
   });
 
   describe('filter stage', () => {
-    it('returns ok with parsed_output matching filterOutputSchema', async () => {
-      const validFilter = {
-        selected_agent_ids: ['agent1', 'agent3'],
-        rejected_agent_ids: ['agent2'],
-        rationale: 'Agent 1 has best fluency, Agent 3 most accurate',
-      };
-      const llm = mockLLM(JSON.stringify(validFilter));
+    it('returns ok with raw_text', async () => {
+      const llm = mockLLM('filter results output');
       const ctx = makeCtx({
         priorStages: [stageOut({ stage: 'review', status: 'complete' })],
       });
@@ -326,38 +215,14 @@ describe('runStage — success paths', () => {
       const result = await runStage('filter', ctx, {}, llm);
       expect(result.ok).toBe(true);
       expect(result.code).toBe('success');
-      expect(result.parsed_output).toEqual(validFilter);
+      expect(result.raw_text).toBe('filter results output');
       expect(llm).toHaveBeenCalledTimes(1);
-    });
-
-    it('parsed_output passes zod safeParse for filterOutputSchema', async () => {
-      const data = {
-        selected_agent_ids: ['a1'],
-        rejected_agent_ids: [],
-        rationale: 'best choice',
-      };
-      const llm = mockLLM(JSON.stringify(data));
-      const ctx = makeCtx({
-        priorStages: [stageOut({ stage: 'review', status: 'complete' })],
-      });
-
-      const result = await runStage('filter', ctx, {}, llm);
-      expect(result.ok).toBe(true);
-      const parseResult = filterOutputSchema.safeParse(result.parsed_output);
-      expect(parseResult.success).toBe(true);
     });
   });
 
   describe('orchestrate stage', () => {
-    it('returns ok with parsed_output matching orchestrateOutputSchema (streaming)', async () => {
-      const validOrch = {
-        structure_notes: 'Split into intro, body, conclusion',
-        segment_assignments: [
-          { segment_index: 0, source_agent_id: 'agent1', source_segment: 'Hello world', rationale: 'best intro' },
-          { segment_index: 1, source_agent_id: 'agent2', source_segment: 'This is body', rationale: 'best body' },
-        ],
-      };
-      const llm = mockStreamLLM(JSON.stringify(validOrch));
+    it('returns ok with raw_text (streaming)', async () => {
+      const llm = mockStreamLLM('orchestration plan output');
       const ctx = makeCtx({
         priorStages: [
           stageOut({ stage: 'review', status: 'complete' }),
@@ -368,39 +233,15 @@ describe('runStage — success paths', () => {
       const result = await runStage('orchestrate', ctx, {}, llm);
       expect(result.ok).toBe(true);
       expect(result.code).toBe('success');
-      expect(result.parsed_output).toEqual(validOrch);
+      expect(result.raw_text).toBe('orchestration plan output');
       expect(llm).toHaveBeenCalledTimes(1);
-    });
-
-    it('parsed_output passes zod safeParse for orchestrateOutputSchema', async () => {
-      const data = {
-        structure_notes: 'simple',
-        segment_assignments: [
-          { segment_index: 0, source_agent_id: 'a1', source_segment: 'segment text', rationale: 'best fit' },
-        ],
-      };
-      const llm = mockStreamLLM(JSON.stringify(data));
-      const ctx = makeCtx({
-        priorStages: [
-          stageOut({ stage: 'review', status: 'complete' }),
-          stageOut({ stage: 'filter', status: 'complete' }),
-        ],
-      });
-
-      const result = await runStage('orchestrate', ctx, {}, llm);
-      expect(result.ok).toBe(true);
-      const parseResult = orchestrateOutputSchema.safeParse(result.parsed_output);
-      expect(parseResult.success).toBe(true);
     });
   });
 
   describe('assemble stage', () => {
-    it('returns ok with parsed_output matching assembleOutputSchema (streaming)', async () => {
-      const validAssemble = {
-        final_text: '你好世界',
-        notes: 'Combined from agent1 intro + agent2 body',
-      };
-      const llm = mockStreamLLM(JSON.stringify(validAssemble));
+    it('returns ok with raw_text and final_text (streaming)', async () => {
+      const output = '最终译文\n---\nnotes about the translation';
+      const llm = mockStreamLLM(output);
       const ctx = makeCtx({
         priorStages: [
           stageOut({ stage: 'review', status: 'complete' }),
@@ -412,13 +253,14 @@ describe('runStage — success paths', () => {
       const result = await runStage('assemble', ctx, {}, llm);
       expect(result.ok).toBe(true);
       expect(result.code).toBe('success');
-      expect(result.parsed_output).toEqual(validAssemble);
+      expect(result.raw_text).toBe(output);
+      expect(result.final_text).toBe('最终译文');
       expect(llm).toHaveBeenCalledTimes(1);
     });
 
-    it('parsed_output passes zod safeParse for assembleOutputSchema', async () => {
-      const data = { final_text: '结果文本', notes: '' };
-      const llm = mockStreamLLM(JSON.stringify(data));
+    it('sets final_text to first segment before --- separator', async () => {
+      const output = 'Final translated text.\n---\nSome notes here.';
+      const llm = mockStreamLLM(output);
       const ctx = makeCtx({
         priorStages: [
           stageOut({ stage: 'review', status: 'complete' }),
@@ -428,14 +270,12 @@ describe('runStage — success paths', () => {
       });
 
       const result = await runStage('assemble', ctx, {}, llm);
-      expect(result.ok).toBe(true);
-      const parseResult = assembleOutputSchema.safeParse(result.parsed_output);
-      expect(parseResult.success).toBe(true);
+      expect(result.final_text).toBe('Final translated text.');
     });
 
     it('calls onAssembled with final_text on success', async () => {
-      const validAssemble = { final_text: '最终译文', notes: 'done' };
-      const llm = mockStreamLLM(JSON.stringify(validAssemble));
+      const output = '最终译文\n---\ndone';
+      const llm = mockStreamLLM(output);
       const ctx = makeCtx({
         priorStages: [
           stageOut({ stage: 'review', status: 'complete' }),
@@ -450,9 +290,8 @@ describe('runStage — success paths', () => {
       expect(onAssembled).toHaveBeenCalledWith('最终译文');
     });
 
-    it('does NOT call onAssembled when assemble validation fails', async () => {
-      const invalidJson = JSON.stringify({ wrong_field: 'bad' });
-      const llm = mockLLM(invalidJson);
+    it('does NOT call onAssembled when assemble output is empty', async () => {
+      const llm = mockStreamLLM('');
       const ctx = makeCtx({
         priorStages: [
           stageOut({ stage: 'review', status: 'complete' }),
@@ -462,119 +301,11 @@ describe('runStage — success paths', () => {
       });
 
       const onAssembled = vi.fn();
-      // assemble is a streaming stage, so we use mockLLM (non-streaming works too,
-      // but the pipeline will treat it as an async iterable. Let's use mockStreamLLM for consistency.)
-      const streamLLM = mockStreamLLM(invalidJson);
-      const result = await runStage('assemble', ctx, { onAssembled }, streamLLM);
+      const result = await runStage('assemble', ctx, { onAssembled }, llm);
+      expect(result.ok).toBe(true);
+      // final_text should be empty string from split + trim, which is falsy
       expect(onAssembled).not.toHaveBeenCalled();
     });
-  });
-});
-
-// =============================================================================
-// Schema validation + retry behavior
-// =============================================================================
-
-describe('schema validation + retry', () => {
-  it('malformed JSON → retries once → still fails → stage_schema_error with zod detail', async () => {
-    // First call returns malformed, second also returns malformed
-    const llm = mockRetryLLM(
-      JSON.stringify({ wrong_field: 'bad' }),
-      JSON.stringify({ also_wrong: true }),
-    );
-    const ctx = makeCtx({
-      priorStages: [stageOut({ stage: 'review', status: 'complete' })],
-    });
-
-    const result = await runStage('filter', ctx, {}, llm);
-    expect(result.ok).toBe(false);
-    expect(result.code).toBe('stage_schema_error');
-    expect(result.detail).toBeTruthy();
-    // detail should contain zod error info
-    expect(result.detail).toMatch(/selected_agent_ids|rationale|rejected_agent_ids/);
-    expect(llm).toHaveBeenCalledTimes(2);
-  });
-
-  it('malformed JSON with no JSON structure → stage_schema_error after retry', async () => {
-    const llm = mockRetryLLM('not json at all', 'still not json');
-    const ctx = makeCtx();
-
-    const result = await runStage('review', ctx, {}, llm);
-    expect(result.ok).toBe(false);
-    expect(result.code).toBe('stage_schema_error');
-    expect(result.detail).toContain('No valid JSON');
-    expect(llm).toHaveBeenCalledTimes(2);
-  });
-
-  it('first call malformed, second call valid → succeeds', async () => {
-    const validFilter = {
-      selected_agent_ids: ['agent1'],
-      rejected_agent_ids: [],
-      rationale: 'best',
-    };
-    const llm = mockRetryLLM(
-      JSON.stringify({ wrong: 'field' }),
-      JSON.stringify(validFilter),
-    );
-    const ctx = makeCtx({
-      priorStages: [stageOut({ stage: 'review', status: 'complete' })],
-    });
-
-    const result = await runStage('filter', ctx, {}, llm);
-    expect(result.ok).toBe(true);
-    expect(result.code).toBe('success');
-    expect(result.parsed_output).toEqual(validFilter);
-    expect(llm).toHaveBeenCalledTimes(2);
-  });
-
-  it('valid JSON on first attempt → only 1 LLM call', async () => {
-    const validReview = {
-      assessments: [{ agent_id: 'a1', strengths: [], weaknesses: [], quality_score: 8, keep: true }],
-    };
-    const llm = mockLLM(JSON.stringify(validReview));
-    const ctx = makeCtx();
-
-    const result = await runStage('review', ctx, {}, llm);
-    expect(result.ok).toBe(true);
-    expect(llm).toHaveBeenCalledTimes(1);
-  });
-
-  it('JSON parse error (not valid JSON syntax) → retries → still fails → stage_schema_error', async () => {
-    const llm = mockRetryLLM('{broken: json}', '{also: broken}');
-    const ctx = makeCtx();
-
-    const result = await runStage('review', ctx, {}, llm);
-    expect(result.ok).toBe(false);
-    expect(result.code).toBe('stage_schema_error');
-    expect(result.detail).toContain('Failed to parse');
-    expect(llm).toHaveBeenCalledTimes(2);
-  });
-});
-
-// =============================================================================
-// Fence-wrapped JSON extraction within full flow
-// =============================================================================
-
-describe('JSON fence extraction in runStage', () => {
-  it('extracts JSON from ```json fence and validates correctly', async () => {
-    const wrapped = '```json\n{"assessments":[{"agent_id":"a1","strengths":["good"],"weaknesses":["bad"],"quality_score":5,"keep":true}]}\n```';
-    const llm = mockLLM(wrapped);
-    const ctx = makeCtx();
-
-    const result = await runStage('review', ctx, {}, llm);
-    expect(result.ok).toBe(true);
-    expect(result.code).toBe('success');
-    expect(result.parsed_output).toHaveProperty('assessments');
-  });
-
-  it('extracts JSON preceded by explanatory prose and validates', async () => {
-    const withProse = 'Here is the review output based on my analysis:\n\n{"assessments":[{"agent_id":"a1","strengths":[],"weaknesses":[],"quality_score":7,"keep":true}]}\n\nI hope this is correct.';
-    const llm = mockLLM(withProse);
-    const ctx = makeCtx();
-
-    const result = await runStage('review', ctx, {}, llm);
-    expect(result.ok).toBe(true);
-    expect(result.parsed_output).toHaveProperty('assessments');
   });
 });
 
@@ -584,8 +315,7 @@ describe('JSON fence extraction in runStage', () => {
 
 describe('callbacks', () => {
   it('onStageStart is called at the beginning', async () => {
-    const validJson = JSON.stringify({ assessments: [{ agent_id: 'a1', strengths: [], weaknesses: [], quality_score: 5, keep: true }] });
-    const llm = mockLLM(validJson);
+    const llm = mockLLM('some output');
     const ctx = makeCtx();
     const onStageStart = vi.fn();
 
@@ -595,8 +325,7 @@ describe('callbacks', () => {
   });
 
   it('onStageComplete is called with the result', async () => {
-    const validJson = JSON.stringify({ assessments: [{ agent_id: 'a1', strengths: [], weaknesses: [], quality_score: 5, keep: true }] });
-    const llm = mockLLM(validJson);
+    const llm = mockLLM('output text');
     const ctx = makeCtx();
     const onStageComplete = vi.fn();
 
@@ -605,11 +334,7 @@ describe('callbacks', () => {
   });
 
   it('onDelta is called for streaming stages (orchestrate)', async () => {
-    const validOrch = {
-      structure_notes: 'ok',
-      segment_assignments: [{ segment_index: 0, source_agent_id: 'a1', source_segment: 'text', rationale: 'best' }],
-    };
-    const llm = mockStreamLLM(JSON.stringify(validOrch));
+    const llm = mockStreamLLM('orchestration output');
     const ctx = makeCtx({
       priorStages: [
         stageOut({ stage: 'review', status: 'complete' }),
@@ -620,15 +345,13 @@ describe('callbacks', () => {
 
     await runStage('orchestrate', ctx, { onDelta }, llm);
     expect(onDelta).toHaveBeenCalled();
-    // Each call receives stage name and content string
     const firstCall = onDelta.mock.calls[0];
     expect(firstCall[0]).toBe('orchestrate');
     expect(typeof firstCall[1]).toBe('string');
   });
 
   it('onDelta is called for streaming stages (assemble)', async () => {
-    const validAssemble = { final_text: 'hello', notes: '' };
-    const llm = mockStreamLLM(JSON.stringify(validAssemble));
+    const llm = mockStreamLLM('assemble output\n---\nnotes');
     const ctx = makeCtx({
       priorStages: [
         stageOut({ stage: 'review', status: 'complete' }),
@@ -643,8 +366,7 @@ describe('callbacks', () => {
   });
 
   it('onDelta is NOT called for non-streaming stages (review)', async () => {
-    const validReview = JSON.stringify({ assessments: [{ agent_id: 'a1', strengths: [], weaknesses: [], quality_score: 5, keep: true }] });
-    const llm = mockLLM(validReview);
+    const llm = mockLLM('review output');
     const ctx = makeCtx();
     const onDelta = vi.fn();
 
@@ -653,8 +375,7 @@ describe('callbacks', () => {
   });
 
   it('onDelta is NOT called for non-streaming stages (filter)', async () => {
-    const validFilter = JSON.stringify({ selected_agent_ids: ['a1'], rejected_agent_ids: [], rationale: 'ok' });
-    const llm = mockLLM(validFilter);
+    const llm = mockLLM('filter output');
     const ctx = makeCtx({
       priorStages: [stageOut({ stage: 'review', status: 'complete' })],
     });
@@ -662,42 +383,6 @@ describe('callbacks', () => {
 
     await runStage('filter', ctx, { onDelta }, llm);
     expect(onDelta).not.toHaveBeenCalled();
-  });
-
-  it('onSchemaError is called on first validation failure (before retry)', async () => {
-    const llm = mockRetryLLM(
-      JSON.stringify({ wrong: 'field' }),
-      JSON.stringify({ selected_agent_ids: ['a1'], rejected_agent_ids: [], rationale: 'ok' }),
-    );
-    const ctx = makeCtx({
-      priorStages: [stageOut({ stage: 'review', status: 'complete' })],
-    });
-    const onSchemaError = vi.fn();
-
-    await runStage('filter', ctx, { onSchemaError }, llm);
-    expect(onSchemaError).toHaveBeenCalledTimes(1); // only first attempt fails
-    expect(onSchemaError).toHaveBeenCalledWith(
-      'filter',
-      expect.any(String), // rawText
-      expect.stringContaining('selected_agent_ids'), // zod error
-      1, // attempt number
-    );
-  });
-
-  it('onSchemaError is called twice when both attempts fail', async () => {
-    const llm = mockRetryLLM(
-      JSON.stringify({ wrong: 'field' }),
-      JSON.stringify({ also: 'wrong' }),
-    );
-    const ctx = makeCtx({
-      priorStages: [stageOut({ stage: 'review', status: 'complete' })],
-    });
-    const onSchemaError = vi.fn();
-
-    await runStage('filter', ctx, { onSchemaError }, llm);
-    expect(onSchemaError).toHaveBeenCalledTimes(2);
-    expect(onSchemaError.mock.calls[0][3]).toBe(1); // first call, attempt 1
-    expect(onSchemaError.mock.calls[1][3]).toBe(2); // second call, attempt 2
   });
 
   it('onError is called when LLM caller throws', async () => {
@@ -726,60 +411,6 @@ describe('callbacks', () => {
     await runStage('review', ctx, { onError }, llm);
     expect(onError).toHaveBeenCalledWith('review', customError);
   });
-
-  it('all callbacks integrated: start → delta → schemaError → retry → complete', async () => {
-    const onStageStart = vi.fn();
-    const onDelta = vi.fn();
-    const onSchemaError = vi.fn();
-    const onStageComplete = vi.fn();
-
-    const validOrch = {
-      structure_notes: 'retry success',
-      segment_assignments: [{ segment_index: 0, source_agent_id: 'a1', source_segment: 'text', rationale: 'best' }],
-    };
-    const llm: LLMCaller = vi.fn(async function* (
-      _endpoint: { baseUrl: string; apiKey: string },
-      _request: ChatCompletionRequest,
-    ) {
-      // unused placeholder
-    } as any);
-
-    // Use a counter-based streaming mock
-    let callCount = 0;
-    const streamingLLM: LLMCaller = vi.fn(async function* (
-      _endpoint: { baseUrl: string; apiKey: string },
-      _request: ChatCompletionRequest,
-    ) {
-      callCount++;
-      const content = callCount === 1
-        ? JSON.stringify({ bad: 'shape' })
-        : JSON.stringify(validOrch);
-      for (let i = 0; i < content.length; i++) {
-        yield { type: 'text' as const, content: content[i] };
-      }
-      yield { type: 'done' as const, content };
-    } as any);
-
-    const ctx = makeCtx({
-      priorStages: [
-        stageOut({ stage: 'review', status: 'complete' }),
-        stageOut({ stage: 'filter', status: 'complete' }),
-      ],
-    });
-
-    const result = await runStage('orchestrate', ctx, {
-      onStageStart,
-      onDelta,
-      onSchemaError,
-      onStageComplete,
-    }, streamingLLM);
-
-    expect(onStageStart).toHaveBeenCalledWith('orchestrate');
-    expect(onDelta).toHaveBeenCalled(); // streaming
-    expect(onSchemaError).toHaveBeenCalledTimes(1); // first attempt fails
-    expect(onStageComplete).toHaveBeenCalledWith('orchestrate', expect.objectContaining({ ok: true }));
-    expect(result.ok).toBe(true);
-  });
 });
 
 // =============================================================================
@@ -787,36 +418,131 @@ describe('callbacks', () => {
 // =============================================================================
 
 describe('edge cases', () => {
-  it('returns raw_text alongside parsed_output on success', async () => {
-    const validReview = { assessments: [{ agent_id: 'a1', strengths: [], weaknesses: [], quality_score: 5, keep: true }] };
-    const rawText = 'Here is the result:\n' + JSON.stringify(validReview) + '\nDone.';
+  it('returns raw_text alongside final_text for assemble', async () => {
+    const rawText = 'Final text here.\n---\nExtra notes.';
     const llm = mockLLM(rawText);
+    const ctx = makeCtx({
+      priorStages: [
+        stageOut({ stage: 'review', status: 'complete' }),
+        stageOut({ stage: 'filter', status: 'complete' }),
+        stageOut({ stage: 'orchestrate', status: 'complete' }),
+      ],
+    });
+
+    const result = await runStage('assemble', ctx, {}, llm);
+    expect(result.ok).toBe(true);
+    expect(result.raw_text).toBe(rawText);
+    expect(result.final_text).toBe('Final text here.');
+  });
+
+  it('non-assemble stages do not set final_text', async () => {
+    const llm = mockLLM('some review text');
     const ctx = makeCtx();
 
     const result = await runStage('review', ctx, {}, llm);
     expect(result.ok).toBe(true);
-    expect(result.raw_text).toBe(rawText);
-    expect(result.parsed_output).toEqual(validReview);
+    expect(result.raw_text).toBe('some review text');
+    expect(result.final_text).toBeUndefined();
   });
 
-  it('returns raw_text on schema error', async () => {
-    const rawText = JSON.stringify({ bad: 'data' });
-    const llm = mockRetryLLM(rawText, JSON.stringify({ also: 'bad' }));
-    const ctx = makeCtx();
-
-    const result = await runStage('review', ctx, {}, llm);
-    expect(result.ok).toBe(false);
-    expect(result.code).toBe('stage_schema_error');
-    expect(result.raw_text).toBeTruthy();
-  });
-
-  it('empty prompt templates still work (no extra context inserted)', async () => {
-    const validReview = { assessments: [{ agent_id: 'a1', strengths: [], weaknesses: [], quality_score: 5, keep: true }] };
-    const llm = mockLLM(JSON.stringify(validReview));
+  it('empty prompt templates still work', async () => {
+    const llm = mockLLM('output text');
     const ctx = makeCtx();
     ctx.promptTemplates.review = 'Review: {{context}}';
 
     const result = await runStage('review', ctx, {}, llm);
     expect(result.ok).toBe(true);
+  });
+});
+
+// =============================================================================
+// Refactored pipeline behavior — raw_text instead of parsed_output
+// =============================================================================
+
+describe('refactored pipeline behavior', () => {
+  it('runStage returns raw_text, not parsed_output', async () => {
+    const llm = mockLLM('Plain text review without JSON parsing.');
+    const ctx = makeCtx();
+
+    const result = await runStage('review', ctx, {}, llm);
+    expect(result.ok).toBe(true);
+    expect(result.code).toBe('success');
+    expect(result.raw_text).toBe('Plain text review without JSON parsing.');
+    // The result must NOT contain a parsed_output field
+    expect((result as unknown as Record<string, unknown>).parsed_output).toBeUndefined();
+  });
+
+  it('assemble final_text uses \\n---\\n split regex (plain text + notes)', async () => {
+    const output = '最终译文正文\n---\n注释部分';
+    const llm = mockLLM(output);
+    const ctx = makeCtx({
+      priorStages: [
+        stageOut({ stage: 'review', status: 'complete' }),
+        stageOut({ stage: 'filter', status: 'complete' }),
+        stageOut({ stage: 'orchestrate', status: 'complete' }),
+      ],
+    });
+
+    const result = await runStage('assemble', ctx, {}, llm);
+    expect(result.ok).toBe(true);
+    expect(result.raw_text).toBe(output);
+    expect(result.final_text).toBe('最终译文正文');
+  });
+
+  it('assemble with no --- separator returns full output as final_text', async () => {
+    const output = 'Just final text without any separator.';
+    const llm = mockLLM(output);
+    const ctx = makeCtx({
+      priorStages: [
+        stageOut({ stage: 'review', status: 'complete' }),
+        stageOut({ stage: 'filter', status: 'complete' }),
+        stageOut({ stage: 'orchestrate', status: 'complete' }),
+      ],
+    });
+
+    const result = await runStage('assemble', ctx, {}, llm);
+    expect(result.ok).toBe(true);
+    expect(result.raw_text).toBe(output);
+    expect(result.final_text).toBe(output);
+  });
+
+  it('assemble with empty LLM output → empty final_text, onAssembled NOT called', async () => {
+    const llm = mockLLM('');
+    const ctx = makeCtx({
+      priorStages: [
+        stageOut({ stage: 'review', status: 'complete' }),
+        stageOut({ stage: 'filter', status: 'complete' }),
+        stageOut({ stage: 'orchestrate', status: 'complete' }),
+      ],
+    });
+
+    const onAssembled = vi.fn();
+    const result = await runStage('assemble', ctx, { onAssembled }, llm);
+    expect(result.ok).toBe(true);
+    expect(result.raw_text).toBe('');
+    expect(result.final_text).toBe('');
+    expect(onAssembled).not.toHaveBeenCalled();
+  });
+
+  it('assemble with multi-line text and --- on its own line splits correctly', async () => {
+    const output = 'Line 1\nLine 2\n---\nNote about assembly';
+    const llm = mockStreamLLM(output);
+    const ctx = makeCtx({
+      priorStages: [
+        stageOut({ stage: 'review', status: 'complete' }),
+        stageOut({ stage: 'filter', status: 'complete' }),
+        stageOut({ stage: 'orchestrate', status: 'complete' }),
+      ],
+    });
+
+    const result = await runStage('assemble', ctx, {}, llm);
+    expect(result.final_text).toBe('Line 1\nLine 2');
+  });
+
+  it('extractJson is no longer exported from pipeline (refactored away)', async () => {
+    // The JSON-extraction helper was deleted during the refactor; the named
+    // export must be undefined on the module namespace.
+    const mod = await import('../../src/lib/orchestration/pipeline');
+    expect((mod as Record<string, unknown>).extractJson).toBeUndefined();
   });
 });

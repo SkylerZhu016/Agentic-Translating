@@ -233,15 +233,22 @@ describe('buildStagePrompt', () => {
     expect(result.user.role).toBe('user')
   })
 
-  it('system contains JSON-only instruction', () => {
+  it('system contains free-form output instruction (not strict JSON)', () => {
     const result = buildStagePrompt(stageTemplate, contextJson, stageSchema)
-    expect(result.system.content).toContain('JSON')
+    expect(result.system.content).toContain('自由输出')
+    // Must NOT contain strict-JSON-only instruction
+    expect(result.system.content).not.toMatch(/严格只输出/)
   })
 
-  it('system contains stage schema text', () => {
+  it('system contains the stage goal text', () => {
+    const goal = '请审查这些译文的质量'
+    const result = buildStagePrompt(stageTemplate, contextJson, goal)
+    expect(result.system.content).toContain(goal)
+  })
+
+  it('system contains the --- separator convention for body+notes', () => {
     const result = buildStagePrompt(stageTemplate, contextJson, stageSchema)
-    expect(result.system.content).toContain('confidence')
-    expect(result.system.content).toContain('stage_schema')
+    expect(result.system.content).toContain('---')
   })
 
   it('user contains the context JSON', () => {

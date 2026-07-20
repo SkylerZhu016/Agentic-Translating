@@ -29,7 +29,6 @@ function stageOut(overrides: Partial<StageOutput> = {}): StageOutput {
     status: 'complete',
     prompt_used: null,
     raw_output: null,
-    parsed_output: null,
     error: null,
     ...overrides,
   }
@@ -84,8 +83,8 @@ describe('buildStageContext', () => {
         trans({ agent_key: 'agent1', agent_snapshot: JSON.stringify({ name: 'Alpha', model: 'gpt-4' }), output_text: '你好世界' }),
       ],
       priorStages: [
-        stageOut({ stage: 'review', parsed_output: JSON.stringify({ assessments: [{ agent_id: 'agent1', keep: true }] }) }),
-        stageOut({ stage: 'filter', parsed_output: JSON.stringify({ selected_agent_ids: ['agent1'], rejected_agent_ids: [], rationale: 'good' }) }),
+        stageOut({ stage: 'review', raw_output: JSON.stringify({ assessments: [{ agent_id: 'agent1', keep: true }] }) }),
+        stageOut({ stage: 'filter', raw_output: JSON.stringify({ selected_agent_ids: ['agent1'], rejected_agent_ids: [], rationale: 'good' }) }),
       ],
     })
 
@@ -125,10 +124,10 @@ describe('buildStageContext', () => {
       targetLang: 'fr',
       translations: [],
       priorStages: [
-        stageOut({ stage: 'review', parsed_output: '{"assessments":[]}' }),
-        stageOut({ stage: 'filter', parsed_output: '{"selected_agent_ids":[],"rejected_agent_ids":[],"rationale":"ok"}' }),
-        stageOut({ stage: 'orchestrate', parsed_output: '{"structure_notes":"ok","segment_assignments":[]}' }),
-        stageOut({ stage: 'assemble', parsed_output: '{"final_text":"done"}' }),
+        stageOut({ stage: 'review', raw_output: '{"assessments":[]}' }),
+        stageOut({ stage: 'filter', raw_output: '{"selected_agent_ids":[],"rejected_agent_ids":[],"rationale":"ok"}' }),
+        stageOut({ stage: 'orchestrate', raw_output: '{"structure_notes":"ok","segment_assignments":[]}' }),
+        stageOut({ stage: 'assemble', raw_output: '{"final_text":"done"}' }),
       ],
     })
 
@@ -141,10 +140,10 @@ describe('buildStageContext', () => {
 
   // ── Token budget / truncation ──
 
-  it('should truncate when over budget: drop rejected full text first, then tail', () => {
+  it('should truncate from tail when over budget (rejected texts are NOT dropped)', () => {
     // 6 translations, each 2000 CJK chars = 2000 tokens from text alone
-    // Well over 6000 budget
-    const rejects = ['agent2', 'agent5']
+    // Well over 6000 budget. With dropRejectedTexts gone, we simply
+    // truncate from the tail until under budget.
     const allAgentKeys = ['agent1', 'agent2', 'agent3', 'agent4', 'agent5', 'agent6']
     const translations = allAgentKeys.map((k, i) =>
       trans({
@@ -165,9 +164,9 @@ describe('buildStageContext', () => {
         priorStages: [
           stageOut({
             stage: 'filter',
-            parsed_output: JSON.stringify({
+            raw_output: JSON.stringify({
               selected_agent_ids: ['agent1', 'agent3', 'agent4', 'agent6'],
-              rejected_agent_ids: rejects,
+              rejected_agent_ids: ['agent2', 'agent5'],
               rationale: 'quality filter',
             }),
           }),
@@ -179,25 +178,100 @@ describe('buildStageContext', () => {
     // Must be marked truncated
     expect(result.truncated).toBe(true)
 
-    // Rejected translations must have their text dropped but metadata kept
-    for (const rejectedKey of rejects) {
-      const entry = result.json.translations.find((t) => t.agent_id === rejectedKey)
-      expect(entry).toBeDefined()
-      expect(entry!.text).toBe('')
-      expect(entry!.name).toBeTruthy()
-      expect(entry!.model).toBeTruthy()
-    }
-
-    // Selected translations should still be present
-    for (const selKey of ['agent1', 'agent3', 'agent4', 'agent6']) {
-      const entry = result.json.translations.find((t) => t.agent_id === selKey)
-      expect(entry).toBeDefined()
-    }
-
     // The final JSON must fit within the token budget
     const jsonString = JSON.stringify(result.json)
     const finalTokens = estimateTokens(jsonString)
     expect(finalTokens).toBeLessThanOrEqual(STAGE_CONTEXT_TOKEN_BUDGET)
+  })
+
+  // ── Body extraction from raw_output via `---` split ──
+
+  it('should strip annotation after --- separator in prior_stages body', () => {
+    const raw = '正文内容\n---\n这是注释部分，不应出现在 body 中'
+    const result = buildStageContext('orchestrate', {
+      sourceText: 'Hi',
+      sourceLang: 'en',
+      targetLang: 'fr',
+      translations: [],
+      priorStages: [stageOut({ stage: 'review', raw_output: raw })],
+    })
+    expect(result.json.prior_stages.review).toBeDefined()
+    expect(result.json.prior_stages.review!.body).toBe('正文内容')
+    // The annotation must NOT appear in the body
+    expect(result.json.prior_stages.review!.body).not.toContain('注释')
+  })
+
+  it('should use the full raw_output as body when no --- separator present', () => {
+    const raw = '完整的审查意见，没有注释分隔'
+    const result = buildStageContext('orchestrate', {
+      sourceText: 'Hi',
+      sourceLang: 'en',
+      targetLang: 'fr',
+      translations: [],
+      priorStages: [stageOut({ stage: 'review', raw_output: raw })],
+    })
+    expect(result.json.prior_stages.review!.body).toBe(raw)
+  })
+
+  it('should produce empty body when raw_output is null/empty', () => {
+    const result1 = buildStageContext('orchestrate', {
+      sourceText: 'Hi',
+      sourceLang: 'en',
+      targetLang: 'fr',
+      translations: [],
+      priorStages: [stageOut({ stage: 'review', raw_output: null })],
+    })
+    expect(result1.json.prior_stages.review!.body).toBe('')
+
+    const result2 = buildStageContext('orchestrate', {
+      sourceText: 'Hi',
+      sourceLang: 'en',
+      targetLang: 'fr',
+      translations: [],
+      priorStages: [stageOut({ stage: 'review', raw_output: '' })],
+    })
+    expect(result2.json.prior_stages.review!.body).toBe('')
+  })
+
+  it('dropRejectedTexts is no longer exported (function removed)', async () => {
+    // The function was removed during the refactor; the named export must be
+    // undefined on the module namespace.
+    const mod = await import('../../src/lib/context/stage-context')
+    expect((mod as Record<string, unknown>).dropRejectedTexts).toBeUndefined()
+  })
+
+  it('parseAgentSnapshot still works (regression test)', () => {
+    // parseAgentSnapshot is invoked internally; we verify behavior via the
+    // translations array. Invalid JSON → name/model 'unknown'; valid JSON →
+    // parsed values.
+    const result = buildStageContext('review', {
+      sourceText: 'Hi',
+      sourceLang: 'en',
+      targetLang: 'fr',
+      translations: [
+        trans({
+          agent_key: 'broken',
+          agent_snapshot: '{not valid json}',
+          output_text: 'Bonjour',
+        }),
+        trans({
+          id: 2,
+          agent_key: 'good',
+          agent_snapshot: JSON.stringify({ name: 'Good Agent', model: 'claude-3' }),
+          output_text: 'Salut',
+        }),
+      ],
+      priorStages: [],
+    })
+    const broken = result.json.translations.find((t) => t.agent_id === 'broken')!
+    expect(broken.name).toBe('unknown')
+    expect(broken.model).toBe('unknown')
+    expect(broken.text).toBe('Bonjour')
+
+    const good = result.json.translations.find((t) => t.agent_id === 'good')!
+    expect(good.name).toBe('Good Agent')
+    expect(good.model).toBe('claude-3')
+    expect(good.text).toBe('Salut')
   })
 
   it('should handle empty translations array gracefully', () => {

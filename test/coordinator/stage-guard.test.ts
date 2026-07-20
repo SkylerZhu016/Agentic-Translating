@@ -22,7 +22,6 @@ function row(stage: Stage, status: StageOutputRow['status']): StageOutputRow {
     status,
     prompt_used: null,
     raw_output: null,
-    parsed_output: null,
     error: null,
     created_at: '2026-01-01 00:00:00',
   }

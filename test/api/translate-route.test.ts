@@ -43,8 +43,12 @@ import { POST as translatePost } from '../../app/api/sessions/[id]/translate/rou
 import { POST as retryPost } from '../../app/api/sessions/[id]/agents/[agentKey]/retry/route';
 
 // ── Migration SQL ──────────────────────────────────────────────────────────
-const MIGRATION_SQL = fs.readFileSync(
+const MIGRATION_SQL_0001 = fs.readFileSync(
   path.join(process.cwd(), 'src/lib/db/migrations/0001_init.sql'),
+  'utf-8',
+);
+const MIGRATION_SQL_0002 = fs.readFileSync(
+  path.join(process.cwd(), 'src/lib/db/migrations/0002_presets_and_drop_parsed_output.sql'),
   'utf-8',
 );
 
@@ -112,7 +116,7 @@ describe('Translate SSE Route (fanout + retry)', () => {
 
     db = new Database(':memory:');
     db.pragma('foreign_keys = ON');
-    db.exec(MIGRATION_SQL);
+    db.exec(MIGRATION_SQL_0001); db.exec(MIGRATION_SQL_0002);
 
     mockGetDb.mockReturnValue(db);
 

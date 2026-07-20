@@ -25,8 +25,12 @@ import { encodeSSE, parseSSEChunk } from '@/src/lib/contracts/sse'
 import { startMockLLM, type MockLLMInstance } from '../fixtures/mock-llm'
 
 // Inline migration SQL
-const MIGRATION_SQL = fs.readFileSync(
+const MIGRATION_SQL_0001 = fs.readFileSync(
   path.join(process.cwd(), 'src/lib/db/migrations/0001_init.sql'),
+  'utf-8',
+)
+const MIGRATION_SQL_0002 = fs.readFileSync(
+  path.join(process.cwd(), 'src/lib/db/migrations/0002_presets_and_drop_parsed_output.sql'),
   'utf-8',
 )
 
@@ -90,7 +94,7 @@ describe('Chat SSE Route', () => {
     // 1. Create in-memory DB + migrate
     db = new Database(':memory:')
     db.pragma('foreign_keys = ON')
-    db.exec(MIGRATION_SQL)
+    db.exec(MIGRATION_SQL_0001); db.exec(MIGRATION_SQL_0002)
 
     repos = createRepositories(db)
     service = createSessionService(db, repos)

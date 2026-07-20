@@ -12,8 +12,12 @@ import {
 import { NoAgentsConfiguredError } from '../../src/lib/services/session-service'
 
 // Inline migration SQL — apply to :memory: DB directly
-const MIGRATION_SQL = fs.readFileSync(
+const MIGRATION_SQL_0001 = fs.readFileSync(
   path.join(process.cwd(), 'src/lib/db/migrations/0001_init.sql'),
+  'utf-8',
+)
+const MIGRATION_SQL_0002 = fs.readFileSync(
+  path.join(process.cwd(), 'src/lib/db/migrations/0002_presets_and_drop_parsed_output.sql'),
   'utf-8',
 )
 
@@ -28,7 +32,8 @@ describe('SessionService', () => {
   beforeEach(() => {
     db = new Database(':memory:')
     db.pragma('foreign_keys = ON')
-    db.exec(MIGRATION_SQL)
+    db.exec(MIGRATION_SQL_0001)
+    db.exec(MIGRATION_SQL_0002)
 
     repos = createRepositories(db)
     service = createSessionService(db, repos)
@@ -141,7 +146,7 @@ describe('SessionService', () => {
       // Add one record of each child type
       repos.stageOutputs.insert({
         session_id: s.id, stage: 'review', status: 'pending',
-        prompt_used: null, raw_output: null, parsed_output: null, error: null,
+        prompt_used: null, raw_output: null, error: null,
       })
       repos.finalVersions.insert({
         session_id: s.id, version_no: 1, text: 'Hello world (translated)', source: 'assemble',
@@ -340,7 +345,7 @@ describe('SessionService', () => {
       const s = service.createSession(DEF_SOURCE)
       repos.stageOutputs.insert({
         session_id: s.id, stage: 'review', status: 'running',
-        prompt_used: null, raw_output: null, parsed_output: null, error: null,
+        prompt_used: null, raw_output: null, error: null,
       })
 
       service.markInterruptedInFlight()
@@ -354,7 +359,7 @@ describe('SessionService', () => {
       // Create a stage that is already stale
       repos.stageOutputs.insert({
         session_id: s.id, stage: 'filter', status: 'complete',
-        prompt_used: null, raw_output: null, parsed_output: null, error: null,
+        prompt_used: null, raw_output: null, error: null,
       })
 
       service.markInterruptedInFlight()

@@ -23,8 +23,13 @@ import { parseSSEChunk } from '../../src/lib/contracts/sse';
 // Setup
 // =============================================================================
 
-const MIGRATION_SQL = fs.readFileSync(
+const MIGRATION_SQL_0001 = fs.readFileSync(
   path.join(process.cwd(), 'src/lib/db/migrations/0001_init.sql'),
+  'utf-8',
+);
+
+const MIGRATION_SQL_0002 = fs.readFileSync(
+  path.join(process.cwd(), 'src/lib/db/migrations/0002_presets_and_drop_parsed_output.sql'),
   'utf-8',
 );
 
@@ -51,11 +56,12 @@ import type { ChatCompletionResponse, LLMStreamEvent } from '../../src/lib/llm/c
 // Test Helpers
 // =============================================================================
 
-/** Create a fresh :memory: DB, run migration, set as global singleton */
+/** Create a fresh :memory: DB, run both migrations, set as global singleton */
 function setupDb(): Database.Database {
   const db = new Database(':memory:');
   db.pragma('foreign_keys = ON');
-  db.exec(MIGRATION_SQL);
+  db.exec(MIGRATION_SQL_0001);
+  db.exec(MIGRATION_SQL_0002);
   vi.mocked(getDb).mockReturnValue(db);
   return db;
 }
@@ -185,13 +191,13 @@ function seedSession(
   return sessionId;
 }
 
-/** Seed a completed prerequisite stage output */
+/** Seed a completed prerequisite stage output (raw_output only; parsed_output column removed) */
 function seedStageOutput(
   repos: Repositories,
   sessionId: string,
   stage: string,
   status: string = 'complete',
-  parsedOutput?: unknown,
+  rawOutput?: string,
 ): void {
   const existing = repos.stageOutputs.getBySessionAndStage(sessionId, stage as any);
   if (existing) {
@@ -199,8 +205,7 @@ function seedStageOutput(
       id: existing.id,
       status: status as any,
       prompt_used: 'test prompt',
-      raw_output: 'test raw',
-      parsed_output: parsedOutput != null ? JSON.stringify(parsedOutput) : null,
+      raw_output: rawOutput ?? 'test raw',
       error: null,
     });
   } else {
@@ -209,8 +214,7 @@ function seedStageOutput(
       stage: stage as any,
       status: status as any,
       prompt_used: 'test prompt',
-      raw_output: 'test raw',
-      parsed_output: parsedOutput != null ? JSON.stringify(parsedOutput) : null,
+      raw_output: rawOutput ?? 'test raw',
       error: null,
     });
   }
@@ -230,30 +234,12 @@ async function* mockStreamResponse(content: string): AsyncIterable<LLMStreamEven
   yield { type: 'done', content };
 }
 
-// Valid JSON fixtures for each stage
-const VALID_REVIEW_JSON = JSON.stringify({
-  assessments: [
-    { agent_id: 'agent-alpha', strengths: ['good flow'], weaknesses: ['stiff'], quality_score: 7, keep: true },
-  ],
-});
-
-const VALID_FILTER_JSON = JSON.stringify({
-  selected_agent_ids: ['agent-alpha'],
-  rejected_agent_ids: [],
-  rationale: 'Best translation',
-});
-
-const VALID_ORCHESTRATE_JSON = JSON.stringify({
-  structure_notes: 'Single segment',
-  segment_assignments: [
-    { segment_index: 0, source_agent_id: 'agent-alpha', source_segment: '你好世界', rationale: 'Only option' },
-  ],
-});
-
-const VALID_ASSEMBLE_JSON = JSON.stringify({
-  final_text: '你好世界',
-  notes: 'Assembled from agent-alpha',
-});
+// Plain-text fixtures for each stage (free-form output, optionally with --- notes)
+const REVIEW_TEXT = '审查意见：agent-alpha 的译文准确流畅，质量较高。'
+const FILTER_TEXT = '筛选结果：保留 agent-alpha，其他淘汰。'
+const ORCHESTRATE_TEXT = '编排方案：使用 agent-alpha 的完整译文作为最终文本。'
+// Assemble output: body + --- + notes. final_text is the part before ---.
+const ASSEMBLE_TEXT = '你好世界\n---\n组装说明：来自 agent-alpha。'
 
 // =============================================================================
 // Tests
@@ -283,9 +269,9 @@ describe('POST /api/sessions/[id]/stages/[stage]/run', () => {
   // ===========================================================================
 
   describe('happy path — review', () => {
-    it('returns stage_start → stage_complete → done, persists parsed_output', async () => {
+    it('returns stage_start → stage_complete → done, persists raw_output', async () => {
       const sid = seedSession(repos);
-      vi.mocked(chatCompletion).mockResolvedValue(mockLLMResponse(VALID_REVIEW_JSON));
+      vi.mocked(chatCompletion).mockResolvedValue(mockLLMResponse(REVIEW_TEXT));
 
       const req = new Request(`http://localhost/api/sessions/${sid}/stages/review/run`, {
         method: 'POST',
@@ -306,7 +292,9 @@ describe('POST /api/sessions/[id]/stages/[stage]/run', () => {
       const completeEvent = events.find((e) => e.event === 'stage_complete');
       expect(completeEvent).toBeDefined();
       expect((completeEvent!.data as any).stage).toBe('review');
-      expect((completeEvent!.data as any).parsed_output).toBeDefined();
+      // Refactored: SSE now carries raw_text, NOT parsed_output
+      expect((completeEvent!.data as any).raw_text).toBe(REVIEW_TEXT);
+      expect((completeEvent!.data as any).parsed_output).toBeUndefined();
 
       // Last event: done
       const lastEvent = events[events.length - 1];
@@ -316,8 +304,7 @@ describe('POST /api/sessions/[id]/stages/[stage]/run', () => {
       const saved = repos.stageOutputs.getBySessionAndStage(sid, 'review');
       expect(saved).toBeDefined();
       expect(saved!.status).toBe('complete');
-      expect(saved!.parsed_output).toBeDefined();
-      expect(JSON.parse(saved!.parsed_output!)).toHaveProperty('assessments');
+      expect(saved!.raw_output).toBe(REVIEW_TEXT);
 
       // Check session state transitioned to coordinating
       const session = repos.sessions.getById(sid);
@@ -330,13 +317,13 @@ describe('POST /api/sessions/[id]/stages/[stage]/run', () => {
       const sid = seedSession(repos);
 
       // Pre-seed review as complete
-      seedStageOutput(repos, sid, 'review', 'complete', { assessments: [] });
+      seedStageOutput(repos, sid, 'review', 'complete', REVIEW_TEXT);
 
       // Pre-seed orchestrate and assemble as complete (to verify they go stale)
-      seedStageOutput(repos, sid, 'orchestrate', 'complete', {});
-      seedStageOutput(repos, sid, 'assemble', 'complete', {});
+      seedStageOutput(repos, sid, 'orchestrate', 'complete', ORCHESTRATE_TEXT);
+      seedStageOutput(repos, sid, 'assemble', 'complete', ASSEMBLE_TEXT);
 
-      vi.mocked(chatCompletion).mockResolvedValue(mockLLMResponse(VALID_FILTER_JSON));
+      vi.mocked(chatCompletion).mockResolvedValue(mockLLMResponse(FILTER_TEXT));
 
       const req = new Request(`http://localhost/api/sessions/${sid}/stages/filter/run`, {
         method: 'POST',
@@ -362,13 +349,13 @@ describe('POST /api/sessions/[id]/stages/[stage]/run', () => {
       const sid = seedSession(repos);
 
       // Pre-seed review, filter, orchestrate as complete
-      seedStageOutput(repos, sid, 'review', 'complete', { assessments: [] });
-      seedStageOutput(repos, sid, 'filter', 'complete', { selected_agent_ids: [] });
-      seedStageOutput(repos, sid, 'orchestrate', 'complete', { segment_assignments: [] });
+      seedStageOutput(repos, sid, 'review', 'complete', REVIEW_TEXT);
+      seedStageOutput(repos, sid, 'filter', 'complete', FILTER_TEXT);
+      seedStageOutput(repos, sid, 'orchestrate', 'complete', ORCHESTRATE_TEXT);
 
       vi.mocked(chatCompletion).mockResolvedValue(
         (async function* () {
-          yield* mockStreamResponse(VALID_ASSEMBLE_JSON);
+          yield* mockStreamResponse(ASSEMBLE_TEXT);
         })() as any,
       );
 
@@ -388,7 +375,7 @@ describe('POST /api/sessions/[id]/stages/[stage]/run', () => {
       expect(completeEvent).toBeDefined();
       expect((completeEvent!.data as any).stage).toBe('assemble');
 
-      // DB: final_versions
+      // DB: final_versions — final_text is now extracted from raw_text via --- split
       const latestVersion = repos.finalVersions.getLatestBySession(sid);
       expect(latestVersion).toBeDefined();
       expect(latestVersion!.version_no).toBe(1);
@@ -403,9 +390,9 @@ describe('POST /api/sessions/[id]/stages/[stage]/run', () => {
     it('creates version_no=2 when a previous version exists', async () => {
       const sid = seedSession(repos);
 
-      seedStageOutput(repos, sid, 'review', 'complete', { assessments: [] });
-      seedStageOutput(repos, sid, 'filter', 'complete', { selected_agent_ids: [] });
-      seedStageOutput(repos, sid, 'orchestrate', 'complete', { segment_assignments: [] });
+      seedStageOutput(repos, sid, 'review', 'complete', REVIEW_TEXT);
+      seedStageOutput(repos, sid, 'filter', 'complete', FILTER_TEXT);
+      seedStageOutput(repos, sid, 'orchestrate', 'complete', ORCHESTRATE_TEXT);
 
       // Pre-existing version_no=1
       repos.finalVersions.insert({
@@ -423,9 +410,10 @@ describe('POST /api/sessions/[id]/stages/[stage]/run', () => {
       expect(preExisting).toBeDefined();
       expect(preExisting!.version_no).toBe(1);
 
+      const newAssembleText = '新版本你好世界\n---\n组装说明';
       vi.mocked(chatCompletion).mockResolvedValue(
         (async function* () {
-          yield* mockStreamResponse(JSON.stringify({ final_text: '新版本你好世界', notes: 'assembled' }));
+          yield* mockStreamResponse(newAssembleText);
         })() as any,
       );
 
@@ -503,8 +491,8 @@ describe('POST /api/sessions/[id]/stages/[stage]/run', () => {
 
     it('allows filter when review is complete', async () => {
       const sid = seedSession(repos);
-      seedStageOutput(repos, sid, 'review', 'complete', { assessments: [] });
-      vi.mocked(chatCompletion).mockResolvedValue(mockLLMResponse(VALID_FILTER_JSON));
+      seedStageOutput(repos, sid, 'review', 'complete', REVIEW_TEXT);
+      vi.mocked(chatCompletion).mockResolvedValue(mockLLMResponse(FILTER_TEXT));
 
       const req = new Request(`http://localhost/api/sessions/${sid}/stages/filter/run`, {
         method: 'POST',
@@ -523,7 +511,7 @@ describe('POST /api/sessions/[id]/stages/[stage]/run', () => {
     it('returns 409 when another stage is already running', async () => {
       const sid = seedSession(repos);
       // Seed review as complete (prerequisite for filter)
-      seedStageOutput(repos, sid, 'review', 'complete', { assessments: [] });
+      seedStageOutput(repos, sid, 'review', 'complete', REVIEW_TEXT);
 
       // Mark orchestrate as running (not related to filter's prerequisite)
       seedStageOutput(repos, sid, 'orchestrate', 'running');
@@ -542,16 +530,13 @@ describe('POST /api/sessions/[id]/stages/[stage]/run', () => {
   });
 
   // ===========================================================================
-  // Schema error
+  // Stage error (refactored: no more schema validation, but llm errors still surface)
   // ===========================================================================
 
-  describe('schema error', () => {
-    it('emits stage_schema_error SSE event for malformed JSON', async () => {
+  describe('stage error', () => {
+    it('emits stage_error SSE event when LLM caller throws', async () => {
       const sid = seedSession(repos);
-      // Both LLM calls return malformed JSON
-      vi.mocked(chatCompletion)
-        .mockResolvedValueOnce(mockLLMResponse(JSON.stringify({ wrong: 'field' })))
-        .mockResolvedValueOnce(mockLLMResponse(JSON.stringify({ also: 'wrong' })));
+      vi.mocked(chatCompletion).mockRejectedValue(new Error('LLM network failure'));
 
       const req = new Request(`http://localhost/api/sessions/${sid}/stages/review/run`, {
         method: 'POST',
@@ -560,15 +545,12 @@ describe('POST /api/sessions/[id]/stages/[stage]/run', () => {
 
       const events = await readSSE(res);
 
-      // Should have at least one stage_schema_error
-      const schemaErrorEvents = events.filter((e) => e.event === 'stage_schema_error');
-      expect(schemaErrorEvents.length).toBeGreaterThan(0);
-
-      // First schema error during retry
-      const firstSchemaErr = schemaErrorEvents[0];
-      expect((firstSchemaErr.data as any).stage).toBe('review');
-      expect((firstSchemaErr.data as any).zodError).toBeDefined();
-      expect((firstSchemaErr.data as any).attempt).toBe(1);
+      // Should have at least one stage_error event (refactored pipeline emits
+      // stage_error rather than stage_schema_error — no JSON parsing anymore)
+      const errorEvents = events.filter(
+        (e) => e.event === 'stage_error' || e.event === 'stage_schema_error',
+      );
+      expect(errorEvents.length).toBeGreaterThan(0);
 
       // DB: status should be 'failed'
       const saved = repos.stageOutputs.getBySessionAndStage(sid, 'review');
@@ -583,16 +565,12 @@ describe('POST /api/sessions/[id]/stages/[stage]/run', () => {
   describe('orchestrate streaming', () => {
     it('emits stage_delta events for streaming stage', async () => {
       const sid = seedSession(repos);
-      seedStageOutput(repos, sid, 'review', 'complete', { assessments: [] });
-      seedStageOutput(repos, sid, 'filter', 'complete', {
-        selected_agent_ids: ['agent-alpha'],
-        rejected_agent_ids: [],
-        rationale: 'ok',
-      });
+      seedStageOutput(repos, sid, 'review', 'complete', REVIEW_TEXT);
+      seedStageOutput(repos, sid, 'filter', 'complete', FILTER_TEXT);
 
       vi.mocked(chatCompletion).mockResolvedValue(
         (async function* () {
-          yield* mockStreamResponse(VALID_ORCHESTRATE_JSON);
+          yield* mockStreamResponse(ORCHESTRATE_TEXT);
         })() as any,
       );
 
@@ -627,17 +605,10 @@ describe('POST /api/sessions/[id]/stages/[stage]/run', () => {
       const sid = seedSession(repos);
 
       // Full pipeline complete
-      seedStageOutput(repos, sid, 'review', 'complete', { assessments: [] });
-      seedStageOutput(repos, sid, 'filter', 'complete', {
-        selected_agent_ids: ['agent-alpha'],
-        rejected_agent_ids: [],
-        rationale: 'best',
-      });
-      seedStageOutput(repos, sid, 'orchestrate', 'complete', {
-        structure_notes: 'ok',
-        segment_assignments: [],
-      });
-      seedStageOutput(repos, sid, 'assemble', 'complete', { final_text: 'hello' });
+      seedStageOutput(repos, sid, 'review', 'complete', REVIEW_TEXT);
+      seedStageOutput(repos, sid, 'filter', 'complete', FILTER_TEXT);
+      seedStageOutput(repos, sid, 'orchestrate', 'complete', ORCHESTRATE_TEXT);
+      seedStageOutput(repos, sid, 'assemble', 'complete', ASSEMBLE_TEXT);
 
       // Session in assembled state (valid for re-running)
       repos.sessions.updateState('assembled', sid);
@@ -647,7 +618,7 @@ describe('POST /api/sessions/[id]/stages/[stage]/run', () => {
       expect(repos.stageOutputs.getBySessionAndStage(sid, 'assemble')!.status).toBe('complete');
 
       // Re-run filter
-      vi.mocked(chatCompletion).mockResolvedValue(mockLLMResponse(VALID_FILTER_JSON));
+      vi.mocked(chatCompletion).mockResolvedValue(mockLLMResponse(FILTER_TEXT));
 
       const req = new Request(`http://localhost/api/sessions/${sid}/stages/filter/run`, {
         method: 'POST',
@@ -678,21 +649,14 @@ describe('POST /api/sessions/[id]/stages/[stage]/run', () => {
     it('re-running review → all downstream stale', async () => {
       const sid = seedSession(repos);
 
-      seedStageOutput(repos, sid, 'review', 'complete', { assessments: [] });
-      seedStageOutput(repos, sid, 'filter', 'complete', {
-        selected_agent_ids: ['agent-alpha'],
-        rejected_agent_ids: [],
-        rationale: 'best',
-      });
-      seedStageOutput(repos, sid, 'orchestrate', 'complete', {
-        structure_notes: 'ok',
-        segment_assignments: [],
-      });
-      seedStageOutput(repos, sid, 'assemble', 'complete', { final_text: 'hello' });
+      seedStageOutput(repos, sid, 'review', 'complete', REVIEW_TEXT);
+      seedStageOutput(repos, sid, 'filter', 'complete', FILTER_TEXT);
+      seedStageOutput(repos, sid, 'orchestrate', 'complete', ORCHESTRATE_TEXT);
+      seedStageOutput(repos, sid, 'assemble', 'complete', ASSEMBLE_TEXT);
 
       repos.sessions.updateState('assembled', sid);
 
-      vi.mocked(chatCompletion).mockResolvedValue(mockLLMResponse(VALID_REVIEW_JSON));
+      vi.mocked(chatCompletion).mockResolvedValue(mockLLMResponse(REVIEW_TEXT));
 
       const req = new Request(`http://localhost/api/sessions/${sid}/stages/review/run`, {
         method: 'POST',

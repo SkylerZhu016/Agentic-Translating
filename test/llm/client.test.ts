@@ -856,4 +856,184 @@ describe('chatCompletion', () => {
       expect(resp.content).toBe('');
     });
   });
+
+  // =========================================================================
+  // 11. Reasoning-content stripping (reasoning_content / thinking discarded)
+  // =========================================================================
+
+  describe('reasoning-content stripping', () => {
+    /** Start an inline HTTP server that returns a non-streaming response
+     *  carrying both `content` and a reasoning field. */
+    async function startReasoningNonStreamServer(
+      reasoningField: 'reasoning_content' | 'thinking',
+    ): Promise<{ url: string; close: () => Promise<void> }> {
+      const http = await import('http');
+      const server = http.createServer((_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          id: 'chatcmpl-reasoning',
+          object: 'chat.completion',
+          created: Math.floor(Date.now() / 1000),
+          model: 'test-model',
+          choices: [
+            {
+              index: 0,
+              message: {
+                role: 'assistant',
+                content: 'Final answer to the user.',
+                [reasoningField]: 'Let me think through this step by step…',
+              },
+              finish_reason: 'stop',
+            },
+          ],
+          usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+        }));
+      });
+      await new Promise<void>((resolve) => server.listen(0, () => resolve()));
+      const addr = server.address() as { port: number };
+      return {
+        url: `http://localhost:${addr.port}`,
+        close: () => new Promise<void>((res) => server.close(() => res())),
+      };
+    }
+
+    /** Start an inline HTTP server that streams SSE deltas carrying both
+     *  `content` deltas and a reasoning field deltas. */
+    async function startReasoningStreamServer(
+      reasoningField: 'reasoning_content' | 'thinking',
+    ): Promise<{ url: string; close: () => Promise<void> }> {
+      const http = await import('http');
+      const server = http.createServer((_req, res) => {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+        });
+        const id = 'chatcmpl-stream-reasoning';
+        const created = Math.floor(Date.now() / 1000);
+        const mk = (delta: Record<string, unknown>) => ({
+          id,
+          object: 'chat.completion.chunk',
+          created,
+          model: 'test-model',
+          choices: [{ index: 0, delta, finish_reason: null }],
+        });
+        const fragments = [
+          `data: ${JSON.stringify(mk({ [reasoningField]: 'Internal reasoning chunk 1.' }))}\n\n`,
+          `data: ${JSON.stringify(mk({ [reasoningField]: 'Internal reasoning chunk 2.' }))}\n\n`,
+          `data: ${JSON.stringify(mk({ content: 'Hello' }))}\n\n`,
+          `data: ${JSON.stringify(mk({ content: ' world' }))}\n\n`,
+          `data: ${JSON.stringify(mk({}))}\n\n`,
+          `data: [DONE]\n\n`,
+        ];
+        let i = 0;
+        const sendNext = () => {
+          if (i < fragments.length) {
+            res.write(fragments[i++]);
+            setTimeout(sendNext, 1);
+          } else {
+            res.end();
+          }
+        };
+        sendNext();
+      });
+      await new Promise<void>((resolve) => server.listen(0, () => resolve()));
+      const addr = server.address() as { port: number };
+      return {
+        url: `http://localhost:${addr.port}`,
+        close: () => new Promise<void>((res) => server.close(() => res())),
+      };
+    }
+
+    it('nonStreamCompletion with reasoning_content → only content returned', async () => {
+      const srv = await startReasoningNonStreamServer('reasoning_content');
+      try {
+        const result = await chatCompletion(
+          { baseUrl: srv.url, apiKey: 'sk-test' },
+          makeRequest(),
+        );
+        expect(isAsyncIterable(result)).toBe(false);
+        const resp = result as ChatCompletionResponse;
+        expect(resp.content).toBe('Final answer to the user.');
+        // Reasoning content must NOT leak into the response
+        expect(resp.content).not.toContain('Let me think');
+        expect((resp as unknown as Record<string, unknown>).reasoning_content).toBeUndefined();
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it('nonStreamCompletion with `thinking` field → only content returned', async () => {
+      const srv = await startReasoningNonStreamServer('thinking');
+      try {
+        const result = await chatCompletion(
+          { baseUrl: srv.url, apiKey: 'sk-test' },
+          makeRequest(),
+        );
+        const resp = result as ChatCompletionResponse;
+        expect(resp.content).toBe('Final answer to the user.');
+        expect(resp.content).not.toContain('Let me think');
+        expect((resp as unknown as Record<string, unknown>).thinking).toBeUndefined();
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it('streamCompletion SSE with reasoning_content → content accumulated, reasoning stripped', async () => {
+      const srv = await startReasoningStreamServer('reasoning_content');
+      try {
+        const result = await chatCompletion(
+          { baseUrl: srv.url, apiKey: 'sk-test' },
+          makeRequest({ stream: true }),
+        );
+        expect(isAsyncIterable(result)).toBe(true);
+        const events = await collectStreamEvents(result as AsyncIterable<LLMStreamEvent>);
+
+        // All text events should be content-only — no reasoning fragments
+        const textEvents = events.filter((e) => e.type === 'text');
+        expect(textEvents.length).toBeGreaterThan(0);
+        for (const e of textEvents) {
+          const txt = (e as { type: 'text'; content: string }).content;
+          expect(txt).not.toContain('Internal reasoning');
+        }
+
+        // done event should have accumulated CONTENT only (not reasoning)
+        const doneEvent = events.find((e) => e.type === 'done') as
+          | { type: 'done'; content: string }
+          | undefined;
+        expect(doneEvent).toBeDefined();
+        expect(doneEvent!.content).toBe('Hello world');
+        expect(doneEvent!.content).not.toContain('Internal reasoning');
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it('streamCompletion SSE with `thinking` field → content accumulated, reasoning stripped', async () => {
+      const srv = await startReasoningStreamServer('thinking');
+      try {
+        const result = await chatCompletion(
+          { baseUrl: srv.url, apiKey: 'sk-test' },
+          makeRequest({ stream: true }),
+        );
+        const events = await collectStreamEvents(result as AsyncIterable<LLMStreamEvent>);
+
+        const doneEvent = events.find((e) => e.type === 'done') as
+          | { type: 'done'; content: string }
+          | undefined;
+        expect(doneEvent).toBeDefined();
+        expect(doneEvent!.content).toBe('Hello world');
+        expect(doneEvent!.content).not.toContain('Internal reasoning');
+
+        // No text event should carry reasoning fragments
+        for (const e of events) {
+          if (e.type === 'text') {
+            expect((e as { content: string }).content).not.toContain('Internal reasoning');
+          }
+        }
+      } finally {
+        await srv.close();
+      }
+    });
+  });
 });
