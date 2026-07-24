@@ -16,6 +16,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { parseSSEChunk, type SSEEvent } from '@/src/lib/contracts/sse'
 import type { ConfigSnapshot, SessionRow } from '@/src/lib/contracts/types'
 import { emitSessionChanged } from '@/src/components/coordinator/session-bus'
+import type { BuiltinDirection, ReviewMode } from '@/src/lib/contracts/vnext'
+import type { TranslationEvidenceReport } from '@/src/lib/evidence/checker'
+import { parseSemanticAgentOutput } from '@/src/lib/protocol/semantic-output'
 
 // ── Public types ────────────────────────────────────────────────
 
@@ -29,6 +32,8 @@ export interface AgentCardState {
   /** 已累积的流式文本（complete 后以服务端 content 为准） */
   text: string
   error: string | null
+  annotation?: string | null
+  evidence?: TranslationEvidenceReport | null
 }
 
 export type TranslatePhase = 'idle' | 'creating' | 'streaming' | 'done'
@@ -40,7 +45,28 @@ export interface LangPair {
   target: string
 }
 
-const DEFAULT_LANG_PAIR: LangPair = { source: '英文', target: '中文五言' }
+const DEFAULT_LANG_PAIR: LangPair = { source: '英文', target: '中文' }
+
+export interface StartTranslationInput {
+  sourceText: string
+  direction: BuiltinDirection
+  taskBrief: string
+  reviewMode: ReviewMode
+  allowedAgentVariantIds: string[]
+  presetRevisionId?: string | null
+}
+
+interface RestorableInvocation {
+  id: string
+  agent_variant_id: string
+  agent_snapshot: string
+  model: string
+  status: 'queued' | 'running' | 'complete' | 'failed' | 'interrupted'
+  raw_output: string | null
+  body_output: string | null
+  annotation_output: string | null
+  error: string | null
+}
 
 const INTERRUPTED_MESSAGE = '连接已中断'
 
@@ -87,7 +113,7 @@ async function readErrorBody(response: Response, fallback: string): Promise<stri
 
 // ── Hook ────────────────────────────────────────────────────────
 
-export function useTranslation() {
+export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
   const [configStatus, setConfigStatus] = useState<ConfigStatus>('loading')
   const [phase, setPhase] = useState<TranslatePhase>('idle')
   const [cards, setCards] = useState<AgentCardState[]>([])
@@ -98,6 +124,14 @@ export function useTranslation() {
 
   const abortRef = useRef<AbortController | null>(null)
   const mountedRef = useRef(true)
+
+  useEffect(() => {
+    setLangPair(
+      direction === 'en_to_zh'
+        ? { source: '英文', target: '中文' }
+        : { source: '中文', target: '英文' },
+    )
+  }, [direction])
 
   // 卸载：取消在飞 SSE（AbortController），此后一切 setState 静默
   useEffect(() => {
@@ -114,13 +148,19 @@ export function useTranslation() {
     ;(async () => {
       try {
         const [agentsRes, endpointsRes] = await Promise.all([
-          fetch('/api/agents'),
+          fetch(`/api/agent-catalog?direction=${direction}`),
           fetch('/api/endpoints'),
         ])
-        const agents = agentsRes.ok ? ((await agentsRes.json()) as unknown[]) : []
+        const catalog = agentsRes.ok
+          ? ((await agentsRes.json()) as { variants?: unknown[] })
+          : {}
         const endpoints = endpointsRes.ok ? ((await endpointsRes.json()) as unknown[]) : []
         if (cancelled) return
-        setConfigStatus(agents.length > 0 && endpoints.length > 0 ? 'ready' : 'unconfigured')
+        setConfigStatus(
+          (catalog.variants?.length ?? 0) >= 2 && endpoints.length > 0
+            ? 'ready'
+            : 'unconfigured',
+        )
       } catch {
         if (!cancelled) setConfigStatus('unconfigured')
       }
@@ -128,7 +168,7 @@ export function useTranslation() {
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [direction])
 
   // ── 卡片局部更新 ───────────────────────────────────────────────
   const patchCard = useCallback((agentKey: string, patch: Partial<AgentCardState>) => {
@@ -159,6 +199,104 @@ export function useTranslation() {
       }
 
       switch (event.event) {
+        case 'agent.started': {
+          const invocationId = data.invocationId as string
+          const variantId = data.agentVariantId as string
+          const replacesInvocationId =
+            typeof data.replacesInvocationId === 'string'
+              ? data.replacesInvocationId
+              : null
+          setCards((previous) => {
+            if (replacesInvocationId) {
+              return previous.map((card) =>
+                card.agentKey === replacesInvocationId
+                  ? {
+                      ...card,
+                      agentKey: invocationId,
+                      name:
+                        typeof data.name === 'string' ? data.name : variantId,
+                      model:
+                        typeof data.model === 'string' ? data.model : card.model,
+                      status: 'streaming',
+                      text: '',
+                      error: null,
+                    }
+                  : card,
+              )
+            }
+            if (previous.some((card) => card.agentKey === invocationId)) {
+              return previous
+            }
+            return [
+              ...previous,
+              {
+                agentKey: invocationId,
+                name:
+                  typeof data.name === 'string' ? data.name : variantId,
+                model:
+                  typeof data.model === 'string' ? data.model : '',
+                status: 'streaming',
+                text: '',
+                error: null,
+              },
+            ]
+          })
+          break
+        }
+        case 'agent.delta': {
+          const invocationId = data.invocationId as string
+          const delta = typeof data.delta === 'string' ? data.delta : ''
+          setCards((previous) =>
+            previous.map((card) =>
+              card.agentKey === invocationId
+                ? { ...card, status: 'streaming', text: card.text + delta }
+                : card,
+            ),
+          )
+          break
+        }
+        case 'agent.completed': {
+          const invocationId = data.invocationId as string
+          patchCard(invocationId, {
+            status: 'complete',
+            text: typeof data.body === 'string' ? data.body : '',
+            annotation:
+              typeof data.annotation === 'string' ? data.annotation : null,
+            error: null,
+          })
+          break
+        }
+        case 'evidence.checked': {
+          const invocationId = data.invocationId as string
+          patchCard(invocationId, {
+            evidence:
+              data.report && typeof data.report === 'object'
+                ? data.report as unknown as TranslationEvidenceReport
+                : null,
+          })
+          break
+        }
+        case 'agent.failed': {
+          const invocationId = data.invocationId as string
+          patchCard(invocationId, {
+            status: 'error',
+            error:
+              typeof data.error === 'string' ? data.error : 'Agent 调用失败',
+          })
+          break
+        }
+        case 'session.completed': {
+          setPhase('done')
+          emitSessionChanged()
+          break
+        }
+        case 'run.interrupted': {
+          setPhase('done')
+          setGlobalError(
+            typeof data.error === 'string' ? data.error : '运行被中断',
+          )
+          break
+        }
         case 'agent_start': {
           const key = data.agent_key as string
           patchCard(key, { status: 'streaming' })
@@ -178,10 +316,17 @@ export function useTranslation() {
         case 'agent_complete': {
           const key = data.agent_key as string
           const content = typeof data.content === 'string' ? data.content : null
+          const semantic = parseSemanticAgentOutput(content ?? '')
           setCards((prev) =>
             prev.map((c) =>
               c.agentKey === key
-                ? { ...c, status: 'complete', text: content ?? c.text, error: null }
+                ? {
+                    ...c,
+                    status: 'complete',
+                    text: semantic.body || c.text,
+                    annotation: semantic.annotation,
+                    error: null,
+                  }
                 : c,
             ),
           )
@@ -211,9 +356,91 @@ export function useTranslation() {
     [patchCard],
   )
 
+  const restoreSession = useCallback(async (id: string) => {
+    const response = await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
+      cache: 'no-store',
+    })
+    if (!response.ok) throw new Error('无法恢复历史会话')
+    const payload = await response.json() as {
+      session: SessionRow
+      invocations?: RestorableInvocation[]
+      runs?: Array<{ status: string }>
+      events?: Array<{ event_type: string; payload_json: string }>
+    }
+    const invocations = payload.invocations ?? []
+    const evidenceByInvocation = new Map<string, TranslationEvidenceReport>()
+    for (const event of payload.events ?? []) {
+      if (event.event_type !== 'evidence.checked') continue
+      try {
+        const value = JSON.parse(event.payload_json) as {
+          invocationId?: string
+          report?: TranslationEvidenceReport
+        }
+        if (value.invocationId && value.report) {
+          evidenceByInvocation.set(value.invocationId, value.report)
+        }
+      } catch {
+        // Ignore malformed historical audit events.
+      }
+    }
+    setSessionId(id)
+    setLangPair({
+      source: payload.session.source_lang,
+      target: payload.session.target_lang,
+    })
+    setCards(
+      invocations.map((invocation) => {
+        let name = invocation.agent_variant_id
+        try {
+          const snapshot = JSON.parse(invocation.agent_snapshot) as {
+            catalogName?: string
+          }
+          name = snapshot.catalogName ?? name
+        } catch {
+          // Preserve stable variant id when a legacy snapshot is malformed.
+        }
+        return {
+          agentKey: invocation.id,
+          name,
+          model: invocation.model,
+          status:
+            invocation.status === 'complete'
+              ? 'complete'
+              : invocation.status === 'failed' ||
+                  invocation.status === 'interrupted'
+                ? 'error'
+                : 'streaming',
+          text: invocation.body_output ?? '',
+          error: invocation.error,
+          annotation: invocation.annotation_output,
+          evidence: evidenceByInvocation.get(invocation.id) ?? null,
+        }
+      }),
+    )
+    const active = (payload.runs ?? []).some(
+      (run) => run.status === 'queued' || run.status === 'running',
+    )
+    setPhase(active ? 'streaming' : 'done')
+    emitSessionChanged(id)
+    if (active) {
+      const controller = new AbortController()
+      abortRef.current?.abort()
+      abortRef.current = controller
+      const events = await fetch(`/api/sessions/${encodeURIComponent(id)}/events`, {
+        signal: controller.signal,
+      })
+      if (events.ok) await consumeSSE(events, applyEvent)
+    }
+    return {
+      sourceText: payload.session.source_text,
+      taskBrief: payload.session.task_brief ?? '',
+      reviewMode: payload.session.review_mode ?? 'main_editor',
+    }
+  }, [applyEvent])
+
   // ── 主流程：创建会话 → 触发翻译 SSE ────────────────────────────
   const start = useCallback(
-    async (sourceText: string) => {
+    async (input: StartTranslationInput) => {
       abortRef.current?.abort()
       const controller = new AbortController()
       abortRef.current = controller
@@ -227,7 +454,7 @@ export function useTranslation() {
         const createRes = await fetch('/api/sessions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sourceText }),
+          body: JSON.stringify(input),
           signal: controller.signal,
         })
         if (!createRes.ok) {
@@ -243,22 +470,37 @@ export function useTranslation() {
         emitSessionChanged(session.id)
         setLangPair({ source: session.source_lang, target: session.target_lang })
         setCards(
-          snapshot.agents.map((a) => ({
-            agentKey: a.name,
-            name: a.name,
-            model: a.model,
-            status: 'pending',
-            text: '',
-            error: null,
-          })),
+          snapshot.version === 3
+            ? []
+            : snapshot.agents.map((a) => ({
+                agentKey: a.name,
+                name: a.name,
+                model: a.model,
+                status: 'pending' as const,
+                text: '',
+                error: null,
+              })),
         )
         setPhase('streaming')
 
-        // 3. 翻译 SSE
-        const sseRes = await fetch(`/api/sessions/${session.id}/translate`, {
-          method: 'POST',
-          signal: controller.signal,
-        })
+        // 3. vNext 运行由服务端持有；SSE 只订阅，不控制任务生命周期。
+        const runRes = await fetch(
+          snapshot.version === 3
+            ? `/api/sessions/${session.id}/run`
+            : `/api/sessions/${session.id}/translate`,
+          { method: 'POST', signal: controller.signal },
+        )
+        if (!runRes.ok) {
+          throw new Error(
+            await readErrorBody(runRes, `启动翻译失败（${runRes.status}）`),
+          )
+        }
+        const sseRes =
+          snapshot.version === 3
+            ? await fetch(`/api/sessions/${session.id}/events`, {
+                signal: controller.signal,
+              })
+            : runRes
         if (!sseRes.ok) {
           throw new Error(await readErrorBody(sseRes, `翻译请求失败（${sseRes.status}）`))
         }
@@ -290,20 +532,36 @@ export function useTranslation() {
       patchCard(agentKey, { status: 'streaming', text: '', error: null })
 
       try {
-        const res = await fetch(
-          `/api/sessions/${sessionId}/agents/${encodeURIComponent(agentKey)}/retry`,
-          { method: 'POST', signal: controller.signal },
-        )
+        const res = await fetch(`/api/sessions/${sessionId}/retry`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ invocationId: agentKey }),
+          signal: controller.signal,
+        })
         if (!res.ok) {
           throw new Error(await readErrorBody(res, `重试请求失败（${res.status}）`))
         }
-        await consumeSSE(res, applyEvent)
+        const retryRun = await res.json() as {
+          afterEventId: number
+          invocationId: string
+        }
+        const events = await fetch(
+          `/api/sessions/${sessionId}/events?after=${retryRun.afterEventId}`,
+          { signal: controller.signal },
+        )
+        if (!events.ok) {
+          throw new Error(
+            await readErrorBody(events, `订阅重试事件失败（${events.status}）`),
+          )
+        }
+        await consumeSSE(events, applyEvent)
 
         if (!mountedRef.current) return
         // 流关闭后该卡仍在飞 → 断流
         setCards((prev) =>
           prev.map((c) =>
-            c.agentKey === agentKey && (c.status === 'streaming' || c.status === 'pending')
+            (c.agentKey === agentKey || c.agentKey === retryRun.invocationId) &&
+                (c.status === 'streaming' || c.status === 'pending')
               ? { ...c, status: 'error', error: INTERRUPTED_MESSAGE }
               : c,
           ),
@@ -349,6 +607,7 @@ export function useTranslation() {
     summary,
     allComplete,
     start,
+    restoreSession,
     retry,
     dismissError,
   }

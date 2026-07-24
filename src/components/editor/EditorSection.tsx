@@ -28,14 +28,17 @@ import type {
   SelectionSnapshot,
   ToolCallView,
 } from './types'
+import { RevisionEvidence } from './RevisionEvidence'
 
 /** 高亮停留时长（ms） */
 const HIGHLIGHT_DURATION = 2600
 
 const SOURCE_LABEL: Record<FinalVersion['source'], string> = {
   assemble: '组装',
+  main_draft: '主 Agent 成稿',
   edit: '编辑',
   restore: '恢复',
+  revert: '撤销',
 }
 
 // ── 服务端历史消息 → 视图模型 ─────────────────────────────────
@@ -270,9 +273,14 @@ export function EditorSection() {
         className="lg:col-span-7"
         actions={
           currentVersionNo != null ? (
-            <Badge variant="subtle">
-              v{currentVersionNo} · {SOURCE_LABEL[currentVersion!.source]}
-            </Badge>
+            <div className="flex items-center gap-1.5">
+              {data?.final_evidence && (
+                <Badge variant="outline">{data.final_evidence.summary}</Badge>
+              )}
+              <Badge variant="subtle">
+                v{currentVersionNo} · {SOURCE_LABEL[currentVersion!.source]}
+              </Badge>
+            </div>
           ) : undefined
         }
       >
@@ -299,6 +307,12 @@ export function EditorSection() {
 
         <Card overline="Versions" title="版本历史" padded={false}>
           <VersionHistory versions={versions} currentVersionNo={currentVersionNo} onRestore={restoreVersion} />
+          <RevisionEvidence
+            sessionId={sessionId}
+            patches={data?.patches ?? []}
+            currentVersionId={currentVersion?.id ?? null}
+            onChanged={refresh}
+          />
         </Card>
       </div>
     </div>

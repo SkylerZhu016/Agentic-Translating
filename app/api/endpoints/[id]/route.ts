@@ -5,6 +5,7 @@ import { getDb } from '@/src/lib/db'
 import { migrate } from '@/src/lib/db/migrate'
 import { createRepositories, type SessionRow } from '@/src/lib/db/repositories'
 import { endpointUpdateSchema } from '@/src/lib/contracts/schemas'
+import { toPublicEndpointDto } from '@/src/lib/security/public-dto'
 
 function ensureDb() {
   const db = getDb()
@@ -63,11 +64,18 @@ export async function PUT(
       id,
       name: parsed.data.name ?? existing.name,
       base_url: parsed.data.base_url ?? existing.base_url,
-      api_key: parsed.data.api_key ?? existing.api_key,
+      api_key:
+        parsed.data.api_key == null || parsed.data.api_key === ''
+          ? existing.api_key
+          : parsed.data.api_key,
+      context_window:
+        parsed.data.context_window === undefined
+          ? existing.context_window ?? null
+          : parsed.data.context_window,
     })
 
     const updated = repos.endpoints.getById(id)
-    return NextResponse.json(updated)
+    return NextResponse.json(updated ? toPublicEndpointDto(updated) : null)
   } catch (e) {
     return NextResponse.json({ error: 'Failed to update endpoint' }, { status: 500 })
   }

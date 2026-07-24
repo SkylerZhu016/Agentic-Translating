@@ -8,6 +8,7 @@ import { writeRunArtifact } from '../storage/run-artifacts';
 import type { Stage, TranslationResult, StageOutput } from '../contracts/types';
 import type { ChatCompletionResponse, LLMStreamEvent, ChatCompletionRequest } from '../llm/client';
 import { isAsyncIterable } from '../llm/client';
+import { semanticBody } from '../protocol/semantic-output';
 
 // ===========================================================================
 // Exported types
@@ -39,6 +40,8 @@ export interface SessionContext {
   sourceText: string;
   sourceLang: string;
   targetLang: string;
+  taskBrief?: string;
+  promptLanguage?: 'zh' | 'en';
   translations: TranslationResult[];
   priorStages: StageOutput[];
   coordinatorEndpoint: { baseUrl: string; apiKey: string };
@@ -65,6 +68,13 @@ const STAGE_GOALS: Record<Stage, string> = {
   filter: '请筛选出最优译文',
   orchestrate: '请规划如何组装最终译文',
   assemble: '请输出最终译文',
+};
+
+const STAGE_GOALS_EN: Record<Stage, string> = {
+  review: 'Review the candidate translations and identify material trade-offs.',
+  filter: 'Select the most useful candidate evidence for the final translation.',
+  orchestrate: 'Plan how the final translation should be assembled.',
+  assemble: 'Produce the complete final translation.',
 };
 
 /** Prerequisite stage for each stage — must be `complete` before this stage runs */
@@ -161,18 +171,23 @@ export async function runStage(
       targetLang: sessionContext.targetLang,
       translations: sessionContext.translations,
       priorStages: sessionContext.priorStages,
+      taskBrief: sessionContext.taskBrief,
     });
 
     const contextJson = JSON.stringify(contextResult.json);
 
     // ── 3. Build stage prompt ──────────────────────────────────
     const stageTemplate = sessionContext.promptTemplates[stage] ?? '';
-    const stageGoal = STAGE_GOALS[stage];
+    const stageGoal =
+      sessionContext.promptLanguage === 'en'
+        ? STAGE_GOALS_EN[stage]
+        : STAGE_GOALS[stage];
 
     const { system, user } = buildStagePrompt(
       stageTemplate,
       contextJson,
       stageGoal,
+      sessionContext.promptLanguage,
     );
 
     // ── 4. LLM call ────────────────────────────────────────────
@@ -213,7 +228,7 @@ export async function runStage(
     // ── 6. Build result ────────────────────────────────────────
     let finalText: string | undefined;
     if (stage === 'assemble') {
-      finalText = rawText.split('\n---\n')[0].trim();
+      finalText = semanticBody(rawText);
       if (finalText) {
         callbacks.onAssembled?.(finalText);
       }

@@ -4,7 +4,7 @@
 // StageOutputPanel —— 每阶段一张输出面板（TID stage-output-panel，data-stage 区分）
 // 四张面板常驻不折叠（R3 中间可见）；统一渲染原始文本：
 //   review / filter / orchestrate → raw_output 原始文本
-//   assemble                      → final_text（如可从 JSON 提取）+ raw_output 原始文本
+//   assemble                      → FSBP 正文 + raw_output 原始文本
 //   failed                        → 错误详情 + 重跑按钮；原始输出折叠
 //   stale                         → 琥珀提醒条 + 旧内容保持可见
 // ---------------------------------------------------------------------------
@@ -13,6 +13,7 @@ import type { Stage, StageOutputRow } from '@/src/lib/contracts/types'
 import { TID } from '@/src/lib/testids'
 import { Badge, Button, Spinner } from '@/src/components/ui'
 import { STAGE_INDEX, STAGES, type StageStatus } from './stage-meta'
+import { parseSemanticAgentOutput } from '@/src/lib/protocol/semantic-output'
 
 export interface StageOutputPanelProps {
   stage: Stage
@@ -145,7 +146,7 @@ export function StageOutputPanel({
           </div>
         )}
 
-        {/* 完成 / 过期：结构化内容（stale 时保持可见） */}
+        {/* 完成 / 过期：自由文本内容（stale 时保持可见） */}
         {(status === 'complete' || status === 'stale') && (
           <StageStructuredBody stage={stage} row={row} />
         )}
@@ -160,7 +161,7 @@ export function StageOutputPanel({
 }
 
 // ---------------------------------------------------------------------------
-// 结构化内容分发
+// 自由文本内容分发
 // ---------------------------------------------------------------------------
 
 function StageStructuredBody({ stage, row }: { stage: Stage; row: StageOutputRow | null }) {
@@ -207,12 +208,7 @@ function OrchestrateBody({ raw }: { raw: string | null }) {
 // ---- assemble：final_text + raw output ----
 
 function AssembleBody({ raw }: { raw: string | null }) {
-  // Extract final text by stripping annotations (matches pipeline.ts split logic)
-  let finalText: string | null = null
-  if (raw) {
-    const splitIdx = raw.indexOf('\n---\n')
-    finalText = splitIdx >= 0 ? raw.slice(0, splitIdx).trim() : raw.trim()
-  }
+  const finalText = raw ? parseSemanticAgentOutput(raw).body : null
   return (
     <div className="space-y-2.5">
       {finalText && (

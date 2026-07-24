@@ -9,7 +9,8 @@ export interface Endpoint {
   id: number
   name: string
   base_url: string
-  api_key: string
+  has_api_key: boolean
+  context_window: number | null
   created_at: string
 }
 
@@ -109,11 +110,16 @@ export interface CoordinatorPutPayload {
 export const configApi = {
   // ── 端点 ────────────────────────────────────────────────
   listEndpoints: () => request<Endpoint[]>('/api/endpoints'),
-  createEndpoint: (data: { name: string; base_url: string; api_key: string }) =>
+  createEndpoint: (data: {
+    name: string
+    base_url: string
+    api_key: string
+    context_window?: number | null
+  }) =>
     request<Endpoint>('/api/endpoints', { method: 'POST', body: JSON.stringify(data) }),
   updateEndpoint: (
     id: number,
-    data: { name?: string; base_url?: string; api_key?: string },
+    data: { name?: string; base_url?: string; api_key?: string; context_window?: number | null },
   ) =>
     request<Endpoint>(`/api/endpoints/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   /** force=true 时绕过会话引用软锁（会话持有快照，删除不影响历史） */

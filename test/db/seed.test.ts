@@ -30,12 +30,50 @@ describe('seed — built-in prompt templates', () => {
     expect(builtins.length).toBe(5)
   })
 
-  it('also seeds the default builtin preset on first call', () => {
+  it('does not create a system workflow preset', () => {
     seed(db)
     const presets = db.prepare('SELECT * FROM config_presets WHERE is_builtin = 1').all() as { id: number; name: string; is_builtin: number }[]
-    expect(presets.length).toBeGreaterThanOrEqual(1)
-    expect(presets[0].name).toBe('默认预设')
-    expect(presets[0].is_builtin).toBe(1)
+    expect(presets).toHaveLength(0)
+  })
+
+  it('seeds exactly 10 archetypes and 20 direction variants', () => {
+    seed(db)
+    const archetypes = db.prepare('SELECT * FROM agent_archetypes').all()
+    const variants = db.prepare(
+      'SELECT direction, prompt_language FROM agent_direction_variants ORDER BY id',
+    ).all() as Array<{ direction: string; prompt_language: string }>
+    expect(archetypes).toHaveLength(10)
+    expect(variants).toHaveLength(20)
+    expect(variants.filter((item) => item.direction === 'en_to_zh')).toHaveLength(10)
+    expect(variants.filter((item) => item.direction === 'zh_to_en')).toHaveLength(10)
+    expect(
+      variants
+        .filter((item) => item.direction === 'en_to_zh')
+        .every((item) => item.prompt_language === 'zh'),
+    ).toBe(true)
+    expect(
+      variants
+        .filter((item) => item.direction === 'zh_to_en')
+        .every((item) => item.prompt_language === 'en'),
+    ).toBe(true)
+  })
+
+  it('seeds independent direction prompt bundles and SQLite drafts', () => {
+    seed(db)
+    const bundles = db.prepare(
+      'SELECT direction, prompt_language FROM direction_prompt_bundles ORDER BY direction',
+    ).all()
+    const drafts = db.prepare(
+      'SELECT direction FROM workspace_drafts ORDER BY direction',
+    ).all()
+    expect(bundles).toEqual([
+      { direction: 'en_to_zh', prompt_language: 'zh' },
+      { direction: 'zh_to_en', prompt_language: 'en' },
+    ])
+    expect(drafts).toEqual([
+      { direction: 'en_to_zh' },
+      { direction: 'zh_to_en' },
+    ])
   })
 
   it('is idempotent — second seed call inserts no duplicates', () => {

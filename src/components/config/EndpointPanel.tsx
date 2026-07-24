@@ -45,6 +45,7 @@ export function EndpointPanel({ endpoints, agents, notify, onChanged }: Endpoint
   const [name, setName] = useState('')
   const [baseUrl, setBaseUrl] = useState('')
   const [apiKey, setApiKey] = useState('')
+  const [contextWindow, setContextWindow] = useState('')
   const [showKey, setShowKey] = useState(false)
   const [errors, setErrors] = useState<FormErrors>({})
   const [saving, setSaving] = useState(false)
@@ -61,6 +62,7 @@ export function EndpointPanel({ endpoints, agents, notify, onChanged }: Endpoint
     setName('')
     setBaseUrl('')
     setApiKey('')
+    setContextWindow('')
     setShowKey(false)
     setErrors({})
     setFormOpen(true)
@@ -70,7 +72,8 @@ export function EndpointPanel({ endpoints, agents, notify, onChanged }: Endpoint
     setEditing(ep)
     setName(ep.name)
     setBaseUrl(ep.base_url)
-    setApiKey(ep.api_key)
+    setApiKey('')
+    setContextWindow(ep.context_window?.toString() ?? '')
     setShowKey(false)
     setErrors({})
     setFormOpen(true)
@@ -105,10 +108,16 @@ export function EndpointPanel({ endpoints, agents, notify, onChanged }: Endpoint
           name: name.trim(),
           base_url: url,
           api_key: apiKey,
+          context_window: contextWindow ? Number(contextWindow) : null,
         })
         notify('端点已更新', { tone: 'inverted' })
       } else {
-        await configApi.createEndpoint({ name: name.trim(), base_url: url, api_key: apiKey })
+        await configApi.createEndpoint({
+          name: name.trim(),
+          base_url: url,
+          api_key: apiKey,
+          context_window: contextWindow ? Number(contextWindow) : null,
+        })
         notify('端点已添加', { tone: 'inverted' })
       }
       setFormOpen(false)
@@ -204,8 +213,8 @@ export function EndpointPanel({ endpoints, agents, notify, onChanged }: Endpoint
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
                     <p className="truncate text-sm font-medium text-ink">{ep.name}</p>
-                    <Badge variant={ep.api_key ? 'outline' : 'subtle'}>
-                      {ep.api_key ? '已设置 Key' : '未设置 Key'}
+                    <Badge variant={ep.has_api_key ? 'outline' : 'subtle'}>
+                      {ep.has_api_key ? '已设置 Key' : '未设置 Key'}
                     </Badge>
                     {refs > 0 && <Badge variant="subtle">{refs} 个 Agent</Badge>}
                   </div>
@@ -295,7 +304,27 @@ export function EndpointPanel({ endpoints, agents, notify, onChanged }: Endpoint
             />
           </Field>
 
-          <Field label="API Key" hint="仅保存在本机数据库，不上传。可留空（如本机 Ollama）。">
+          <Field
+            label="上下文上限"
+            hint="可选。填写模型上下文窗口 token 数；超限时会明确报错，不静默裁剪。"
+          >
+            <Input
+              type="number"
+              min={1}
+              value={contextWindow}
+              onChange={(event) => setContextWindow(event.target.value)}
+              placeholder="例如 128000"
+            />
+          </Field>
+
+          <Field
+            label="API Key"
+            hint={
+              editing?.has_api_key
+                ? '已安全保存。留空表示保留现有 Key；输入新值才会替换。'
+                : '本地加密保存且不会返回浏览器。可留空（如本机 Ollama）。'
+            }
+          >
             <div className="relative">
               <Input
                 testId={TID.endpoint.keyInput}

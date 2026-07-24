@@ -5,9 +5,6 @@ import {
   agentCreateSchema, agentUpdateSchema,
   coordinatorUpdateSchema,
   promptCreateSchema, promptUpdateSchema,
-  // C2 stage output schemas
-  reviewOutputSchema, filterOutputSchema,
-  orchestrateOutputSchema, assembleOutputSchema,
   // Tools
   replaceTextParamsSchema,
   // State transitions
@@ -98,98 +95,6 @@ describe('Config CRUD schemas', () => {
   it('promptUpdateSchema accepts partial', () => {
     const result = promptUpdateSchema.safeParse({ content: 'Updated content' })
     expect(result.success).toBe(true)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// C2 Stage output schemas — each stage: 1 positive + 1 negative
-// ---------------------------------------------------------------------------
-describe('C2 stage output schemas', () => {
-  // --- review ---
-  const validReview = {
-    assessments: [
-      {
-        agent_id: 'agent-1',
-        strengths: ['accurate', 'fluent'],
-        weaknesses: ['slightly verbose'],
-        quality_score: 8,
-        keep: true,
-      },
-    ],
-  }
-
-  it('reviewOutputSchema accepts valid input', () => {
-    const result = reviewOutputSchema.safeParse(validReview)
-    expect(result.success).toBe(true)
-  })
-
-  it('reviewOutputSchema rejects quality_score out of range', () => {
-    const result = reviewOutputSchema.safeParse({
-      assessments: [{ agent_id: 'a', strengths: [], weaknesses: [], quality_score: 11, keep: true }],
-    })
-    expect(result.success).toBe(false)
-  })
-
-  // --- filter ---
-  const validFilter = {
-    selected_agent_ids: ['agent-1', 'agent-3'],
-    rationale: 'These two are best',
-    rejected_agent_ids: ['agent-2'],
-  }
-
-  it('filterOutputSchema accepts valid input', () => {
-    const result = filterOutputSchema.safeParse(validFilter)
-    expect(result.success).toBe(true)
-  })
-
-  it('filterOutputSchema rejects missing rationale', () => {
-    const result = filterOutputSchema.safeParse({
-      selected_agent_ids: ['agent-1'],
-      rejected_agent_ids: [],
-    })
-    expect(result.success).toBe(false)
-  })
-
-  // --- orchestrate ---
-  const validOrchestrate = {
-    structure_notes: 'Combine chronologically',
-    segment_assignments: [
-      {
-        segment_index: 0,
-        source_agent_id: 'agent-1',
-        source_segment: '开头段落',
-        rationale: 'Best intro',
-      },
-    ],
-  }
-
-  it('orchestrateOutputSchema accepts valid input', () => {
-    const result = orchestrateOutputSchema.safeParse(validOrchestrate)
-    expect(result.success).toBe(true)
-  })
-
-  it('orchestrateOutputSchema rejects missing source_agent_id', () => {
-    const result = orchestrateOutputSchema.safeParse({
-      structure_notes: 'x',
-      segment_assignments: [{ segment_index: 0, source_segment: 's', rationale: 'r' }],
-    })
-    expect(result.success).toBe(false)
-  })
-
-  // --- assemble ---
-  const validAssemble = {
-    final_text: '月落乌啼霜满天',
-    notes: 'Final version after polish',
-  }
-
-  it('assembleOutputSchema accepts valid input', () => {
-    const result = assembleOutputSchema.safeParse(validAssemble)
-    expect(result.success).toBe(true)
-  })
-
-  it('assembleOutputSchema rejects empty final_text', () => {
-    const result = assembleOutputSchema.safeParse({ final_text: '', notes: 'x' })
-    expect(result.success).toBe(false)
   })
 })
 

@@ -19,9 +19,11 @@ import {
 import { AgentPanel } from './AgentPanel'
 import { CoordinatorPanel } from './CoordinatorPanel'
 import { EndpointPanel } from './EndpointPanel'
-import { PresetPanel } from './PresetPanel'
 import { PromptPanel } from './PromptPanel'
 import { Skeleton, ToastStack, useToasts } from './shared'
+import { DirectionSettingsCard } from './DirectionSettingsCard'
+import { AgentLibraryPanel } from './AgentLibraryPanel'
+import { WorkflowPresetPanel } from './WorkflowPresetPanel'
 
 export function ConfigPanels() {
   const [loading, setLoading] = useState(true)
@@ -102,13 +104,15 @@ export function ConfigPanels() {
         </div>
       ) : (
         <div className="mx-auto grid max-w-3xl grid-cols-1 gap-5">
+          <DirectionSettingsCard notify={push} />
+          <AgentLibraryPanel notify={push} />
+          <WorkflowPresetPanel endpoints={endpoints} notify={push} />
           <EndpointPanel
             endpoints={endpoints}
             agents={agents}
             notify={push}
             onChanged={refreshEndpoints}
           />
-          <PresetPanel endpoints={endpoints} notify={push} onPresetLoaded={loadAll} />
           <AgentPanel
             agents={agents}
             endpoints={endpoints}

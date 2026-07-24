@@ -34,6 +34,7 @@ import {
   collectSSEEvents,
   sseEventNames,
   sseData,
+  E2E_DATA_DIR,
 } from './helpers'
 
 const MOCK_URL = process.env.E2E_MOCK_LLM_URL ?? 'http://localhost:41099'
@@ -42,7 +43,7 @@ const AGENT_NAMES = ['Agent 1', 'Agent 2', 'Agent 3']
 const COORD_MODEL = 'gpt-4o-cleanup-coord'
 
 /** Path to the runs directory (matches src/lib/storage/run-artifacts.ts). */
-const RUNS_DIR = path.resolve(process.cwd(), 'data', 'runs')
+const RUNS_DIR = path.join(E2E_DATA_DIR, 'runs')
 
 test.beforeEach(async ({ request }) => {
   await resetDb(request)

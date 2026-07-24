@@ -38,6 +38,7 @@ import {
   collectSSEEvents,
   sseEventNames,
   sseData,
+  E2E_DATA_DIR,
 } from './helpers'
 
 const MOCK_URL = process.env.E2E_MOCK_LLM_URL ?? 'http://localhost:41099'
@@ -46,7 +47,7 @@ const AGENT_NAMES = ['Agent 1', 'Agent 2', 'Agent 3']
 const COORD_MODEL = 'gpt-4o-pipeline-coord'
 
 /** Path to the runs directory (matches src/lib/storage/run-artifacts.ts). */
-const RUNS_DIR = path.resolve(process.cwd(), 'data', 'runs')
+const RUNS_DIR = path.join(E2E_DATA_DIR, 'runs')
 
 test.beforeEach(async ({ request }) => {
   await resetDb(request)
@@ -144,11 +145,11 @@ test.describe('Task17 — Full pipeline free-text flow', () => {
     await byTid(page, TID.translate.sourceInput).fill(SOURCE_TEXT)
     await byTid(page, TID.translate.translateButton).click()
 
-    // Wait for all 3 agent cards to reach complete status
-    await expect(byTid(page, TID.translate.agentStreamCard)).toHaveCount(3, {
+    // Dynamic selection uses the two-role mandatory fallback.
+    await expect(byTid(page, TID.translate.agentStreamCard)).toHaveCount(2, {
       timeout: 10_000,
     })
-    await expect(byTid(page, TID.translate.agentStatusComplete)).toHaveCount(3, {
+    await expect(byTid(page, TID.translate.agentStatusComplete)).toHaveCount(2, {
       timeout: 30_000,
     })
 
@@ -220,11 +221,19 @@ test.describe('Task17 — Full pipeline free-text flow', () => {
       expect(content.length).toBeGreaterThan(0)
     }
 
-    // Draft txt files (one per agent, named draft-{agentKey})
-    // agent_key equals the agent's name (see session-service.ts)
-    for (const name of AGENT_NAMES) {
-      const draftPath = path.join(sessionDir, `draft-${name}.txt`)
-      expect(fs.existsSync(draftPath), `draft txt should exist: draft-${name}.txt`).toBe(true)
+    // vNext dynamic fallback stores one raw txt artifact per actual invocation.
+    expect(detail.invocations).toHaveLength(2)
+    for (const invocation of detail.invocations as Array<{
+      agent_variant_id: string
+    }>) {
+      const draftPath = path.join(
+        sessionDir,
+        `draft-${invocation.agent_variant_id}.txt`,
+      )
+      expect(
+        fs.existsSync(draftPath),
+        `draft txt should exist: draft-${invocation.agent_variant_id}.txt`,
+      ).toBe(true)
     }
   })
 })

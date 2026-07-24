@@ -1,0 +1,13 @@
+.git
+.next
+.omo
+node_modules
+data
+dist-electron
+playwright-report
+test-results
+.env
+.env.*
+*.log
+experiments/results
+experiments/reports

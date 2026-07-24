@@ -20,8 +20,10 @@ export interface VersionHistoryProps {
 
 const SOURCE_META: Record<FinalVersion['source'], { label: string; variant: 'solid' | 'outline' | 'subtle' }> = {
   assemble: { label: '组装', variant: 'solid' },
+  main_draft: { label: '主成稿', variant: 'solid' },
   edit: { label: '编辑', variant: 'outline' },
   restore: { label: '恢复', variant: 'subtle' },
+  revert: { label: '撤销', variant: 'subtle' },
 }
 
 function formatTime(createdAt: string): string {

@@ -2,6 +2,8 @@
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
+import { useDirection } from '@/src/components/direction/DirectionProvider'
+import { TID } from '@/src/lib/testids'
 
 // ---------------------------------------------------------------------------
 // TopNav — 顶栏：方印标识 + 产品名 + 主导航（工作台 / 配置 / 历史）
@@ -15,6 +17,7 @@ const NAV_ITEMS = [
 
 export function TopNav() {
   const pathname = usePathname()
+  const { direction, requestDirection } = useDirection()
 
   return (
     <header className="sticky top-0 z-40 border-b border-line bg-paper/85 backdrop-blur-sm">
@@ -33,7 +36,8 @@ export function TopNav() {
         </Link>
 
         {/* 导航 */}
-        <nav aria-label="主导航" className="flex shrink-0 items-center gap-1 sm:gap-2">
+        <div className="flex shrink-0 items-center gap-2">
+        <nav aria-label="主导航" className="flex items-center gap-1 sm:gap-2">
           {NAV_ITEMS.map((item) => {
             const active = item.exact ? pathname === item.href : pathname.startsWith(item.href)
             return (
@@ -53,6 +57,38 @@ export function TopNav() {
             )
           })}
         </nav>
+        <div
+          className="inline-flex rounded-sm border border-line-2 bg-paper p-0.5"
+          role="group"
+          aria-label="翻译方向"
+        >
+          {([
+            ['en_to_zh', '英 → 中', '英中'],
+            ['zh_to_en', '中 → 英', '中英'],
+          ] as const).map(([value, desktopLabel, mobileLabel]) => (
+            <button
+              key={value}
+              type="button"
+              data-testid={
+                value === 'en_to_zh'
+                  ? TID.direction.enToZhButton
+                  : TID.direction.zhToEnButton
+              }
+              aria-pressed={direction === value}
+              onClick={() => requestDirection(value)}
+              className={[
+                'rounded-xs px-2 py-1 text-xs leading-4 transition-colors',
+                direction === value
+                  ? 'bg-ink text-paper'
+                  : 'text-ink-3 hover:text-ink',
+              ].join(' ')}
+            >
+              <span className="hidden sm:inline">{desktopLabel}</span>
+              <span className="sm:hidden">{mobileLabel}</span>
+            </button>
+          ))}
+        </div>
+        </div>
       </div>
     </header>
   )

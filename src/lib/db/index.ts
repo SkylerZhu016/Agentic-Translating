@@ -7,7 +7,9 @@ declare global {
   var __db: Database.Database | undefined
 }
 
-const DB_DIR = path.join(process.cwd(), 'data')
+const DB_DIR = process.env.AGENTIC_DATA_DIR
+  ? path.resolve(process.env.AGENTIC_DATA_DIR)
+  : path.join(process.cwd(), 'data')
 const DB_PATH = path.join(DB_DIR, 'app.db')
 
 /**

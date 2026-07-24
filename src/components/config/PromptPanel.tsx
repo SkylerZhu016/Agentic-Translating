@@ -21,7 +21,7 @@ const KINDS: { kind: PromptKind; label: string }[] = [
 const VAR_DOCS: Record<PromptKind, { name: string; desc: string }[]> = {
   translator: [
     { name: '{{source_lang}}', desc: '原文语言（如 英文）' },
-    { name: '{{target_lang}}', desc: '目标语言（如 中文五言）' },
+    { name: '{{target_lang}}', desc: '目标语言（如 中文）' },
     { name: '{{source_text}}', desc: '待翻译的原文全文' },
     { name: '{{extra_instructions}}', desc: '附加指令，可为空' },
   ],
@@ -32,17 +32,17 @@ const VAR_DOCS: Record<PromptKind, { name: string; desc: string }[]> = {
   ],
   filter: [
     { name: '{{source_text}}', desc: '原文全文' },
-    { name: '{{review_output}}', desc: '审查阶段 JSON 输出' },
+    { name: '{{review_output}}', desc: '审查阶段正文（不含注释）' },
   ],
   orchestrate: [
     { name: '{{source_text}}', desc: '原文全文' },
     { name: '{{selected_translations}}', desc: '入选译稿全文' },
-    { name: '{{review_output}}', desc: '审查阶段 JSON 输出' },
-    { name: '{{filter_output}}', desc: '筛选阶段 JSON 输出' },
+    { name: '{{review_output}}', desc: '审查阶段正文（不含注释）' },
+    { name: '{{filter_output}}', desc: '筛选阶段正文（不含注释）' },
   ],
   assemble: [
     { name: '{{source_text}}', desc: '原文全文' },
-    { name: '{{orchestrate_output}}', desc: '编排阶段 JSON 输出' },
+    { name: '{{orchestrate_output}}', desc: '编排阶段正文（不含注释）' },
     { name: '{{selected_translations}}', desc: '入选译稿全文' },
   ],
 }

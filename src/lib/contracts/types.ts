@@ -1,3 +1,14 @@
+import type {
+  AgentDirectionVariant,
+  DirectionPromptBundle,
+  ModelBinding,
+  ReviewMode,
+  TeamPolicy,
+  TranslationConstraints,
+  TranslationDirection,
+  WorkflowPresetRevision,
+} from './vnext'
+
 // ---------------------------------------------------------------------------
 // Domain types — single source of truth for all domain entities
 // ---------------------------------------------------------------------------
@@ -21,6 +32,7 @@ export interface EndpointConfig {
   name: string
   base_url: string
   api_key: string
+  context_window?: number | null
   created_at: string
 }
 
@@ -75,7 +87,7 @@ export interface FinalVersion {
   session_id: string
   version_no: number
   text: string
-  source: 'assemble' | 'edit' | 'restore'
+  source: 'assemble' | 'main_draft' | 'edit' | 'restore' | 'revert'
   created_at: string
 }
 
@@ -101,6 +113,12 @@ export interface SessionRow {
   target_lang: string
   state: string
   config_snapshot: string
+  direction?: 'en_to_zh' | 'zh_to_en' | 'custom'
+  task_brief?: string
+  review_mode?: 'main_editor' | 'four_stage'
+  preset_revision_id?: string | null
+  final_version_id?: number | null
+  batch_item_id?: string | null
   created_at: string
   updated_at: string
 }
@@ -137,7 +155,10 @@ export interface FinalVersionRow {
   session_id: string
   version_no: number
   text: string
-  source: 'assemble' | 'edit' | 'restore'
+  source: 'assemble' | 'main_draft' | 'edit' | 'restore' | 'revert'
+  parent_version_id?: number | null
+  content_hash?: string | null
+  created_by_patch_id?: string | null
   created_at: string
 }
 
@@ -156,10 +177,36 @@ export interface ChatMessageRow {
 // ────────────────────────────────────────────────────────────────
 /** Deep-frozen config snapshot at session creation */
 export interface ConfigSnapshot {
+  version?: 2 | 3
   endpoint: EndpointConfig | null
+  endpoints?: EndpointConfig[]
   agents: TranslatorAgentConfig[]
   coordinator: CoordinatorConfig | null
   prompts: Record<string, string> // kind → content
+  direction?: TranslationDirection
+  promptBundleSnapshot?: DirectionPromptBundle
+  agentVariantSnapshots?: AgentDirectionVariant[]
+  endpointSnapshots?: Array<{
+    id: number
+    name: string
+    baseUrl: string
+    apiKey: string
+    hasApiKey: boolean
+    contextWindow: number | null
+  }>
+  modelBindings?: {
+    defaultWorker: ModelBinding
+    mainAgent: ModelBinding
+    editingAgent: ModelBinding
+  }
+  presetRevisionSnapshot?: WorkflowPresetRevision | null
+  taskBrief?: string
+  constraints?: TranslationConstraints
+  orchestrationPolicy?: {
+    teamPolicy: TeamPolicy
+    reviewMode: ReviewMode
+    maxAgentCalls: number
+  }
 }
 
 // ── Preset DB Row types ──────────────────────────────────────────

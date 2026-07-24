@@ -1,8 +1,11 @@
 {
   "name": "agentic-translating",
   "version": "0.1.0",
+  "description": "A bidirectional, multi-model translation deliberation and evidence-based editing workspace.",
+  "author": "Agentic Translating contributors",
   "private": true,
   "type": "module",
+  "main": "electron/main.mjs",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -11,11 +14,21 @@
     "test:watch": "vitest",
     "lint": "next lint",
     "typecheck": "node node_modules/typescript/lib/tsc.js --noEmit",
-    "e2e": "playwright test"
+    "e2e": "npm run build:standalone && playwright test",
+    "build:standalone": "next build && node scripts/prepare-standalone.mjs",
+    "desktop": "electron .",
+    "icon:build": "node scripts/generate-icon.mjs",
+    "package:win": "node scripts/package-win.mjs",
+    "experiment:protocol": "node scripts/protocol-experiment.mjs",
+    "experiment:report": "node scripts/protocol-report.mjs"
   },
   "dependencies": {
-    "better-sqlite3": "^11.8.1",
-    "next": "^15.3.1",
+    "better-sqlite3": "13.0.1",
+    "cmu-pronouncing-dictionary": "^3.0.0",
+    "fast-array-diff": "^1.1.0",
+    "jszip": "^3.10.1",
+    "next": "^15.5.21",
+    "pinyin-pro": "^3.28.2",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },
@@ -26,9 +39,48 @@
     "@types/node": "^22.20.1",
     "@types/react": "^19.1.2",
     "@types/react-dom": "^19.1.2",
+    "electron": "43.2.0",
+    "electron-builder": "^26.15.3",
     "tailwindcss": "^4.1.4",
     "typescript": "^5.8.3",
     "vitest": "^3.2.7",
     "zod": "^4.4.3"
+  },
+  "overrides": {
+    "postcss": "^8.5.19",
+    "sharp": "^0.35.0"
+  },
+  "build": {
+    "appId": "com.agentictranslating.desktop",
+    "productName": "Agentic Translating",
+    "files": [
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": ".next/standalone",
+        "to": "app"
+      }
+    ],
+    "directories": {
+      "output": "dist-electron"
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "artifactName": "${productName}-${version}-setup-${arch}.${ext}",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "deleteAppDataOnUninstall": false
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-portable-${arch}.${ext}"
+    }
   }
 }

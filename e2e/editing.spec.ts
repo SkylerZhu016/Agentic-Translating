@@ -88,8 +88,8 @@ async function runTranslation(page: Page, request: APIRequestContext): Promise<v
   await page.goto('/')
   await byTid(page, TID.translate.sourceInput).fill(SOURCE_TEXT)
   await byTid(page, TID.translate.translateButton).click()
-  await expect(byTid(page, TID.translate.agentStreamCard)).toHaveCount(3, { timeout: 10_000 })
-  await expect(byTid(page, TID.translate.agentStatusComplete)).toHaveCount(3, { timeout: 30_000 })
+  await expect(byTid(page, TID.translate.agentStreamCard)).toHaveCount(2, { timeout: 10_000 })
+  await expect(byTid(page, TID.translate.agentStatusComplete)).toHaveCount(2, { timeout: 30_000 })
 }
 
 /** Run all four coordination stages to reach assembled state. */

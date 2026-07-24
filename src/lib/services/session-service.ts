@@ -12,9 +12,14 @@ import type Database from 'better-sqlite3'
 import type { Repositories } from '../db/repositories'
 import {
   assertSourceNonEmpty,
-  assertSourceLength,
   assertTransition,
 } from '../guards'
+import type {
+  ReviewMode,
+  TranslationConstraints,
+  TranslationDirection,
+} from '../contracts/vnext'
+import { createVNextRepositories } from '../db/vnext-repositories'
 import type {
   SessionState,
   ConfigSnapshot,
@@ -38,6 +43,15 @@ export class NoAgentsConfiguredError extends Error {
   }
 }
 
+export class InvalidCustomDirectionError extends Error {
+  readonly code = 'invalid_custom_direction'
+
+  constructor(message: string) {
+    super(message)
+    this.name = 'InvalidCustomDirectionError'
+  }
+}
+
 // ===========================================================================
 // Public Types
 // ===========================================================================
@@ -46,6 +60,12 @@ export interface CreateSessionInput {
   sourceText: string
   sourceLang: string
   targetLang: string
+  direction?: TranslationDirection
+  taskBrief?: string
+  reviewMode?: ReviewMode
+  presetRevisionId?: string | null
+  allowedAgentVariantIds?: string[]
+  constraints?: TranslationConstraints
 }
 
 export interface FullSession {
@@ -71,7 +91,8 @@ function deepClone<T>(obj: T): T {
  * structurally independent of the DB rows — callers can safely store it.
  */
 function buildConfigSnapshot(repos: Repositories): ConfigSnapshot {
-  const endpoint = repos.endpoints.list()[0] ?? null
+  const endpoints = repos.endpoints.list()
+  const endpoint = endpoints[0] ?? null
   const agents = repos.translatorAgents.list()
   const coordinator = repos.coordinatorConfig.get() ?? null
   const promptsList = repos.promptTemplates.list()
@@ -79,7 +100,15 @@ function buildConfigSnapshot(repos: Repositories): ConfigSnapshot {
   for (const p of promptsList) {
     prompts[p.kind] = p.content
   }
-  return deepClone({ endpoint, agents, coordinator, prompts })
+  return deepClone({ version: 2, endpoint, endpoints, agents, coordinator, prompts })
+}
+
+function tableExists(db: Database.Database, table: string): boolean {
+  return Boolean(
+    db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+    ).get(table),
+  )
 }
 
 // ===========================================================================
@@ -111,15 +140,117 @@ export function createSessionService(
     createSession(input: CreateSessionInput): SessionRow {
       // 1. Guards
       assertSourceNonEmpty(input.sourceText)
-      assertSourceLength(input.sourceText)
 
       const agents = repos.translatorAgents.list()
-      if (agents.length === 0) {
+      const direction = input.direction ?? 'en_to_zh'
+      const vnext = tableExists(db, 'agent_direction_variants')
+        ? createVNextRepositories(db)
+        : null
+      const availableVariants = vnext?.agents.listVariants(direction, false) ?? []
+      if (agents.length === 0 && availableVariants.length === 0) {
         throw new NoAgentsConfiguredError()
       }
 
       // 2. Deep-clone current config into snapshot
       const snapshot = buildConfigSnapshot(repos)
+      if (vnext) {
+        const promptBundle = vnext.directionPrompts.getLatest(direction)
+        if (!promptBundle) {
+          throw new Error(`Missing direction prompt bundle: ${direction}`)
+        }
+        const requestedIds = new Set(input.allowedAgentVariantIds ?? [])
+        const selectedVariants =
+          requestedIds.size > 0
+            ? availableVariants.filter((variant) => requestedIds.has(variant.id))
+            : availableVariants
+        const presetRevision = input.presetRevisionId
+          ? vnext.workflowPresets.getRevision(input.presetRevisionId)
+          : null
+        if (input.presetRevisionId && !presetRevision) {
+          throw new Error(`Preset revision not found: ${input.presetRevisionId}`)
+        }
+        if (presetRevision) {
+          const preset = vnext.workflowPresets.get(presetRevision.presetId)
+          if (!preset) {
+            throw new Error(`Preset not found: ${presetRevision.presetId}`)
+          }
+          if (preset.direction !== direction) {
+            throw new InvalidCustomDirectionError(
+              `Preset direction ${preset.direction} does not match session direction ${direction}.`,
+            )
+          }
+          if (
+            presetRevision.contract.agentVariantSnapshots.some(
+              (variant) => variant.direction !== direction,
+            )
+          ) {
+            throw new InvalidCustomDirectionError(
+              'A preset revision cannot mix translation directions.',
+            )
+          }
+        }
+        const executionVariants =
+          presetRevision?.contract.agentVariantSnapshots ?? selectedVariants
+        if (
+          direction === 'custom' &&
+          executionVariants.filter((variant) => variant.direction === 'custom')
+            .length < 2
+        ) {
+          throw new InvalidCustomDirectionError(
+            'Custom directions require at least two enabled custom Agent variants.',
+          )
+        }
+        const endpoints = repos.endpoints.list()
+        const firstAgent = agents[0]
+        const coordinator = repos.coordinatorConfig.get()
+        const defaultWorker =
+          presetRevision?.contract.defaultWorkerBinding ?? {
+            endpointId:
+              firstAgent?.endpoint_id ??
+              coordinator?.endpoint_id ??
+              endpoints[0]?.id ??
+              null,
+            model: firstAgent?.model ?? coordinator?.model ?? '',
+            contextWindow: null,
+          }
+        const mainAgent = presetRevision?.contract.mainAgentBinding ?? {
+          endpointId: coordinator?.endpoint_id ?? defaultWorker.endpointId,
+          model: coordinator?.model ?? defaultWorker.model,
+          contextWindow: null,
+        }
+        const editingAgent = presetRevision?.contract.editingAgentBinding ?? {
+          endpointId: coordinator?.chat_endpoint_id ?? mainAgent.endpointId,
+          model: coordinator?.chat_model || mainAgent.model,
+          contextWindow: null,
+        }
+        Object.assign(snapshot, {
+          version: 3 as const,
+          direction,
+          promptBundleSnapshot: promptBundle,
+          agentVariantSnapshots: executionVariants,
+          endpointSnapshots: endpoints.map((endpoint) => ({
+            id: endpoint.id,
+            name: endpoint.name,
+            baseUrl: endpoint.base_url,
+            apiKey: endpoint.api_key,
+            hasApiKey: endpoint.api_key.length > 0,
+            contextWindow: endpoint.context_window ?? null,
+          })),
+          modelBindings: { defaultWorker, mainAgent, editingAgent },
+          presetRevisionSnapshot: presetRevision,
+          taskBrief: input.taskBrief ?? '',
+          constraints:
+            input.constraints ?? presetRevision?.contract.constraints ?? {},
+          orchestrationPolicy: {
+            teamPolicy: presetRevision?.contract.teamPolicy ?? 'dynamic',
+            reviewMode:
+              input.reviewMode ??
+              presetRevision?.contract.reviewMode ??
+              'main_editor',
+            maxAgentCalls: presetRevision?.contract.maxAgentCalls ?? 5,
+          },
+        })
+      }
       const id = randomUUID()
 
       // 3. Transaction: session + one translation_result per agent
@@ -132,6 +263,26 @@ export function createSessionService(
           state: 'draft',
           config_snapshot: JSON.stringify(snapshot),
         })
+
+        const sessionColumns = db
+          .prepare('PRAGMA table_info(sessions)')
+          .all() as Array<{ name: string }>
+        if (sessionColumns.some((column) => column.name === 'direction')) {
+          db.prepare(`
+            UPDATE sessions
+            SET direction = @direction,
+                task_brief = @task_brief,
+                review_mode = @review_mode,
+                preset_revision_id = @preset_revision_id
+            WHERE id = @id
+          `).run({
+            id,
+            direction: input.direction ?? 'en_to_zh',
+            task_brief: input.taskBrief ?? '',
+            review_mode: input.reviewMode ?? 'main_editor',
+            preset_revision_id: input.presetRevisionId ?? null,
+          })
+        }
 
         for (const agent of agents) {
           repos.translationResults.insert({

@@ -46,12 +46,45 @@ export const endpointCreateSchema = z.object({
   name: z.string().min(1, 'Name is required'),
   base_url: z.string().url('Must be a valid URL'),
   api_key: z.string().min(0).default(''),
+  context_window: z.number().int().positive().nullable().optional(),
 })
 
 export const endpointUpdateSchema = z.object({
   name: z.string().min(1).optional(),
   base_url: z.string().url().optional(),
   api_key: z.string().optional(),
+  context_window: z.number().int().positive().nullable().optional(),
+})
+
+export const sessionCreateSchema = z.object({
+  sourceText: z.string(),
+  direction: z.enum(['en_to_zh', 'zh_to_en', 'custom']).default('en_to_zh'),
+  sourceLang: z.string().min(1).optional(),
+  targetLang: z.string().min(1).optional(),
+  taskBrief: z.string().default(''),
+  reviewMode: z.enum(['main_editor', 'four_stage']).default('main_editor'),
+  presetRevisionId: z.string().min(1).nullable().optional(),
+  allowedAgentVariantIds: z.array(z.string().min(1)).optional(),
+  constraints: z.object({
+    preserveParagraphs: z.boolean().optional(),
+    preserveStanzas: z.boolean().optional(),
+    expectedStanzas: z.number().int().positive().optional(),
+    targetCharsOrWordsPerLine: z.number().int().positive().optional(),
+    forbiddenTerms: z.array(z.string()).optional(),
+    requiredTerms: z.array(z.string()).optional(),
+    rhymeEvidence: z.boolean().optional(),
+  }).default({}),
+}).superRefine((value, context) => {
+  if (
+    value.direction === 'custom' &&
+    (!value.sourceLang?.trim() || !value.targetLang?.trim())
+  ) {
+    context.addIssue({
+      code: 'custom',
+      path: ['sourceLang'],
+      message: 'Custom directions require explicit sourceLang and targetLang.',
+    })
+  }
 })
 
 export const agentCreateSchema = z.object({
@@ -86,53 +119,6 @@ export const promptCreateSchema = z.object({
 export const promptUpdateSchema = z.object({
   name: z.string().min(1).optional(),
   content: z.string().min(1).optional(),
-})
-
-// ===========================================================================
-// C2 — Four stage output schemas (exact per plan lines 62–65)
-// ===========================================================================
-
-/** `review` output: array of assessments */
-export const reviewOutputSchema = z.object({
-  assessments: z
-    .array(
-      z.object({
-        agent_id: z.string().min(1),
-        strengths: z.array(z.string()),
-        weaknesses: z.array(z.string()),
-        quality_score: z.number().int().min(1).max(10),
-        keep: z.boolean(),
-      })
-    )
-    .min(1),
-})
-
-/** `filter` output: selected / rejected agent ids */
-export const filterOutputSchema = z.object({
-  selected_agent_ids: z.array(z.string().min(1)),
-  rationale: z.string().min(1),
-  rejected_agent_ids: z.array(z.string().min(1)),
-})
-
-/** `orchestrate` output: segment assignments */
-export const orchestrateOutputSchema = z.object({
-  structure_notes: z.string().min(1),
-  segment_assignments: z
-    .array(
-      z.object({
-        segment_index: z.number().int().min(0),
-        source_agent_id: z.string().min(1),
-        source_segment: z.string().min(1),
-        rationale: z.string().min(1),
-      })
-    )
-    .min(1),
-})
-
-/** `assemble` output: final text + notes */
-export const assembleOutputSchema = z.object({
-  final_text: z.string().min(1, 'final_text must not be empty'),
-  notes: z.string().min(0),
 })
 
 // ===========================================================================

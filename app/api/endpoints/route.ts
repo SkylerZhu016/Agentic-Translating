@@ -5,6 +5,7 @@ import { getDb } from '@/src/lib/db'
 import { migrate } from '@/src/lib/db/migrate'
 import { createRepositories } from '@/src/lib/db/repositories'
 import { endpointCreateSchema } from '@/src/lib/contracts/schemas'
+import { toPublicEndpointDto } from '@/src/lib/security/public-dto'
 
 function ensureDb() {
   const db = getDb()
@@ -17,7 +18,7 @@ export async function GET(_req: NextRequest) {
   try {
     const { repos } = ensureDb()
     const list = repos.endpoints.list()
-    return NextResponse.json(list)
+    return NextResponse.json(list.map(toPublicEndpointDto))
   } catch (e) {
     return NextResponse.json({ error: 'Failed to list endpoints' }, { status: 500 })
   }
@@ -42,9 +43,10 @@ export async function POST(req: NextRequest) {
       name: parsed.data.name,
       base_url: parsed.data.base_url,
       api_key: parsed.data.api_key,
+      context_window: parsed.data.context_window ?? null,
     })
     const created = repos.endpoints.getById(result.lastInsertRowid as number)
-    return NextResponse.json(created, { status: 201 })
+    return NextResponse.json(created ? toPublicEndpointDto(created) : null, { status: 201 })
   } catch (e) {
     return NextResponse.json({ error: 'Failed to create endpoint' }, { status: 500 })
   }

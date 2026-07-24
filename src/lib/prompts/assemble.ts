@@ -206,13 +206,16 @@ export function buildStagePrompt(
   stageTemplate: string,
   contextJson: string,
   stageGoal: string,
+  promptLanguage: 'zh' | 'en' = 'zh',
 ): { system: ChatMessageInput; user: ChatMessageInput } {
   const system: ChatMessageInput = {
     role: 'system',
     content: [
       stageGoal,
       '',
-      '你可以自由输出。如需添加注释/理由，请在正文后用一行 `---`（markdown 水平分割线）分隔，然后写注释。下游审查者只看正文不看注释，注释仅供人类归档参考。',
+      promptLanguage === 'en'
+        ? 'Write freely. If notes are useful, place them after a standalone `---` line. Downstream agents receive only the body before that line; notes remain available to the user.'
+        : '你可以自由输出。如需添加注释/理由，请在正文后用一行 `---`（markdown 水平分割线）分隔，然后写注释。下游审查者只看正文不看注释，注释仅供人类归档参考。',
     ].join('\n'),
   }
 
@@ -240,6 +243,8 @@ export function buildStagePrompt(
     filter_output: (priorStages.filter as { body?: string } | undefined)?.body ?? '',
     orchestrate_output: (priorStages.orchestrate as { body?: string } | undefined)?.body ?? '',
     extra_instructions: '',
+    task_brief:
+      typeof ctx.task_brief === 'string' ? ctx.task_brief : '',
   }
 
   const { result: userContent } = interpolate(stageTemplate, vars)

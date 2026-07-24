@@ -1,0 +1,13 @@
+{
+  "runId": "2026-07-24T15-25-09-239Z-e5ee2aaa",
+  "createdAt": "2026-07-24T15:27:21.885Z",
+  "configHash": "fe399eafc17e92bcf7a09935a7cb07c3de4f03edd6d63b5690b5848d20d8f87c",
+  "samplesHash": "a4d6f6502ff0250bd3f37966c5d18b8d59f9c66808a4bbaa6c1c8cc234a3464c",
+  "sampleCount": 20,
+  "stressSampleCount": 6,
+  "protocols": [
+    "strict-json",
+    "freeform-raw",
+    "fsbp-v1"
+  ]
+}

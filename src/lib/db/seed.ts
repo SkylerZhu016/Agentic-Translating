@@ -1,5 +1,125 @@
 import type Database from 'better-sqlite3'
 import { createRepositories } from './repositories'
+import {
+  BUILTIN_AGENT_ARCHETYPES,
+  BUILTIN_AGENT_VARIANTS,
+  BUILTIN_DIRECTION_BUNDLES,
+} from '../prompts/bidirectional'
+
+function tableExists(db: Database.Database, name: string): boolean {
+  return Boolean(
+    db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name),
+  )
+}
+
+function seedVNext(db: Database.Database): void {
+  if (!tableExists(db, 'agent_archetypes')) return
+
+  const insertArchetype = db.prepare(`
+    INSERT INTO agent_archetypes
+      (id, slug, display_name_zh, category, tags_json, is_builtin, updated_at)
+    VALUES
+      (@id, @slug, @display_name_zh, @category, @tags_json, 1, datetime('now'))
+    ON CONFLICT(id) DO UPDATE SET
+      display_name_zh=excluded.display_name_zh,
+      category=excluded.category,
+      tags_json=excluded.tags_json,
+      is_builtin=1,
+      updated_at=datetime('now')
+  `)
+
+  const insertVariant = db.prepare(`
+    INSERT INTO agent_direction_variants
+      (id, archetype_id, direction, catalog_name, catalog_description,
+       role_prompt, prompt_language, prompt_version, enabled,
+       endpoint_override_id, model_override, sort_order, updated_at)
+    VALUES
+      (@id, @archetype_id, @direction, @catalog_name, @catalog_description,
+       @role_prompt, @prompt_language, @prompt_version, @enabled,
+       @endpoint_override_id, @model_override, @sort_order, datetime('now'))
+    ON CONFLICT(id) DO UPDATE SET
+      catalog_name=excluded.catalog_name,
+      catalog_description=excluded.catalog_description,
+      role_prompt=CASE
+        WHEN excluded.prompt_version > agent_direction_variants.prompt_version
+        THEN excluded.role_prompt ELSE agent_direction_variants.role_prompt END,
+      prompt_language=excluded.prompt_language,
+      prompt_version=MAX(agent_direction_variants.prompt_version, excluded.prompt_version),
+      sort_order=excluded.sort_order,
+      updated_at=datetime('now')
+  `)
+
+  const insertBundle = db.prepare(`
+    INSERT OR IGNORE INTO direction_prompt_bundles
+      (direction, version, prompt_language, main_agent_prompt,
+       worker_base_prompt, review_prompt, filter_prompt, orchestrate_prompt,
+       assemble_prompt, editing_prompt, tool_descriptions, is_builtin)
+    VALUES
+      (@direction, @version, @prompt_language, @main_agent_prompt,
+       @worker_base_prompt, @review_prompt, @filter_prompt, @orchestrate_prompt,
+       @assemble_prompt, @editing_prompt, @tool_descriptions, 1)
+  `)
+
+  db.transaction(() => {
+    for (const archetype of BUILTIN_AGENT_ARCHETYPES) {
+      insertArchetype.run({
+        id: archetype.id,
+        slug: archetype.slug,
+        display_name_zh: archetype.displayNameZh,
+        category: archetype.category,
+        tags_json: JSON.stringify(archetype.tags),
+      })
+    }
+
+    for (const variant of BUILTIN_AGENT_VARIANTS) {
+      insertVariant.run({
+        id: variant.id,
+        archetype_id: variant.archetypeId,
+        direction: variant.direction,
+        catalog_name: variant.catalogName,
+        catalog_description: variant.catalogDescription,
+        role_prompt: variant.rolePrompt,
+        prompt_language: variant.promptLanguage,
+        prompt_version: variant.promptVersion,
+        enabled: variant.enabled ? 1 : 0,
+        endpoint_override_id: variant.endpointOverrideId,
+        model_override: variant.modelOverride,
+        sort_order: variant.sortOrder,
+      })
+    }
+
+    for (const bundle of BUILTIN_DIRECTION_BUNDLES) {
+      insertBundle.run({
+        direction: bundle.direction,
+        version: bundle.version,
+        prompt_language: bundle.promptLanguage,
+        main_agent_prompt: bundle.mainAgentSystemPrompt,
+        worker_base_prompt: bundle.workerBasePrompt,
+        review_prompt: bundle.reviewPrompt,
+        filter_prompt: bundle.filterPrompt,
+        orchestrate_prompt: bundle.orchestratePrompt,
+        assemble_prompt: bundle.assemblePrompt,
+        editing_prompt: bundle.editingPrompt,
+        tool_descriptions: JSON.stringify(bundle.toolDescriptions),
+      })
+    }
+
+    db.prepare(
+      "INSERT OR IGNORE INTO workspace_drafts (direction) VALUES ('en_to_zh'), ('zh_to_en')",
+    ).run()
+    db.prepare(
+      "INSERT OR IGNORE INTO settings (key, value) VALUES ('workspace_direction', 'en_to_zh')",
+    ).run()
+    db.prepare(
+      "INSERT OR IGNORE INTO settings (key, value) VALUES ('suppress_direction_switch_warning', '0')",
+    ).run()
+    db.prepare(`
+      INSERT INTO seed_versions (key, version, updated_at)
+      VALUES ('vnext_builtin_agents', 1, datetime('now'))
+      ON CONFLICT(key) DO UPDATE SET version=excluded.version, updated_at=datetime('now')
+    `).run()
+  })()
+}
 
 /**
  * Seed the database with built-in Chinese prompt templates and default settings.
@@ -9,6 +129,7 @@ import { createRepositories } from './repositories'
  */
 export function seed(db: Database.Database): void {
   const repos = createRepositories(db)
+  seedVNext(db)
 
   // Check if already seeded
   const existing = repos.promptTemplates.list().filter(r => r.is_builtin === 1)
@@ -165,12 +286,6 @@ export function seed(db: Database.Database): void {
 
 你可以自由输出。如需添加注释/理由，请在正文后用一行 \`---\`（markdown 水平分割线）分隔，然后写注释。下游审查者只看正文不看注释，注释仅供人类归档参考。`,
   })
-
-  // ── Default builtin preset ─────────────────────────────────────
-  db.prepare(`
-    INSERT INTO config_presets (name, description, is_builtin)
-    VALUES (@name, @description, @is_builtin)
-  `).run({ name: '默认预设', description: '系统内置默认配置', is_builtin: 1 })
 
   // ── Default settings ──────────────────────────────────────────
   repos.settings.set({ key: 'suppress_flash_warning', value: '0' })

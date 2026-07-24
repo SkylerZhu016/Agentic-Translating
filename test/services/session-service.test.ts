@@ -6,7 +6,6 @@ import { createRepositories } from '../../src/lib/db/repositories'
 import { createSessionService } from '../../src/lib/services/session-service'
 import {
   SourceRequiredError,
-  SourceTooLongError,
   InvalidTransitionError,
 } from '../../src/lib/guards'
 import { NoAgentsConfiguredError } from '../../src/lib/services/session-service'
@@ -105,12 +104,10 @@ describe('SessionService', () => {
       ).toThrow(SourceRequiredError)
     })
 
-    it('throws SourceTooLongError on excessive source text', () => {
-      // 32_000 non-CJK chars → ~8000 tokens → must exceed 8000 limit
+    it('accepts source text beyond the legacy 8000-token guard', () => {
       const long = 'a'.repeat(40_000)
-      expect(() =>
-        service.createSession({ ...DEF_SOURCE, sourceText: long }),
-      ).toThrow(SourceTooLongError)
+      const session = service.createSession({ ...DEF_SOURCE, sourceText: long })
+      expect(session.source_text).toBe(long)
     })
 
     it('throws NoAgentsConfiguredError when translator_agents is empty', () => {

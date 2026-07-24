@@ -140,10 +140,10 @@ describe('buildStageContext', () => {
 
   // ── Token budget / truncation ──
 
-  it('should truncate from tail when over budget (rejected texts are NOT dropped)', () => {
+  it('should keep every candidate when the legacy budget is exceeded', () => {
     // 6 translations, each 2000 CJK chars = 2000 tokens from text alone
-    // Well over 6000 budget. With dropRejectedTexts gone, we simply
-    // truncate from the tail until under budget.
+    // This deliberately exceeds the old 6000-token budget. vNext must retain
+    // the complete context and let the configured model report overflow.
     const allAgentKeys = ['agent1', 'agent2', 'agent3', 'agent4', 'agent5', 'agent6']
     const translations = allAgentKeys.map((k, i) =>
       trans({
@@ -175,13 +175,14 @@ describe('buildStageContext', () => {
       STAGE_CONTEXT_TOKEN_BUDGET, // 6000
     )
 
-    // Must be marked truncated
-    expect(result.truncated).toBe(true)
+    expect(result.truncated).toBe(false)
+    expect(result.json.translations).toHaveLength(6)
+    expect(result.json.translations.every((entry) => entry.text.length === 2000)).toBe(true)
 
-    // The final JSON must fit within the token budget
+    // Prove that the legacy budget argument no longer causes silent deletion.
     const jsonString = JSON.stringify(result.json)
     const finalTokens = estimateTokens(jsonString)
-    expect(finalTokens).toBeLessThanOrEqual(STAGE_CONTEXT_TOKEN_BUDGET)
+    expect(finalTokens).toBeGreaterThan(STAGE_CONTEXT_TOKEN_BUDGET)
   })
 
   // ── Body extraction from raw_output via `---` split ──
@@ -349,40 +350,27 @@ describe('buildChatContext', () => {
     expect(result[result.length - 1].content).toBe('Message 5')
   })
 
-  it('should drop oldest messages and insert omission placeholder when over maxTurns', () => {
+  it('should retain every message when the legacy maxTurns value is exceeded', () => {
     const maxTurns = 10
     const totalMessages = 25
     const messages = nMessages(totalMessages)
     const result = buildChatContext(messages, '当前文本', maxTurns)
 
-    // system + 1 omission placeholder + 10 messages = 12 entries
-    expect(result).toHaveLength(1 + 1 + maxTurns)
-
-    // First entry: system
+    expect(result).toHaveLength(1 + totalMessages)
     expect(result[0].role).toBe('system')
     expect(result[0].content).toContain('当前文本')
-
-    // Second entry: omission placeholder (system role)
-    expect(result[1].role).toBe('system')
-    expect(result[1].content).toContain('省略')
-    expect(result[1].content).toContain('15') // 25 - 10 = 15 omitted
-
-    // The rest should be the last 10 messages (messages[15..24], 0-based)
-    // messages[15] = {id:16, role:'assistant', content:'Message 16'}
-    expect(result[2].role).toBe('assistant')
-    expect(result[2].content).toBe('Message 16')
-    // messages[24] = {id:25, role:'user', content:'Message 25'}
+    expect(result[1].role).toBe('user')
+    expect(result[1].content).toBe('Message 1')
     expect(result[result.length - 1].role).toBe('user')
     expect(result[result.length - 1].content).toBe('Message 25')
   })
 
-  it('should use CHAT_CONTEXT_TURNS as default maxTurns', () => {
+  it('should retain all messages beyond the legacy default turn count', () => {
     const totalMessages = CHAT_CONTEXT_TURNS + 5 // 25
     const messages = nMessages(totalMessages)
     const result = buildChatContext(messages, '文本')
 
-    // system + omission + CHAT_CONTEXT_TURNS messages
-    expect(result).toHaveLength(1 + 1 + CHAT_CONTEXT_TURNS)
+    expect(result).toHaveLength(1 + totalMessages)
   })
 
   it('should handle exactly maxTurns messages without truncation', () => {

@@ -21,6 +21,8 @@ import { runChatTurn } from '@/src/lib/chat/tool-loop'
 import { buildChatContext } from '@/src/lib/context/stage-context'
 import { encodeSSE } from '@/src/lib/contracts/sse'
 import type { ConfigSnapshot, SessionState } from '@/src/lib/contracts/types'
+import { createHash, randomUUID } from 'crypto'
+import { buildDiffSpans } from '@/src/lib/editing/diff-spans'
 
 // =============================================================================
 // Types
@@ -56,10 +58,30 @@ function resolveChatConfig(snapshot: ConfigSnapshot): {
   apiKey: string
   model: string
 } | null {
+  const editingBinding = snapshot.modelBindings?.editingAgent
+  if (editingBinding?.model) {
+    const endpoint = snapshot.endpointSnapshots?.find(
+      (candidate) => candidate.id === editingBinding.endpointId,
+    )
+    if (endpoint) {
+      return {
+        baseUrl: endpoint.baseUrl,
+        apiKey: endpoint.apiKey,
+        model: editingBinding.model,
+      }
+    }
+  }
   const coordinator = snapshot.coordinator
   if (!coordinator) return null
 
-  const endpointConfig = snapshot.endpoint
+  const endpointConfig =
+    snapshot.endpoints?.find(
+      (endpoint) => endpoint.id === coordinator.chat_endpoint_id,
+    ) ??
+    snapshot.endpoints?.find(
+      (endpoint) => endpoint.id === coordinator.endpoint_id,
+    ) ??
+    snapshot.endpoint
   if (!endpointConfig) return null
 
   const model = coordinator.chat_model || coordinator.model
@@ -143,7 +165,7 @@ export function createHandlers(db: Database.Database) {
     // 5. Get current text and recent messages
     const latestVersion = repos.finalVersions.getLatestBySession(sessionId)
     const currentText = latestVersion?.text ?? ''
-    const recentMessages = repos.chatMessages.listBySessionWithLimit(sessionId, 20)
+    const recentMessages = repos.chatMessages.listBySession(sessionId)
 
     // 6. Insert user message
     const userMessageContent = buildUserMessage(body)
@@ -170,6 +192,14 @@ export function createHandlers(db: Database.Database) {
       })),
       currentText,
     )
+    if (snapshot.promptBundleSnapshot) {
+      const bundle = snapshot.promptBundleSnapshot
+      contextMessages[0].content =
+        `${bundle.editingPrompt}\n\n` +
+        (bundle.promptLanguage === 'en'
+          ? `Current complete translation:\n${currentText}\n\nAvailable editing tool: replace_text. Every textual change must use the tool.`
+          : `当前最新完整译文：\n${currentText}\n\n可用编辑工具：replace_text。任何文本修改都必须调用工具。`)
+    }
 
     const llmMessages = contextMessages.map((cm) => ({
       role: cm.role,
@@ -192,6 +222,10 @@ export function createHandlers(db: Database.Database) {
 
         let fullText = ''
         let didProtocolFallback = false
+        const appliedToolCalls: Array<{
+          old_string: string
+          new_string: string
+        }> = []
 
         try {
           const result = await runChatTurn({
@@ -205,6 +239,16 @@ export function createHandlers(db: Database.Database) {
                 enqueue(encodeSSE('delta', { text }))
               },
               onToolCall: (name, args) => {
+                if (
+                  name === 'replace_text' &&
+                  typeof args.old_string === 'string' &&
+                  typeof args.new_string === 'string'
+                ) {
+                  appliedToolCalls.push({
+                    old_string: args.old_string,
+                    new_string: args.new_string,
+                  })
+                }
                 enqueue(encodeSSE('tool_call', { name, arguments: args }))
               },
               onToolResult: (ok, resultData) => {
@@ -241,15 +285,106 @@ export function createHandlers(db: Database.Database) {
 
               if (result.kind === 'edited') {
                 const latest = repos.finalVersions.getLatestBySession(sessionId)
-                const versionNo = (latest?.version_no ?? 0) + 1
-
-                const vResult = repos.finalVersions.insert({
-                  session_id: sessionId,
-                  version_no: versionNo,
-                  text: result.newText,
-                  source: 'edit',
-                })
-                versionId = vResult.lastInsertRowid as number
+                if (!latest || latestVersion?.id !== latest.id) {
+                  throw new Error('版本已发生变化，请基于最新版本重新修改')
+                }
+                const hasPatchTable = Boolean(
+                  db.prepare(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='text_patches'",
+                  ).get(),
+                )
+                let versionNo = latest.version_no
+                if (hasPatchTable) {
+                  if (appliedToolCalls.length === 0) {
+                    throw new Error('编辑结果缺少 replace_text 工具证据')
+                  }
+                  let workingText = currentText
+                  let baseVersionId = latest.id
+                  for (const edit of appliedToolCalls) {
+                    const first = workingText.indexOf(edit.old_string)
+                    const second =
+                      first < 0
+                        ? -1
+                        : workingText.indexOf(
+                            edit.old_string,
+                            first + edit.old_string.length,
+                          )
+                    if (first < 0 || second >= 0) {
+                      throw new Error(
+                        first < 0
+                          ? 'oldText 不存在，未修改正文'
+                          : 'oldText 不唯一，未修改正文',
+                      )
+                    }
+                    const nextText =
+                      workingText.slice(0, first) +
+                      edit.new_string +
+                      workingText.slice(first + edit.old_string.length)
+                    const patchId = randomUUID()
+                    versionNo += 1
+                    const hash = createHash('sha256')
+                      .update(nextText)
+                      .digest('hex')
+                    const vResult = db.prepare(`
+                      INSERT INTO final_versions
+                        (session_id, version_no, text, source, parent_version_id,
+                         content_hash, created_by_patch_id)
+                      VALUES (?, ?, ?, 'edit', ?, ?, ?)
+                    `).run(
+                      sessionId,
+                      versionNo,
+                      nextText,
+                      baseVersionId,
+                      hash,
+                      patchId,
+                    )
+                    const resultVersionId = Number(vResult.lastInsertRowid)
+                    db.prepare(`
+                      INSERT INTO text_patches
+                        (id, session_id, base_version_id, result_version_id,
+                         old_text, new_text, reason, evidence_refs_json,
+                         diff_spans_json)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, '[]', ?)
+                    `).run(
+                      patchId,
+                      sessionId,
+                      baseVersionId,
+                      resultVersionId,
+                      edit.old_string,
+                      edit.new_string,
+                      body.message,
+                      JSON.stringify(
+                        buildDiffSpans(edit.old_string, edit.new_string),
+                      ),
+                    )
+                    workingText = nextText
+                    baseVersionId = resultVersionId
+                    versionId = resultVersionId
+                    enqueue(
+                      encodeSSE('patch.applied', {
+                        patch_id: patchId,
+                        version_no: versionNo,
+                        old_text: edit.old_string,
+                        new_text: edit.new_string,
+                      }),
+                    )
+                  }
+                  if (workingText !== result.newText) {
+                    throw new Error('工具调用结果与模型返回文本不一致，未提交版本')
+                  }
+                  db.prepare(
+                    "UPDATE sessions SET final_version_id=?, updated_at=datetime('now') WHERE id=?",
+                  ).run(versionId, sessionId)
+                } else {
+                  versionNo += 1
+                  const vResult = repos.finalVersions.insert({
+                    session_id: sessionId,
+                    version_no: versionNo,
+                    text: result.newText,
+                    source: 'edit',
+                  })
+                  versionId = vResult.lastInsertRowid as number
+                }
 
                 enqueue(
                   encodeSSE('tool_result', {
@@ -266,8 +401,14 @@ export function createHandlers(db: Database.Database) {
                 session_id: sessionId,
                 role: 'assistant',
                 content: fullText,
-                tool_calls: null,
-                tool_results: null,
+                tool_calls:
+                  appliedToolCalls.length > 0
+                    ? JSON.stringify(appliedToolCalls)
+                    : null,
+                tool_results:
+                  versionId != null
+                    ? JSON.stringify({ versionId })
+                    : null,
                 version_id: versionId,
               })
             })

@@ -23,7 +23,7 @@ export interface StageStepperProps {
   stageRows: StageRowMap
   runningStage: Stage | null
   sessionState: string | null
-  /** 各节点的瞬态提示（schema 重试 / POST 守卫错误） */
+  /** 各节点的瞬态提示（模型重试 / POST 守卫错误） */
   transientNotes?: Partial<Record<Stage, string | null>>
   onRun: (stage: Stage) => void
 }
@@ -177,14 +177,14 @@ export function StageStepper({
                 )}
               </p>
 
-              {/* failed 节点：错误摘要 + schema 细节在面板内 */}
+              {/* failed 节点：错误摘要与原始输出细节在面板内 */}
               {status === 'failed' && row?.error && (
                 <p className="mt-1 truncate text-xs text-cinnabar" title={row.error}>
                   {row.error}
                 </p>
               )}
 
-              {/* 瞬态提示：schema 自动重试 / 守卫拒绝 */}
+              {/* 瞬态提示：模型自动重试 / 守卫拒绝 */}
               {note && (
                 <p className="mt-1 text-xs text-amber" role="status">
                   {note}

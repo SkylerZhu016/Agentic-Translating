@@ -479,6 +479,9 @@ describe('Chat SSE Route', () => {
       const latest = repos.sessions.getById(sid)!
       const snap = JSON.parse(latest.config_snapshot)
       snap.endpoint.base_url = server.url
+      for (const endpoint of snap.endpoints ?? []) {
+        endpoint.base_url = server.url
+      }
       setSnapshotConfig(db, sid, snap)
 
       try {
@@ -611,6 +614,9 @@ describe('Chat SSE Route', () => {
       const latest = repos.sessions.getById(sid)!
       const snap = JSON.parse(latest.config_snapshot)
       snap.endpoint.base_url = server.url
+      for (const endpoint of snap.endpoints ?? []) {
+        endpoint.base_url = server.url
+      }
       setSnapshotConfig(db, sid, snap)
 
       try {

@@ -23,6 +23,15 @@ export const TID = {
     promptOverrideToggle: 'prompt-override-toggle',
   },
 
+  /** Bidirectional workspace switch */
+  direction: {
+    enToZhButton: 'direction-en-to-zh',
+    zhToEnButton: 'direction-zh-to-en',
+    warningDialog: 'direction-warning-dialog',
+    suppressCheckbox: 'direction-suppress-checkbox',
+    confirmButton: 'direction-confirm-button',
+  },
+
   /** Coordinator configuration panel */
   coordinator: {
     modelInput: 'coordinator-model-input',

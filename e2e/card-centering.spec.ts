@@ -7,8 +7,8 @@
 //
 // The config page renders <ConfigPanels> whose inner card grid uses
 //   className="mx-auto grid max-w-3xl grid-cols-1 gap-5"
-// The history page wraps its card container with
-//   className="mx-auto max-w-3xl"
+// The history page wraps its wider history card with
+//   className="mx-auto max-w-5xl"
 //
 // No data-testid attributes exist on these containers, so we select by CSS
 // class combination (div.mx-auto.max-w-3xl) and verify the class attribute
@@ -56,12 +56,12 @@ test.describe('Card centering — mx-auto on grid containers', () => {
       timeout: 10_000,
     })
 
-    // The inner card container has classes "mx-auto max-w-3xl".
-    const container = page.locator('div.mx-auto.max-w-3xl').first()
+    // The inner history card container has classes "mx-auto max-w-5xl".
+    const container = page.locator('div.mx-auto.max-w-5xl').first()
     await expect(container).toBeVisible()
 
     const className = await container.getAttribute('class')
     expect(className, 'history container must have mx-auto').toContain('mx-auto')
-    expect(className, 'history container must have max-w-3xl').toContain('max-w-3xl')
+    expect(className, 'history container must have max-w-5xl').toContain('max-w-5xl')
   })
 })

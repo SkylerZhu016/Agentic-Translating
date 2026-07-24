@@ -1,0 +1,13 @@
+services:
+  agentic-translating:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      AGENTIC_SECRET_KEY: "${AGENTIC_SECRET_KEY:?set AGENTIC_SECRET_KEY}"
+    volumes:
+      - agentic-data:/data
+    restart: unless-stopped
+
+volumes:
+  agentic-data:

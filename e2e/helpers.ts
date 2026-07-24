@@ -15,6 +15,8 @@ import path from 'path'
 import fs from 'fs'
 import type { MockBehavior } from '../test/fixtures/mock-llm'
 
+export const E2E_DATA_DIR = path.join(process.cwd(), '.omo', 'e2e-data')
+
 // ---- Mock LLM control -----------------------------------------------------
 
 const MOCK_URL = process.env.E2E_MOCK_LLM_URL ?? 'http://localhost:41099'
@@ -218,37 +220,27 @@ export function sseData<T = unknown>(events: SSEEvent[], name: string): T | null
   }
 }
 
-// ---- C2 schema-compliant mock JSON payloads ------------------------------
-// Use these as `jsonContent` for `json_content` behavior in stage specs so the
-// zod validators accept the response.
-//
-// IMPORTANT: the stage pipeline builds stage context using each agent's
-// `agent_key` which equals the agent's `name` (see session-service.ts:139).
-// So the `agent_id` values below must match the names of the agents the spec
-// creates via POST /api/agents. Use `buildReviewOutput(agentNames)` etc. to
-// generate payloads with the correct agent ids.
+// ---- FSBP free-text stage payloads ----------------------------------------
+// The mock fixture calls the response field `jsonContent`, but that field is
+// simply message.content. Product stage output remains free text.
 
 export function buildReviewOutput(agentNames: string[]): string {
-  return JSON.stringify({
-    assessments: agentNames.map((name, i) => ({
-      agent_id: name,
-      strengths: ['用词准确', '节奏得当'],
-      weaknesses: ['可进一步打磨'],
-      quality_score: i === 0 ? 9 : 8 - i,
-      keep: i < 2,
-    })),
-  })
+  return [
+    '审查意见',
+    ...agentNames.map(
+      (name, index) =>
+        `${index + 1}. ${name}：用词准确、节奏得当；部分衔接可进一步打磨。`,
+    ),
+  ].join('\n')
 }
 
 export function buildFilterOutput(
   selected: string[],
   rejected: string[],
 ): string {
-  return JSON.stringify({
-    selected_agent_ids: selected,
-    rationale: '保留风格互补的译稿',
-    rejected_agent_ids: rejected,
-  })
+  return `保留：${selected.join('、')}。这些候选风格互补。\n淘汰：${
+    rejected.join('、') || '无'
+  }。`
 }
 
 export function buildOrchestrateOutput(
@@ -260,17 +252,19 @@ export function buildOrchestrateOutput(
   }>,
   notes = '按意群编排',
 ): string {
-  return JSON.stringify({
-    structure_notes: notes,
-    segment_assignments: assignments,
-  })
+  return [
+    `总体方案：${notes}`,
+    ...assignments.map(
+      (item) =>
+        `第 ${item.segment_index + 1} 段采用 ${item.source_agent_id} 的“${
+          item.source_segment
+        }”：${item.rationale}`,
+    ),
+  ].join('\n')
 }
 
 export function buildAssembleOutput(finalText: string, notes = ''): string {
-  return JSON.stringify({
-    final_text: finalText,
-    notes,
-  })
+  return notes ? `${finalText}\n---\n${notes}` : finalText
 }
 
 // Backwards-compatible defaults using agent names "Agent 1" / "Agent 2" /

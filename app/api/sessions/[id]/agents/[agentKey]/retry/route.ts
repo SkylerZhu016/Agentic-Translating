@@ -64,7 +64,11 @@ export async function POST(
   }
 
   // ── Guard: endpoint configured ────────────────────────────────
-  if (!config.endpoint) {
+  const endpointConfig =
+    config.endpoints?.find(
+      (endpoint) => endpoint.id === targetAgent.endpoint_id,
+    ) ?? config.endpoint;
+  if (!endpointConfig) {
     return Response.json(
       { error: 'No API endpoint configured in session snapshot' },
       { status: 400 },
@@ -73,8 +77,6 @@ export async function POST(
 
   // ── Build single AgentRuntime ──────────────────────────────────
   const defaultTemplate = config.prompts.translator ?? '';
-  const endpointConfig = config.endpoint;
-
   const template = resolveTranslatorPrompt(
     { prompt_override: targetAgent.prompt_override },
     defaultTemplate,

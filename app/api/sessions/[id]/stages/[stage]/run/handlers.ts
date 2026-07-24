@@ -9,7 +9,7 @@
 //   - 前置守卫: runStage prereq missing→409
 //   - 并发守卫: stage_already_running→409
 //   - 读快照+prompts+buildStageContext→runStage(任务11)
-//   - SSE: C1 事件 (stage_start/stage_delta 仅orch+assemble/stage_complete/stage_schema_error/done)
+//   - SSE: C1 事件 (stage_start/stage_delta/stage_complete/done)
 //   - 完成: UPSERT stage_outputs; markDownstreamStale→下游stale; assemble→insert final_versions+transition assembled
 // ---------------------------------------------------------------------------
 
@@ -88,12 +88,18 @@ function getPrerequisite(stage: Stage): Stage | null {
 function buildPromptUsed(
   stageTemplate: string,
   contextJson: string,
-  _schemaDesc: string,
+  promptLanguage: 'zh' | 'en' = 'zh',
 ): string {
-  const system = [
-    '你可以自由输出。如需添加注释/理由，请在正文后用一行 ---（markdown 水平分割线）分隔，然后写注释。',
-    '下游审查者只看正文不看注释，注释仅供人类归档参考。',
-  ].join('\n')
+  const system =
+    promptLanguage === 'en'
+      ? [
+          'Write freely. If you add notes, put them after a standalone --- line.',
+          'Downstream stages receive only the body before that boundary.',
+        ].join('\n')
+      : [
+          '你可以自由输出。如需添加注释/理由，请在正文后用一行 ---（markdown 水平分割线）分隔，然后写注释。',
+          '下游审查者只看正文不看注释，注释仅供人类归档参考。',
+        ].join('\n')
 
   return `SYSTEM:\n${system}\n\nUSER:\n${stageTemplate.replace('{{context}}', contextJson)}`
 }
@@ -214,7 +220,17 @@ export function createHandlers(db: Database.Database) {
 
     // ── 7. Build session context from snapshot ────────────────────
     const snapshot = service.snapshotConfig(session.config_snapshot)
-    const endpoint = snapshot.endpoint
+    const coordinatorEndpointId =
+      snapshot.modelBindings?.mainAgent.endpointId ??
+      snapshot.coordinator?.endpoint_id
+    const endpoint =
+      snapshot.endpointSnapshots?.find(
+        (candidate) => candidate.id === coordinatorEndpointId,
+      ) ??
+      snapshot.endpoints?.find(
+        (candidate) => candidate.id === coordinatorEndpointId,
+      ) ??
+      snapshot.endpoint
     if (!endpoint) {
       // Roll back running status
       const rollbackRow = repos.stageOutputs.getBySessionAndStage(sessionId, stage)
@@ -236,15 +252,26 @@ export function createHandlers(db: Database.Database) {
     }
 
     const coordinatorEndpoint = {
-      baseUrl: endpoint.base_url,
-      apiKey: endpoint.api_key,
+      baseUrl: 'baseUrl' in endpoint ? endpoint.baseUrl : endpoint.base_url,
+      apiKey: 'apiKey' in endpoint ? endpoint.apiKey : endpoint.api_key,
     }
-    const coordinatorModel = snapshot.coordinator?.model || 'gpt-4o'
+    const coordinatorModel =
+      snapshot.modelBindings?.mainAgent.model ||
+      snapshot.coordinator?.model ||
+      'gpt-4o'
 
     // Prompt templates: snapshot has kind→content
     const promptTemplates: Record<string, string> = {}
     for (const kind of ['review', 'filter', 'orchestrate', 'assemble'] as const) {
-      promptTemplates[kind] = snapshot.prompts?.[kind] || ''
+      promptTemplates[kind] =
+        (kind === 'review' && snapshot.promptBundleSnapshot?.reviewPrompt) ||
+        (kind === 'filter' && snapshot.promptBundleSnapshot?.filterPrompt) ||
+        (kind === 'orchestrate' &&
+          snapshot.promptBundleSnapshot?.orchestratePrompt) ||
+        (kind === 'assemble' &&
+          snapshot.promptBundleSnapshot?.assemblePrompt) ||
+        snapshot.prompts?.[kind] ||
+        ''
     }
 
     // Translation results (completed only)
@@ -273,6 +300,8 @@ export function createHandlers(db: Database.Database) {
       sourceText: session.source_text,
       sourceLang: session.source_lang,
       targetLang: session.target_lang,
+      taskBrief: session.task_brief ?? snapshot.taskBrief ?? '',
+      promptLanguage: snapshot.promptBundleSnapshot?.promptLanguage ?? 'zh',
       translations: completedTranslations,
       priorStages: priorStageOutputs,
       coordinatorEndpoint,
@@ -288,24 +317,14 @@ export function createHandlers(db: Database.Database) {
       targetLang: sessionContext.targetLang,
       translations: sessionContext.translations,
       priorStages: sessionContext.priorStages,
+      taskBrief: sessionContext.taskBrief,
     })
     const contextJson = JSON.stringify(contextResult.json)
-
-    // Human-readable schema description for prompt_used
-    const SCHEMA_DESCRIPTIONS: Record<Stage, string> = {
-      review:
-        'reviewOutputSchema: { assessments: [{ agent_id, strengths, weaknesses, quality_score, keep }] }',
-      filter:
-        'filterOutputSchema: { selected_agent_ids, rejected_agent_ids, rationale }',
-      orchestrate:
-        'orchestrateOutputSchema: { structure_notes, segment_assignments: [{ segment_index, source_agent_id, source_segment, rationale }] }',
-      assemble: 'assembleOutputSchema: { final_text, notes }',
-    }
 
     const promptUsedText = buildPromptUsed(
       stageTemplate,
       contextJson,
-      SCHEMA_DESCRIPTIONS[stage],
+      sessionContext.promptLanguage,
     )
 
     // ── 9. SSE Stream ─────────────────────────────────────────────

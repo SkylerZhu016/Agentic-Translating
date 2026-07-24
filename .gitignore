@@ -5,6 +5,8 @@ data/
 playwright-report/
 test-results/
 .playwright-mcp/
+dist-electron/
+.npm-cache/
 
 # Build artifacts
 *.tsbuildinfo

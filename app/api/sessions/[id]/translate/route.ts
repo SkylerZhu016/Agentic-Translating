@@ -60,7 +60,7 @@ export async function POST(
   }
 
   // ── Guard: endpoint configured ────────────────────────────────
-  if (!config.endpoint) {
+  if (!config.endpoint && (!config.endpoints || config.endpoints.length === 0)) {
     return Response.json(
       { error: 'No API endpoint configured in session snapshot' },
       { status: 400 },
@@ -69,9 +69,20 @@ export async function POST(
 
   // ── Build AgentRuntime array ──────────────────────────────────
   const defaultTemplate = config.prompts.translator ?? '';
-  const endpointConfig = config.endpoint;
+  const endpointById = new Map(
+    (config.endpoints ?? (config.endpoint ? [config.endpoint] : [])).map(
+      (endpoint) => [endpoint.id, endpoint],
+    ),
+  );
 
   const agents: AgentRuntime[] = config.agents.map((agent) => {
+    const endpointConfig =
+      endpointById.get(agent.endpoint_id) ?? config.endpoint;
+    if (!endpointConfig) {
+      throw new Error(
+        `Endpoint ${agent.endpoint_id} for agent "${agent.name}" is missing from the session snapshot`,
+      );
+    }
     const template = resolveTranslatorPrompt(
       { prompt_override: agent.prompt_override },
       defaultTemplate,

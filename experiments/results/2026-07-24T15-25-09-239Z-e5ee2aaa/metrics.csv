@@ -1,0 +1,4 @@
+protocol,stage_completion_rate,format_success_rate,retries,mean_latency_ms,total_tokens,judge_wins,judge_count,judge_ties,judge_evaluations,win_rate,wilson_low,wilson_high,mean_rank,hard_constraint_passes,hard_constraint_count,hard_constraint_satisfaction,score_faithfulness,score_naturalness,score_style,score_structure,score_coherence
+strict-json,1,1,1,17980.0125,153619,4,12,8,40,0.3333333333333333,0.13812009109121315,0.6093779111272004,2.2,10,10,1,8.15,8.1125,7.9625,8.55,8.4625
+freeform-raw,1,1,0,25143.8875,155766,5,12,8,40,0.4166666666666667,0.19326031365875665,0.6804886874504503,1.825,10,10,1,8.5375,8.475,8.375,8.825,8.875
+fsbp-v1,1,1,0,22009.775,118719,3,12,8,40,0.25,0.08894166839405473,0.5323053349335657,1.975,10,10,1,8.35,8.35,8.05,8.4125,8.625

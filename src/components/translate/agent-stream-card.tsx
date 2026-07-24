@@ -88,7 +88,14 @@ export function AgentStreamCard({
             {card.model}
           </span>
         </div>
-        <StatusBadge status={card.status} />
+        <div className="flex items-center gap-1.5">
+          {card.evidence && (
+            <Badge variant={card.evidence.summary.startsWith('未发现') ? 'outline' : 'subtle'}>
+              {card.evidence.summary}
+            </Badge>
+          )}
+          <StatusBadge status={card.status} />
+        </div>
       </header>
 
       {/* 体部：流式草稿 → 译文排版 */}
@@ -131,6 +138,30 @@ export function AgentStreamCard({
           </p>
         )}
       </div>
+      {card.status === 'complete' && (card.annotation || card.evidence) && (
+        <div className="border-t border-line px-4 py-2">
+          {card.annotation && (
+            <details>
+              <summary className="cursor-pointer text-xs font-medium text-ink-3">
+                Agent 注释
+              </summary>
+              <p className="mt-2 whitespace-pre-wrap text-xs leading-5 text-ink-3">
+                {card.annotation}
+              </p>
+            </details>
+          )}
+          {card.evidence && (
+            <details className={card.annotation ? 'mt-2' : ''}>
+              <summary className="cursor-pointer text-xs font-medium text-ink-3">
+                辅助证据详情
+              </summary>
+              <p className="mt-2 whitespace-pre-wrap text-xs leading-5 text-ink-3">
+                {card.evidence.naturalLanguage}
+              </p>
+            </details>
+          )}
+        </div>
+      )}
     </article>
   )
 }

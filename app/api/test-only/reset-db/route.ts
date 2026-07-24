@@ -14,7 +14,7 @@
 //
 // The reset:
 //   1. DELETEs all rows from every domain table (FK-safe order: children first)
-//   2. Re-runs seed() to restore builtin prompt templates + default settings
+//   2. Re-runs seed() to restore built-in prompts, agents, bundles and settings
 //   3. Keeps the migrations meta table intact
 // ---------------------------------------------------------------------------
 
@@ -24,17 +24,31 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getDb } from '@/src/lib/db'
 import { migrate } from '@/src/lib/db/migrate'
 import { seed } from '@/src/lib/db/seed'
+import { waitForVNextRunsToSettle } from '@/src/lib/orchestration/vnext-runner'
 
 // Domain tables in FK-safe deletion order (children before parents).
-// Includes preset child tables (config_preset_*) so that seed() can re-insert
-// the 默认预设 without hitting a UNIQUE constraint violation on repeated
-// resets. FK enforcement is OFF during deletion, but order is kept logical.
+// Includes vNext tables so direction drafts, events and revision snapshots do
+// not leak between E2E cases. FK enforcement is OFF during deletion, but order
+// is kept logical.
 const DOMAIN_TABLES = [
+  'batch_items',
+  'batch_jobs',
+  'text_patches',
+  'agent_invocations',
+  'run_events',
+  'orchestration_runs',
   'chat_messages',
   'final_versions',
   'stage_outputs',
   'translation_results',
+  'workflow_preset_revisions',
+  'workflow_presets',
   'sessions',
+  'workspace_drafts',
+  'agent_direction_variants',
+  'agent_archetypes',
+  'direction_prompt_bundles',
+  'seed_versions',
   'settings',
   'coordinator_config',
   'translator_agents',
@@ -63,6 +77,9 @@ export async function POST(_req: NextRequest) {
   }
 
   try {
+    // A prior browser test may already have disconnected while its
+    // server-owned run is finishing. Never delete its FK parents mid-write.
+    await waitForVNextRunsToSettle()
     const db = getDb()
     migrate(db) // ensure schema exists (idempotent)
 
@@ -77,7 +94,7 @@ export async function POST(_req: NextRequest) {
       db.pragma('foreign_keys = ON')
     }
 
-    // Re-seed builtin prompts + default settings.
+    // Re-seed built-in prompts, direction catalog, drafts and settings.
     seed(db)
 
     return NextResponse.json(

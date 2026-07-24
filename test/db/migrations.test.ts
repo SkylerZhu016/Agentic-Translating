@@ -59,16 +59,27 @@ describe('DB Migrations — In-Memory DB', () => {
     expect(tables).toContain('config_preset_agents')
     expect(tables).toContain('config_preset_coordinator')
     expect(tables).toContain('config_preset_prompts')
-    // 10 domain tables + migrations meta table + sqlite_sequence (AUTOINCREMENT) = 12+
-    expect(tables.length).toBeGreaterThanOrEqual(12)
+    // Migration 0003 adds the direction-aware vNext domain tables.
+    expect(tables).toContain('agent_archetypes')
+    expect(tables).toContain('agent_direction_variants')
+    expect(tables).toContain('direction_prompt_bundles')
+    expect(tables).toContain('workspace_drafts')
+    expect(tables).toContain('workflow_presets')
+    expect(tables).toContain('workflow_preset_revisions')
+    expect(tables).toContain('agent_invocations')
+    expect(tables).toContain('run_events')
+    expect(tables).toContain('text_patches')
+    expect(tables).toContain('batch_jobs')
+    expect(tables).toContain('batch_items')
+    expect(tables.length).toBeGreaterThanOrEqual(24)
   })
 
   it('is idempotent — 3x migrate → 1 version', () => {
     migrate(db); migrate(db); migrate(db)
     const version = (db.prepare('SELECT MAX(version) as v FROM migrations').get() as { v: number | null }).v
-    expect(version).toBe(2)
+    expect(version).toBe(4)
     const count = (db.prepare('SELECT COUNT(*) as c FROM migrations').get() as { c: number }).c
-    expect(count).toBe(2)
+    expect(count).toBe(4)
   })
 
   it('creates config_presets and child tables (migration 0002)', () => {
@@ -130,6 +141,31 @@ describe('DB Migrations — In-Memory DB', () => {
     db.prepare("INSERT INTO final_versions (session_id,version_no,text,source) VALUES ('s1',1,'t','assemble')").run()
     expect(() => db.prepare("INSERT INTO final_versions (session_id,version_no,text,source) VALUES ('s1',1,'t2','edit')").run()).toThrow()
   })
+
+  it('accepts every append-only text version source', () => {
+    migrate(db)
+    db.prepare(
+      "INSERT INTO sessions (id,source_text,config_snapshot) VALUES ('s1','t','{}')",
+    ).run()
+    for (const [index, source] of [
+      'assemble',
+      'main_draft',
+      'edit',
+      'restore',
+      'revert',
+    ].entries()) {
+      db.prepare(
+        'INSERT INTO final_versions (session_id,version_no,text,source) VALUES (?,?,?,?)',
+      ).run('s1', index + 1, source, source)
+    }
+    expect(
+      (
+        db.prepare(
+          "SELECT COUNT(*) AS count FROM final_versions WHERE session_id='s1'",
+        ).get() as { count: number }
+      ).count,
+    ).toBe(5)
+  })
 })
 
 describe('DB Migrations — File DB', () => {
@@ -146,9 +182,10 @@ describe('DB Migrations — File DB', () => {
     db2.pragma('foreign_keys = ON')
     migrate(db2)
     const v = (db2.prepare('SELECT MAX(version) as v FROM migrations').get() as { v: number | null }).v
-    expect(v).toBe(2)
+    expect(v).toBe(4)
     expect(listTables(db2)).toContain('endpoints')
     expect(listTables(db2)).toContain('config_presets')
+    expect(listTables(db2)).toContain('agent_direction_variants')
     db2.close()
   })
 })

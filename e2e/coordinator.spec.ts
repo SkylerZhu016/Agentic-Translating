@@ -121,8 +121,9 @@ async function runTranslation(page: Page, request: APIRequestContext): Promise<v
   await page.goto('/')
   await byTid(page, TID.translate.sourceInput).fill(SOURCE_TEXT)
   await byTid(page, TID.translate.translateButton).click()
-  await expect(byTid(page, TID.translate.agentStreamCard)).toHaveCount(3, { timeout: 10_000 })
-  await expect(byTid(page, TID.translate.agentStatusComplete)).toHaveCount(3, { timeout: 30_000 })
+  // Dynamic selection falls back to the two mandatory complementary roles.
+  await expect(byTid(page, TID.translate.agentStreamCard)).toHaveCount(2, { timeout: 10_000 })
+  await expect(byTid(page, TID.translate.agentStatusComplete)).toHaveCount(2, { timeout: 30_000 })
 }
 
 /** Locator for a specific stage's run button (scoped by data-stage li). */

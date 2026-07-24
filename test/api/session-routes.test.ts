@@ -169,7 +169,7 @@ describe('POST /api/sessions', () => {
     expect(res.status).toBe(200)
     const body = await res.json()
     expect(body.source_lang).toBe('英文')
-    expect(body.target_lang).toBe('中文五言')
+    expect(body.target_lang).toBe('中文')
   })
 })
 

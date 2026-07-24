@@ -1,0 +1,40 @@
+{
+  "samples": "../samples/public-domain.json",
+  "candidateModels": [
+    {
+      "name": "deepseek-v4-flash",
+      "baseUrl": "https://opencode.ai/zen/go/v1",
+      "apiKeyEnv": "EXPERIMENT_API_KEY_A",
+      "model": "deepseek-v4-flash"
+    },
+    {
+      "name": "glm-5.2",
+      "baseUrl": "https://opencode.ai/zen/go/v1",
+      "apiKeyEnv": "EXPERIMENT_API_KEY_B",
+      "model": "glm-5.2"
+    },
+    {
+      "name": "kimi-k2.6",
+      "baseUrl": "https://opencode.ai/zen/go/v1",
+      "apiKeyEnv": "EXPERIMENT_API_KEY_C",
+      "model": "kimi-k2.6"
+    }
+  ],
+  "coordinatorModel": {
+    "name": "glm-5.2",
+    "baseUrl": "https://opencode.ai/zen/go/v1",
+    "apiKeyEnv": "EXPERIMENT_COORDINATOR_API_KEY",
+    "model": "glm-5.2"
+  },
+  "judgeModel": {
+    "name": "kimi-k2.6",
+    "baseUrl": "https://opencode.ai/zen/go/v1",
+    "apiKeyEnv": "EXPERIMENT_JUDGE_API_KEY",
+    "model": "kimi-k2.6"
+  },
+  "temperatures": {
+    "candidate": 0.5,
+    "stage": 0.2,
+    "judge": 0
+  }
+}

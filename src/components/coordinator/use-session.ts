@@ -14,6 +14,8 @@ import type {
   TranslationResultRow,
 } from '@/src/lib/contracts/types'
 import { onSessionChanged } from './session-bus'
+import type { TextPatchView } from '@/src/components/editor/RevisionEvidence'
+import type { TranslationEvidenceReport } from '@/src/lib/evidence/checker'
 
 /** GET /api/sessions/[id] 响应形状（与 handlers.ts 对齐） */
 export interface SessionFullResponse {
@@ -22,6 +24,8 @@ export interface SessionFullResponse {
   stages: StageOutputRow[]
   versions: FinalVersionRow[]
   messages: ChatMessageRow[]
+  patches?: TextPatchView[]
+  final_evidence?: TranslationEvidenceReport | null
   latest_version_no: number | null
 }
 
@@ -37,14 +41,10 @@ export function useSessionFull() {
     try {
       let id = idRef.current
       if (!id) {
-        // 发现最近会话（sessions 按 updated_at DESC 排列）
-        const listRes = await fetch('/api/sessions?limit=1', { cache: 'no-store' })
-        if (!listRes.ok) {
-          setLoading(false)
-          return null
-        }
-        const list = (await listRes.json()) as { sessions?: SessionRow[] }
-        id = list.sessions?.[0]?.id ?? null
+        id =
+          typeof window === 'undefined'
+            ? null
+            : new URLSearchParams(window.location.search).get('session')
         if (!id) {
           idRef.current = null
           setSessionId(null)
@@ -89,6 +89,10 @@ export function useSessionFull() {
       if (detail.sessionId) {
         idRef.current = detail.sessionId
         setSessionId(detail.sessionId)
+        const url = new URL(window.location.href)
+        url.search = ''
+        url.searchParams.set('session', detail.sessionId)
+        window.history.replaceState(null, '', url)
       }
       void refresh()
     })

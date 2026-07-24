@@ -6,6 +6,7 @@ import type {
   ConfigPresetPromptRow,
   FullPreset,
 } from '../contracts/types'
+import { decryptSecret, encryptSecret } from '../security/secrets'
 
 // ── Type definitions ──────────────────────────────────────────────
 
@@ -14,6 +15,7 @@ export interface EndpointRow {
   name: string
   base_url: string
   api_key: string
+  context_window?: number | null
   created_at: string
 }
 
@@ -57,6 +59,12 @@ export interface SessionRow {
   target_lang: string
   state: string
   config_snapshot: string
+  direction?: 'en_to_zh' | 'zh_to_en' | 'custom'
+  task_brief?: string
+  review_mode?: 'main_editor' | 'four_stage'
+  preset_revision_id?: string | null
+  final_version_id?: number | null
+  batch_item_id?: string | null
   created_at: string
   updated_at: string
 }
@@ -90,7 +98,10 @@ export interface FinalVersionRow {
   session_id: string
   version_no: number
   text: string
-  source: 'assemble' | 'edit' | 'restore'
+  source: 'assemble' | 'main_draft' | 'edit' | 'restore' | 'revert'
+  parent_version_id?: number | null
+  content_hash?: string | null
+  created_by_patch_id?: string | null
   created_at: string
 }
 
@@ -108,18 +119,45 @@ export interface ChatMessageRow {
 // ── Endpoints Repository ──────────────────────────────────────────
 
 export function createEndpointsRepo(db: Database.Database) {
-  const insertStmt = db.prepare('INSERT INTO endpoints (name, base_url, api_key) VALUES (@name, @base_url, @api_key)')
+  const hasContextWindow = (
+    db.prepare('PRAGMA table_info(endpoints)').all() as Array<{ name: string }>
+  ).some((column) => column.name === 'context_window')
+  const insertStmt = db.prepare(
+    hasContextWindow
+      ? 'INSERT INTO endpoints (name, base_url, api_key, context_window) VALUES (@name, @base_url, @api_key, @context_window)'
+      : 'INSERT INTO endpoints (name, base_url, api_key) VALUES (@name, @base_url, @api_key)',
+  )
   const getByIdStmt = db.prepare('SELECT * FROM endpoints WHERE id = ?')
-  const updateStmt = db.prepare('UPDATE endpoints SET name = @name, base_url = @base_url, api_key = @api_key WHERE id = @id')
+  const updateStmt = db.prepare(
+    hasContextWindow
+      ? 'UPDATE endpoints SET name = @name, base_url = @base_url, api_key = @api_key, context_window = @context_window WHERE id = @id'
+      : 'UPDATE endpoints SET name = @name, base_url = @base_url, api_key = @api_key WHERE id = @id',
+  )
   const deleteStmt = db.prepare('DELETE FROM endpoints WHERE id = ?')
   const listStmt = db.prepare('SELECT * FROM endpoints ORDER BY id')
+  const mapEndpoint = (row: EndpointRow | undefined) =>
+    row ? { ...row, api_key: decryptSecret(row.api_key) } : undefined
 
   return {
-    insert: (row: Pick<EndpointRow, 'name' | 'base_url' | 'api_key'>) => insertStmt.run(row as any),
-    getById: (id: number) => getByIdStmt.get(id) as EndpointRow | undefined,
-    update: (row: Pick<EndpointRow, 'id' | 'name' | 'base_url' | 'api_key'>) => updateStmt.run(row as any),
+    insert: (row: Pick<EndpointRow, 'name' | 'base_url' | 'api_key'> & { context_window?: number | null }) =>
+      insertStmt.run({
+        ...row,
+        api_key: encryptSecret(row.api_key),
+        context_window: row.context_window ?? null,
+      } as any),
+    getById: (id: number) =>
+      mapEndpoint(getByIdStmt.get(id) as EndpointRow | undefined),
+    update: (row: Pick<EndpointRow, 'id' | 'name' | 'base_url' | 'api_key'> & { context_window?: number | null }) =>
+      updateStmt.run({
+        ...row,
+        api_key: encryptSecret(row.api_key),
+        context_window: row.context_window ?? null,
+      } as any),
     delete: (id: number) => deleteStmt.run(id),
-    list: () => listStmt.all() as EndpointRow[],
+    list: () =>
+      (listStmt.all() as EndpointRow[]).map(
+        (row) => mapEndpoint(row)!,
+      ),
   }
 }
 

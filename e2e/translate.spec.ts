@@ -2,8 +2,7 @@
 // E2E: translate.spec.ts
 //
 // Covers:
-//   AC18 — 流式网格（streaming agent grid: N agents → N cards with streaming
-//          status badges, transitioning to complete) + 单卡重试（single card
+//   AC18 — 动态保底流式网格（两个互补角色 → 两张卡片）+ 单卡重试（single card
 //          retry: induce error on one agent → retry-agent-button → re-streams
 //          → complete）
 //
@@ -56,7 +55,7 @@ async function seedBaselineConfig(
 }
 
 test.describe('AC18 — streaming agent grid', () => {
-  test('three agents stream in parallel → all cards reach complete status', async ({
+  test('fallback pair streams in parallel → both cards reach complete status', async ({
     page,
     request,
   }) => {
@@ -73,16 +72,15 @@ test.describe('AC18 — streaming agent grid', () => {
     await byTid(page, TID.translate.sourceInput).fill(SOURCE_TEXT)
     await byTid(page, TID.translate.translateButton).click()
 
-    // Wait for three agent cards to appear
-    await expect(byTid(page, TID.translate.agentStreamCard)).toHaveCount(3, {
+    await expect(byTid(page, TID.translate.agentStreamCard)).toHaveCount(2, {
       timeout: 10_000,
     })
 
     // Each card should transition through streaming → complete.
-    // Web-first: wait for all three complete badges to appear.
+    // Web-first: wait for both mandatory fallback candidates.
     await expect(
       byTid(page, TID.translate.agentStatusComplete),
-    ).toHaveCount(3, { timeout: 30_000 })
+    ).toHaveCount(2, { timeout: 30_000 })
 
     // No error badges should be present
     await expect(byTid(page, TID.translate.agentStatusError)).toHaveCount(0)
@@ -92,7 +90,13 @@ test.describe('AC18 — streaming agent grid', () => {
 
   test('cards show streaming badge while in flight', async ({ page, request }) => {
     // Slower stream so the streaming badge is observable
-    await setMockBehavior(request, { behavior: 'stream', delayMs: 50 })
+    for (const model of ['gpt-4o', 'claude-3.7', 'gemini-2.0']) {
+      await setMockBehavior(request, {
+        behavior: 'stream',
+        model,
+        delayMs: 100,
+      })
+    }
 
     await seedBaselineConfig(request, ['gpt-4o', 'claude-3.7', 'gemini-2.0'])
 
@@ -100,7 +104,7 @@ test.describe('AC18 — streaming agent grid', () => {
     await byTid(page, TID.translate.sourceInput).fill(SOURCE_TEXT)
     await byTid(page, TID.translate.translateButton).click()
 
-    await expect(byTid(page, TID.translate.agentStreamCard)).toHaveCount(3, {
+    await expect(byTid(page, TID.translate.agentStreamCard)).toHaveCount(2, {
       timeout: 10_000,
     })
 
@@ -111,7 +115,7 @@ test.describe('AC18 — streaming agent grid', () => {
     await evidenceScreenshot(page, 'translate-streaming-in-flight')
 
     // Eventually all complete
-    await expect(byTid(page, TID.translate.agentStatusComplete)).toHaveCount(3, {
+    await expect(byTid(page, TID.translate.agentStatusComplete)).toHaveCount(2, {
       timeout: 30_000,
     })
   })
@@ -122,24 +126,73 @@ test.describe('AC18 — single card retry', () => {
     page,
     request,
   }) => {
-    // Two models succeed, one fails (5xx → retryable in fanout, but we use
-    // 401 which is non-retryable so the card lands in error state).
-    await setMockBehavior(request, { behavior: 'stream', model: 'gpt-4o' })
-    await setMockBehavior(request, { behavior: 'stream', model: 'claude-3.7' })
+    await setMockBehavior(request, { behavior: 'stream', model: 'good-model' })
     await setMockBehavior(request, {
       behavior: 'error',
-      model: 'gemini-2.0',
+      model: 'bad-model',
       status: 401,
       errorMessage: 'Invalid API key',
     })
 
-    await seedBaselineConfig(request, ['gpt-4o', 'claude-3.7', 'gemini-2.0'])
+    const endpointResponse = await request.post('/api/endpoints', {
+      data: { name: 'Retry Mock', base_url: MOCK_URL, api_key: 'sk-mock' },
+    })
+    expect(endpointResponse.status()).toBe(201)
+    const endpoint = await endpointResponse.json()
+    const catalogResponse = await request.get(
+      '/api/agent-catalog?direction=en_to_zh',
+    )
+    expect(catalogResponse.status()).toBe(200)
+    const catalog = await catalogResponse.json()
+    const variants = catalog.variants.slice(0, 2)
+    const defaultBinding = {
+      endpointId: endpoint.id,
+      model: 'good-model',
+      contextWindow: 128000,
+    }
+    const presetResponse = await request.post('/api/workflow-presets', {
+      data: {
+        name: 'Retry fixed team',
+        description: '',
+        direction: 'en_to_zh',
+        contract: {
+          sourceLang: '英文',
+          targetLang: '中文',
+          taskBriefTemplate: '',
+          teamPolicy: 'fixed',
+          reviewMode: 'main_editor',
+          agentVariantIds: variants.map((variant: { id: string }) => variant.id),
+          agentVariantSnapshots: variants,
+          defaultWorkerBinding: defaultBinding,
+          agentBindingOverrides: {
+            [variants[1].id]: {
+              endpointId: endpoint.id,
+              model: 'bad-model',
+              contextWindow: 128000,
+            },
+          },
+          mainAgentBinding: defaultBinding,
+          editingAgentBinding: defaultBinding,
+          promptBundleVersion: 1,
+          maxAgentCalls: 5,
+          batchConcurrency: 2,
+          constraints: {},
+        },
+      },
+    })
+    expect(presetResponse.status()).toBe(201)
+    const preset = await presetResponse.json()
 
     await page.goto('/')
+    await page.locator('details').first().click()
+    await page
+      .locator('details select')
+      .first()
+      .selectOption(preset.preset.id)
     await byTid(page, TID.translate.sourceInput).fill(SOURCE_TEXT)
     await byTid(page, TID.translate.translateButton).click()
 
-    await expect(byTid(page, TID.translate.agentStreamCard)).toHaveCount(3, {
+    await expect(byTid(page, TID.translate.agentStreamCard)).toHaveCount(2, {
       timeout: 10_000,
     })
 
@@ -154,13 +207,13 @@ test.describe('AC18 — single card retry', () => {
     await expect(retryButton).toBeVisible()
 
     // Now flip the failing model to stream so retry succeeds
-    await setMockBehavior(request, { behavior: 'stream', model: 'gemini-2.0' })
+    await setMockBehavior(request, { behavior: 'stream', model: 'bad-model' })
 
     await retryButton.click()
 
     // After retry, the error badge should disappear and a complete badge
-    // should be present on that card. Wait for all 3 completes.
-    await expect(byTid(page, TID.translate.agentStatusComplete)).toHaveCount(3, {
+    // should be present on that card. Wait for both completes.
+    await expect(byTid(page, TID.translate.agentStatusComplete)).toHaveCount(2, {
       timeout: 30_000,
     })
     await expect(byTid(page, TID.translate.agentStatusError)).toHaveCount(0)
