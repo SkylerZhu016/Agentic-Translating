@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "A bidirectional, multi-model translation deliberation and evidence-based editing workspace.",
   "author": "Agentic Translating contributors",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "main": "electron/main.mjs",
