@@ -56,7 +56,8 @@
     "productName": "Agentic Translating",
     "files": [
       "electron/**/*",
-      "package.json"
+      "package.json",
+      "LICENSE"
     ],
     "extraResources": [
       {

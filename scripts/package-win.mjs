@@ -75,6 +75,7 @@ try {
 
   cpSync(path.join(root, 'package.json'), path.join(stage, 'package.json'))
   cpSync(path.join(root, 'package-lock.json'), path.join(stage, 'package-lock.json'))
+  cpSync(path.join(root, 'LICENSE'), path.join(stage, 'LICENSE'))
   cpSync(path.join(root, 'electron'), path.join(stage, 'electron'), {
     recursive: true,
   })
