@@ -1,141 +1,141 @@
-# Agentic Translating · 智能体翻译工作台
+# Agentic Translating
 
-面向高难度翻译任务的双向、多模型、多视角审议与证据化成稿系统。
+A bidirectional translation system for difficult translation tasks. It supports multi-model, multi-perspective deliberation and evidence-based workflows.
 
-它与通用编码 Agent 的关键区别不是“把翻译当成另一种任务”，而是让多个角色处理同一个开放问题：候选间的分歧被保留为可比较证据，主 Agent 决定调用哪些视角、如何审议与融合，并通过可追溯的文本工具形成版本。
+The key difference from a general-purpose coding agent is not treating translation as just another coding task. Instead, it lets multiple roles work on the same open problem. Disagreements between candidate versions are kept as comparable evidence. The main agent decides which perspectives to call on, how to deliberate and merge them, and produces the final version through traceable text operations.
 
-## 核心能力
+## Core Features
 
-- 英译中 / 中译英双向模式；会话创建后方向冻结，两个方向分别保存工作台草稿。
-- 10 个 Agent 原型 × 2 个方向变体：忠实、自然、声音、术语、文化、长文本、规范文本、文学、诗歌与异议视角。
-- 动态组队与固定预设并存；第一版前至少保有两个不同原型的成功候选。
-- 主 Agent 编辑与经典“审查 → 筛选 → 编排 → 组装”两条成稿路径。
-- FSBP 自由文本语义边界协议：首个独立 `---` 分隔正文与注释；完整原文留档，下游只继承正文。
-- `call_agents`、`write_draft`、`replace_text`、`submit_final` 分阶段暴露，每轮只注入必要工具。
-- 版本化修改、Unicode 修订对照、证据引用、撤销与恢复。
-- 用户预设 revision、历史恢复、安全导出、100 文件级批量队列。
-- SQLite 本地优先、BYOK、OpenAI 兼容端点；API Key 不进入浏览器 DTO、SSE、日志或导出。
-- Next.js Web、自部署 Docker、Windows Electron 安装版与便携版。
+- Supports both English-to-Chinese and Chinese-to-English modes. Direction is frozen after session creation. Each direction maintains its own independent workspace draft.
+- 10 agent archetypes, each with 2 directional variants: fidelity, naturalness, voice, terminology, culture, long text, formal text, literary, poetry, and dissent.
+- Dynamic teaming and fixed presets coexist. The system keeps at least two successful candidates from different archetypes before forming the first version.
+- Two completion paths: direct editing by the main agent, or the classic four-stage process of review, filter, orchestrate, and assemble.
+- FSBP (Free-form Semantic Boundary Protocol). The first standalone `---` in a document acts as a divider. Content above is the body, content below is annotation. The full original is always archived. Downstream components only inherit the body.
+- Tools are exposed in stages: `call_agents`, `write_draft`, `replace_text`, `submit_final`. Each round injects only the tools needed at that point.
+- Versioned edits, Unicode diff comparisons, evidence citations, undo and redo.
+- User preset revision management, history recovery, safe export, and a batch queue supporting up to 100 files.
+- SQLite local-first storage with BYOK and OpenAI-compatible endpoints. API keys never appear in browser DTOs, SSE events, logs, or export files.
+- Available as a Next.js web app, self-hosted Docker image, Windows Electron installer, and portable build.
 
-英译中默认产出普通中文。五言、七言、押韵等属于任务要求或诗歌 Agent 的专门约束，不再作为系统默认。
+English-to-Chinese output defaults to plain modern Chinese. Forms like five-character or seven-character verse and rhyming are task-specific requirements or constraints for the Poetry agent, not system defaults.
 
-## 快速开始
+## Quick Start
 
-要求 Node.js 22+。
+Requires Node.js 22 or later.
 
 ```bash
 npm install
 npm run dev
 ```
 
-打开 `http://localhost:3000`。首次使用请在“配置”页添加 OpenAI 兼容端点并绑定模型。
+Open `http://localhost:3000`. On first use, add an OpenAI-compatible endpoint and bind a model on the Configuration page.
 
-生产模式：
+Production mode:
 
 ```bash
 npm run build
 npm start
 ```
 
-## 工作方式
+## Workflow
 
-1. 在右上角选择“英 → 中”或“中 → 英”。
-2. 输入原文与自然语言任务要求，选择允许的 Agent、预设与审议模式。
-3. 动态模式由主 Agent 调用 2—4 个适合当前文本的角色；无有效选择时自动启用“语义忠实 + 目标语表达”保底组合。
-4. 主 Agent 基于至少两个候选建立第一版，或执行固定的四阶段深度审议。
-5. 后续修改必须通过精确文本工具创建 Patch 和新版本，界面可查看修改前后、理由与候选证据。
+1. Select "English to Chinese" or "Chinese to English" in the top-right corner.
+2. Enter the source text and task requirements in natural language. Choose the allowed agents, preset, and deliberation mode.
+3. In dynamic mode, the main agent invokes 2 to 4 roles suited to the current text. If no valid selection is available, it falls back to the "semantic fidelity plus target language fluency" combination.
+4. The main agent builds the first version from at least two candidates, or runs the fixed four-stage deep deliberation process.
+5. Subsequent edits must go through precise text tools to create patches and new versions. The interface shows before-and-after comparisons, revision reasons, and candidate evidence.
 
-切换方向不会转换现有会话。系统先保存当前草稿，然后切到另一方向的工作台草稿；旧会话仍在历史中，后台运行不因页面离开而取消。
+Switching directions does not convert the current session. The system saves the current draft, then switches to the other direction's workspace draft. Old sessions remain in history. Background tasks are not canceled when the page is closed.
 
 ## FSBP
 
-Agent 可自由表达：
+Agents can express themselves freely:
 
 ```text
-完整候选译文正文
+Full candidate translation body
 ---
-可选的取舍说明、歧义或术语注释
+Optional notes on trade-offs, ambiguities, or terminology
 ```
 
-规则：
+Rules:
 
-- 只识别首个独立成行、去除空白后等于 `---` 的分隔符；
-- 支持 LF 与 CRLF；
-- `raw` 永久保存并展示；
-- 下游只获得 `body`；
-- `annotation` 只供用户查看；
-- 产品中的四阶段不会要求严格 JSON。
+- Only the first standalone separator that equals `---` after trimming whitespace is recognized.
+- Supports both LF and CRLF line endings.
+- The `raw` content is saved and displayed permanently.
+- Downstream components only receive the `body`.
+- The `annotation` is for user reference only.
+- The four-stage process in the product does not require strict JSON.
 
-配置 API、SSE 事件和工具参数使用 JSON，是为了精确改变系统状态，不属于 Agent 内容协议。完整定义见 [docs/protocol-spec.md](docs/protocol-spec.md)。
+Configuration APIs, SSE events, and tool parameters use JSON for precise system state control. This is not part of the agent content protocol. See [docs/protocol-spec.md](docs/protocol-spec.md) for the full specification.
 
-## 预设与批量
+## Presets and Batch
 
-预设是用户创建的可重复工作契约，不是系统替用户决定的翻译套路。执行内容的每次修改都会建立新 revision，历史会话和批次继续使用冻结快照。
+A preset is a reusable work contract created by the user, not a translation strategy imposed by the system. Each content modification creates a new revision. Historical sessions and batches continue to use the frozen snapshot.
 
-批量任务必须选择一个有效 revision，支持 UTF-8 `.txt` / `.md`、1—4 并发、暂停恢复、失败项重试、路径镜像、BOM/换行符保持以及 Web ZIP 导出。详见 [docs/preset-and-batch.md](docs/preset-and-batch.md)。
+Batch tasks must select a valid revision. They support UTF-8 encoded `.txt` and `.md` files, 1 to 4 concurrent tasks, pause and resume, retry on failure, path mirroring, BOM and line ending preservation, and web ZIP export. See [docs/preset-and-batch.md](docs/preset-and-batch.md) for details.
 
-## 桌面与自部署
+## Desktop and Self-Hosting
 
-Windows 打包：
+Windows packaging:
 
 ```bash
 npm run package:win
 ```
 
-产物位于 `dist-electron/`，同时生成 NSIS 安装版与便携版。桌面数据位于 Electron `userData`，密钥由 `safeStorage` 包装的本地主密钥保护。
+Output goes to the `dist-electron/` directory. Both an NSIS installer and a portable build are generated. Desktop data is stored in the Electron `userData` directory. Keys are protected by a local master key wrapped with `safeStorage`.
 
-Docker：
+Docker:
 
 ```bash
 docker compose up --build
 ```
 
-生产 Web 必须设置 `AGENTIC_SECRET_KEY`。构建、备份与升级说明见 [docs/desktop-build.md](docs/desktop-build.md)。
+Production web deployments must set the `AGENTIC_SECRET_KEY` environment variable. Build, backup, and upgrade instructions are in [docs/desktop-build.md](docs/desktop-build.md).
 
-## 协议实验
+## Protocol Experiments
 
-先编辑 `experiments/configs/main.json` 的模型名称，并只通过环境变量提供 API Key：
+First edit the model names in `experiments/configs/main.json` and provide the API key through environment variables:
 
 ```bash
 npm run experiment:protocol -- --config experiments/configs/main.json
 npm run experiment:report -- --run <run-id>
 ```
 
-实验固定 20 个公共领域双向样本和 6 个误导性注释压力样本，对比 `strict-json`、`freeform-raw` 与 `fsbp-v1`。执行器可按记录键断点续跑，不将 API Key 写入结果。
+The experiment uses a fixed set of 20 public-domain bidirectional samples and 6 misleading-annotation stress samples. It compares three protocols: `strict-json`, `freeform-raw`, and `fsbp-v1`. The executor supports checkpoint resume by record key and does not write API keys to result files.
 
-真实模型实验会产生 API 费用；仓库不预置或伪造实验结果。
+Running experiments with real models incurs API costs. The repository does not include pre-generated or fabricated experimental results.
 
-## 开发命令
+## Development Commands
 
-| 命令 | 说明 |
+| Command | Description |
 |---|---|
-| `npm run dev` | 开发服务器 |
-| `npm run typecheck` | TypeScript 类型检查 |
-| `npm test` | Vitest 测试 |
-| `npm run build` | Next.js 生产构建 |
-| `npm run e2e` | Playwright 端到端测试 |
-| `npm run package:win` | Windows NSIS + portable |
-| `npm run experiment:protocol` | 运行协议消融 |
-| `npm run experiment:report` | 生成 CSV、Markdown 与 HTML 报告 |
+| `npm run dev` | Start development server |
+| `npm run typecheck` | TypeScript type checking |
+| `npm test` | Run Vitest tests |
+| `npm run build` | Next.js production build |
+| `npm run e2e` | Run Playwright end-to-end tests |
+| `npm run package:win` | Package Windows NSIS installer and portable build |
+| `npm run experiment:protocol` | Run protocol ablation experiment |
+| `npm run experiment:report` | Generate CSV, Markdown, and HTML reports |
 
-## 文档
+## Documentation
 
-- [Agent 架构](docs/agent-architecture.md)
-- [双向提示词](docs/bidirectional-prompts.md)
-- [协议规范](docs/protocol-spec.md)
-- [预设与批量](docs/preset-and-batch.md)
-- [桌面与自部署](docs/desktop-build.md)
-- [设计参考与许可证](docs/design-references.md)
-- [技术报告](docs/technical-report.md)
+- [Agent Architecture](docs/agent-architecture.md)
+- [Bidirectional Prompts](docs/bidirectional-prompts.md)
+- [Protocol Specification](docs/protocol-spec.md)
+- [Presets and Batch](docs/preset-and-batch.md)
+- [Desktop Build and Self-Hosting](docs/desktop-build.md)
+- [Design References and License](docs/design-references.md)
+- [Technical Report](docs/technical-report.md)
 
-## 数据与安全
+## Data and Security
 
-- Web 开发数据库默认位于 `data/app.db`。
-- Electron 将数据库、日志和运行文件放入应用 `userData`。
-- 开发环境可生成仅供本机使用的密钥文件；生产环境不会自动生成弱默认密钥。
-- 删除会话、预设和批次前由界面确认；预设默认软删除。
-- 旧会话和旧预设表保留只读兼容，迁移不做破坏性删除。
+- The web development database is located at `data/app.db` by default.
+- Electron stores database, logs, and runtime files in the application's `userData` directory.
+- The development environment can generate a key file for local use only. The production environment does not auto-generate weak default keys.
+- Deleting sessions, presets, and batches requires confirmation through the interface. Presets use soft deletion by default.
+- Old session and preset tables are kept read-only for compatibility. Migrations do not perform destructive deletions.
 
-## 许可证
+## License
 
-本项目采用 [MIT License](LICENSE)。
+This project is licensed under the [MIT License](LICENSE).
