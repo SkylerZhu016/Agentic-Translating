@@ -7,6 +7,7 @@ import { migrate } from '@/src/lib/db/migrate'
 import { seed } from '@/src/lib/db/seed'
 import { createVNextRepositories } from '@/src/lib/db/vnext-repositories'
 import type { BuiltinDirection } from '@/src/lib/contracts/vnext'
+import { translationConstraintsSchema } from '@/src/lib/contracts/vnext-schemas'
 
 const directionSchema = z.enum(['en_to_zh', 'zh_to_en'])
 const draftSchema = z.object({
@@ -15,6 +16,8 @@ const draftSchema = z.object({
   selectedPresetRevisionId: z.string().min(1).nullable(),
   allowedAgentVariantIds: z.array(z.string().min(1)),
   reviewMode: z.enum(['main_editor', 'four_stage']),
+  promptBundleRevisionId: z.string().min(1).nullable().optional(),
+  constraints: translationConstraintsSchema.default({}),
 })
 
 function getRepos() {

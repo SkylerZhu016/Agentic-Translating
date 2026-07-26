@@ -12,8 +12,7 @@ import { useSessionFull } from './use-session'
 
 export function CoordinatorFinalText() {
   const { data } = useSessionFull()
-  const versions = data?.versions ?? []
-  const latest = versions.length > 0 ? versions[versions.length - 1] : null
+  const latest = data?.finalVersion ?? null
 
   if (!latest) {
     return (

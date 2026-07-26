@@ -49,6 +49,10 @@ export async function setMockBehavior(
 
 /** Convenience: reset the catch-all slot to a benign echo behavior. */
 export async function resetMockBehavior(api: APIRequestContext): Promise<void> {
+  const reset = await api.post(`${MOCK_URL}/__control`, {
+    data: { reset: true },
+  })
+  expect(reset.status(), 'mock behavior reset').toBe(204)
   await setMockBehavior(api, { behavior: 'echo' })
 }
 

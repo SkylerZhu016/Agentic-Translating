@@ -11,15 +11,18 @@
 // ---------------------------------------------------------------------------
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Button, Card, Spinner, Textarea, Toast } from '@/src/components/ui'
+import { useSearchParams } from 'next/navigation'
+import { Button, Card, Modal, Spinner, Textarea, Toast } from '@/src/components/ui'
 import { TID } from '@/src/lib/testids'
 import { estimateTokens } from '@/src/lib/guards/tokens'
 import { AgentStreamCard } from './agent-stream-card'
 import { useTranslation } from './use-translation'
 import { useDirection } from '@/src/components/direction/DirectionProvider'
+import { onSessionChanged } from '@/src/components/coordinator/session-bus'
 import type {
   AgentDirectionVariant,
   ReviewMode,
+  TranslationConstraints,
   WorkspaceDraft,
   WorkflowPreset,
   WorkflowPresetRevision,
@@ -34,7 +37,39 @@ export interface TranslatePanelProps {
 const emptyBox =
   'rounded-sm border border-dashed border-line-2 bg-paper/60 px-4 py-6 text-center text-sm leading-6 text-ink-4'
 
+const DEFAULT_POETRY_CONSTRAINTS: TranslationConstraints = {
+  poetryMode: 'auto',
+  poetryTargetForm: 'preserve',
+  chineseRhymeSystem: 'mandarin',
+  englishRhymeMode: 'natural',
+  rhymePositions: 'auto',
+  firstLineRhyme: 'auto',
+  rhymeChange: 'source',
+  poetryPriority: 'balanced',
+  rhymeEvidence: true,
+}
+
+function hasNonDefaultPoetryConstraints(
+  constraints: TranslationConstraints | undefined,
+): boolean {
+  if (!constraints) return false
+  const merged = {
+    ...DEFAULT_POETRY_CONSTRAINTS,
+    ...constraints,
+  }
+  return (
+    Object.entries(DEFAULT_POETRY_CONSTRAINTS).some(
+      ([key, value]) =>
+        merged[key as keyof TranslationConstraints] !== value,
+    ) ||
+    Object.keys(constraints).some(
+      (key) => !(key in DEFAULT_POETRY_CONSTRAINTS),
+    )
+  )
+}
+
 export function TranslatePanel({ className = '', onAllCompleteChange }: TranslatePanelProps) {
+  const searchParams = useSearchParams()
   const { direction, registerDraftController } = useDirection()
   const {
     configStatus,
@@ -49,24 +84,60 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     start,
     restoreSession,
     retry,
+    retryAll,
     dismissError,
   } = useTranslation(direction)
+  const contextAnalysisCards = cards.filter(
+    (card) => card.kind === 'context_analysis',
+  )
+  const poetryPlanCards = cards.filter(
+    (card) => card.kind === 'poetry_plan',
+  )
+  const translationCards = cards.filter(
+    (card) => card.kind === 'translation' || card.kind == null,
+  )
 
   const [source, setSource] = useState('')
   const [taskBrief, setTaskBrief] = useState('')
   const [reviewMode, setReviewMode] = useState<ReviewMode>('main_editor')
+  const [constraints, setConstraints] = useState<TranslationConstraints>(
+    DEFAULT_POETRY_CONSTRAINTS,
+  )
   const [allowedAgentVariantIds, setAllowedAgentVariantIds] = useState<string[]>([])
   const [catalog, setCatalog] = useState<AgentDirectionVariant[]>([])
   const [presets, setPresets] = useState<WorkflowPreset[]>([])
   const [selectedPresetId, setSelectedPresetId] = useState('')
   const [selectedPresetRevisionId, setSelectedPresetRevisionId] = useState<string | null>(null)
+  const [promptBundleRevisionId, setPromptBundleRevisionId] =
+    useState<string | null>(null)
+  const [promptBundles, setPromptBundles] = useState<Array<{
+    id: string
+    name: string
+    isBuiltin: boolean
+    currentRevision: { id: string }
+  }>>([])
   const [draftLoaded, setDraftLoaded] = useState(false)
   const [restoredSession, setRestoredSession] = useState(false)
+  const [recoverableDraft, setRecoverableDraft] =
+    useState<WorkspaceDraft | null>(null)
+  const [retryAllOpen, setRetryAllOpen] = useState(false)
+  const [timelineOpen, setTimelineOpen] = useState(false)
+  const routeSessionId = searchParams.get('session')
+  const freshWorkspace = searchParams.get('fresh') === '1' && !routeSessionId
+
+  useEffect(() => {
+    if (!routeSessionId) return
+    return onSessionChanged((detail) => {
+      if (!detail.sessionId || detail.sessionId === routeSessionId) {
+        void restoreSession(routeSessionId)
+      }
+    })
+  }, [restoreSession, routeSessionId])
 
   useEffect(() => {
     let cancelled = false
     setDraftLoaded(false)
-    const activeSessionId = new URLSearchParams(window.location.search).get('session')
+    const activeSessionId = routeSessionId
     void Promise.all([
       activeSessionId
         ? restoreSession(activeSessionId)
@@ -83,29 +154,68 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
       fetch(`/api/workflow-presets?direction=${direction}`).then((response) =>
         response.ok ? response.json() as Promise<WorkflowPreset[]> : [],
       ),
-    ]).then(([draftOrSession, catalogue, presetList]) => {
+      fetch(`/api/prompt-bundles?direction=${direction}`).then((response) =>
+        response.ok
+          ? response.json() as Promise<Array<{
+              id: string
+              name: string
+              isBuiltin: boolean
+              currentRevision: { id: string }
+            }>>
+          : [],
+      ),
+    ]).then(([draftOrSession, catalogue, presetList, bundleList]) => {
       if (cancelled) return
       const variants = catalogue?.variants ?? []
       setCatalog(variants)
       setPresets(presetList)
-      setSource(draftOrSession?.sourceText ?? '')
-      setTaskBrief(draftOrSession?.taskBrief ?? '')
-      setReviewMode(draftOrSession?.reviewMode ?? 'main_editor')
+      setPromptBundles(bundleList)
+      const savedDraft =
+        !activeSessionId && draftOrSession
+          ? (draftOrSession as WorkspaceDraft)
+          : null
+      const hasSavedDraft = Boolean(
+        savedDraft &&
+          (
+            savedDraft.sourceText.trim() ||
+            savedDraft.taskBrief.trim() ||
+            savedDraft.selectedPresetRevisionId ||
+            hasNonDefaultPoetryConstraints(savedDraft.constraints)
+          ),
+      )
+      setRecoverableDraft(
+        freshWorkspace && hasSavedDraft ? savedDraft : null,
+      )
+      const visibleState =
+        freshWorkspace && !activeSessionId ? null : draftOrSession
+      setSource(visibleState?.sourceText ?? '')
+      setTaskBrief(visibleState?.taskBrief ?? '')
+      setReviewMode(visibleState?.reviewMode ?? 'main_editor')
+      setConstraints({
+        ...DEFAULT_POETRY_CONSTRAINTS,
+        ...(visibleState?.constraints ?? {}),
+      })
       setAllowedAgentVariantIds(
-        'allowedAgentVariantIds' in (draftOrSession ?? {}) &&
-        (draftOrSession as WorkspaceDraft).allowedAgentVariantIds.length
-          ? (draftOrSession as WorkspaceDraft).allowedAgentVariantIds
+        visibleState &&
+        'allowedAgentVariantIds' in visibleState &&
+        (visibleState as WorkspaceDraft).allowedAgentVariantIds.length
+          ? (visibleState as WorkspaceDraft).allowedAgentVariantIds
           : variants.map((variant) => variant.id),
       )
       setSelectedPresetRevisionId(
-        'selectedPresetRevisionId' in (draftOrSession ?? {})
-          ? (draftOrSession as WorkspaceDraft).selectedPresetRevisionId
+        visibleState && 'selectedPresetRevisionId' in visibleState
+          ? (visibleState as WorkspaceDraft).selectedPresetRevisionId
+          : null,
+      )
+      setPromptBundleRevisionId(
+        visibleState && 'promptBundleRevisionId' in visibleState
+          ? (visibleState as WorkspaceDraft).promptBundleRevisionId ?? null
           : null,
       )
       setSelectedPresetId('')
       const draftRevisionId =
-        'selectedPresetRevisionId' in (draftOrSession ?? {})
-          ? (draftOrSession as WorkspaceDraft).selectedPresetRevisionId
+        visibleState && 'selectedPresetRevisionId' in visibleState
+          ? (visibleState as WorkspaceDraft).selectedPresetRevisionId
           : null
       if (draftRevisionId) {
         void Promise.all(
@@ -135,7 +245,31 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     return () => {
       cancelled = true
     }
-  }, [direction, restoreSession])
+  }, [direction, freshWorkspace, restoreSession, routeSessionId])
+
+  const removeFreshMarker = useCallback(() => {
+    const url = new URL(window.location.href)
+    url.searchParams.delete('fresh')
+    window.history.replaceState(null, '', url)
+  }, [])
+
+  const restoreSavedDraft = useCallback(() => {
+    if (!recoverableDraft) return
+    setSource(recoverableDraft.sourceText)
+    setTaskBrief(recoverableDraft.taskBrief)
+    setReviewMode(recoverableDraft.reviewMode)
+    setConstraints({
+      ...DEFAULT_POETRY_CONSTRAINTS,
+      ...(recoverableDraft.constraints ?? {}),
+    })
+    setAllowedAgentVariantIds(recoverableDraft.allowedAgentVariantIds)
+    setSelectedPresetRevisionId(recoverableDraft.selectedPresetRevisionId)
+    setPromptBundleRevisionId(
+      recoverableDraft.promptBundleRevisionId ?? null,
+    )
+    setRecoverableDraft(null)
+    removeFreshMarker()
+  }, [recoverableDraft, removeFreshMarker])
 
   const flushDraft = useCallback(async () => {
     if (!draftLoaded || busy || restoredSession) return
@@ -146,8 +280,10 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
         sourceText: source,
         taskBrief,
         selectedPresetRevisionId,
+        promptBundleRevisionId,
         allowedAgentVariantIds,
         reviewMode,
+        constraints,
       }),
     })
   }, [
@@ -155,7 +291,9 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     busy,
     direction,
     draftLoaded,
+    promptBundleRevisionId,
     reviewMode,
+    constraints,
     restoredSession,
     selectedPresetRevisionId,
     source,
@@ -170,7 +308,10 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
           source.trim().length > 0 ||
           taskBrief.trim().length > 0 ||
           selectedPresetRevisionId != null ||
+          promptBundleRevisionId != null ||
           reviewMode !== 'main_editor' ||
+          JSON.stringify(constraints) !==
+            JSON.stringify(DEFAULT_POETRY_CONSTRAINTS) ||
           allowedAgentVariantIds.length !== catalog.length ||
           allowedAgentVariantIds.some(
             (id) => !catalog.some((variant) => variant.id === id),
@@ -184,8 +325,10 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     catalog,
     flushDraft,
     registerDraftController,
+    promptBundleRevisionId,
     restoredSession,
     reviewMode,
+    constraints,
     selectedPresetRevisionId,
     source,
     taskBrief,
@@ -218,7 +361,11 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     !busy &&
     !restoredSession &&
     !empty &&
-    allowedAgentVariantIds.length >= 2 &&
+    allowedAgentVariantIds.filter(
+      (id) =>
+        catalog.find((variant) => variant.id === id)?.archetypeId !==
+        'cultural-context',
+    ).length >= 2 &&
     configStatus === 'ready'
 
   const handleTranslate = () => {
@@ -228,8 +375,15 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
       direction,
       taskBrief,
       reviewMode,
-      allowedAgentVariantIds,
+      constraints,
+      allowedAgentVariantIds: Array.from(new Set([
+        ...allowedAgentVariantIds,
+        ...catalog
+          .filter((variant) => variant.archetypeId === 'cultural-context')
+          .map((variant) => variant.id),
+      ])),
       presetRevisionId: selectedPresetRevisionId,
+      promptBundleRevisionId,
     })
   }
 
@@ -255,6 +409,10 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     setTaskBrief(revision.contract.taskBriefTemplate)
     setAllowedAgentVariantIds(revision.contract.agentVariantIds)
     setReviewMode(revision.contract.reviewMode)
+    setConstraints({
+      ...DEFAULT_POETRY_CONSTRAINTS,
+      ...(revision.contract.constraints ?? {}),
+    })
   }
 
   // ── 配置检测中 ────────────────────────────────────────────────
@@ -300,6 +458,29 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
         </span>
       }
     >
+      {recoverableDraft && (
+        <div className="mb-3 rounded-sm border border-line-2 bg-paper px-3 py-2.5 text-sm text-ink-2">
+          <p className="font-medium text-ink">该方向有一份上次未提交的草稿</p>
+          <p className="mt-1 text-xs text-ink-3">
+            更新时间：{new Date(recoverableDraft.updatedAt).toLocaleString('zh-CN')}
+          </p>
+          <div className="mt-2 flex gap-2">
+            <Button size="sm" variant="outline" onClick={restoreSavedDraft}>
+              恢复上次草稿
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => {
+                setRecoverableDraft(null)
+                removeFreshMarker()
+              }}
+            >
+              忽略
+            </Button>
+          </div>
+        </div>
+      )}
       <Textarea
         testId={TID.translate.sourceInput}
         rows={9}
@@ -331,6 +512,26 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
               ))}
             </select>
           </label>
+          <label className="block text-xs font-medium text-ink-3">
+            提示词包
+            <select
+              value={promptBundleRevisionId ?? ''}
+              disabled={busy || restoredSession}
+              onChange={(event) =>
+                setPromptBundleRevisionId(event.target.value || null)
+              }
+              className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-2 text-sm text-ink"
+            >
+              {promptBundles.map((bundle) => (
+                <option
+                  key={bundle.id}
+                  value={bundle.isBuiltin ? '' : bundle.currentRevision.id}
+                >
+                  {bundle.name}
+                </option>
+              ))}
+            </select>
+          </label>
           <Textarea
             rows={4}
             value={taskBrief}
@@ -339,6 +540,225 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
             aria-label="翻译任务要求"
             placeholder="说明翻译目标、文体、术语、结构及其他要求。内容将原样传给 Agent。"
           />
+          <details className="rounded-sm border border-line bg-paper/70">
+            <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-ink-2">
+              诗歌形式与押韵
+            </summary>
+            <div className="space-y-3 border-t border-line px-3 py-3">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <label className="text-xs font-medium text-ink-3">
+                  诗歌专项
+                  <select
+                    value={constraints.poetryMode ?? 'auto'}
+                    disabled={busy || restoredSession}
+                    onChange={(event) =>
+                      setConstraints((current) => ({
+                        ...current,
+                        poetryMode: event.target
+                          .value as TranslationConstraints['poetryMode'],
+                      }))
+                    }
+                    className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-1.5 text-sm text-ink"
+                  >
+                    <option value="auto">自动识别</option>
+                    <option value="on">强制启用</option>
+                    <option value="off">关闭</option>
+                  </select>
+                </label>
+                <label className="text-xs font-medium text-ink-3">
+                  目标诗体
+                  <select
+                    value={constraints.poetryTargetForm ?? 'preserve'}
+                    disabled={
+                      busy ||
+                      restoredSession ||
+                      constraints.poetryMode === 'off'
+                    }
+                    onChange={(event) =>
+                      setConstraints((current) => ({
+                        ...current,
+                        poetryTargetForm: event.target
+                          .value as TranslationConstraints['poetryTargetForm'],
+                      }))
+                    }
+                    className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-1.5 text-sm text-ink"
+                  >
+                    <option value="preserve">尽量保留原体</option>
+                    <option value="free_verse">自由诗</option>
+                    <option value="classical">古体诗</option>
+                    <option value="regulated">近体诗</option>
+                    <option value="custom">自定义</option>
+                  </select>
+                </label>
+                {direction === 'en_to_zh' ? (
+                  <label className="text-xs font-medium text-ink-3">
+                    中文韵部规则
+                    <select
+                      value={constraints.chineseRhymeSystem ?? 'mandarin'}
+                      disabled={
+                        busy ||
+                        restoredSession ||
+                        constraints.poetryMode === 'off'
+                      }
+                      onChange={(event) =>
+                        setConstraints((current) => ({
+                          ...current,
+                          chineseRhymeSystem: event.target
+                            .value as TranslationConstraints['chineseRhymeSystem'],
+                        }))
+                      }
+                      className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-1.5 text-sm text-ink"
+                    >
+                      <option value="mandarin">普通话〔默认〕</option>
+                      <option value="pingshui">平水韵</option>
+                      <option value="dual">双重校验</option>
+                    </select>
+                  </label>
+                ) : (
+                  <label className="text-xs font-medium text-ink-3">
+                    英文押韵强度
+                    <select
+                      value={constraints.englishRhymeMode ?? 'natural'}
+                      disabled={
+                        busy ||
+                        restoredSession ||
+                        constraints.poetryMode === 'off'
+                      }
+                      onChange={(event) =>
+                        setConstraints((current) => ({
+                          ...current,
+                          englishRhymeMode: event.target
+                            .value as TranslationConstraints['englishRhymeMode'],
+                        }))
+                      }
+                      className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-1.5 text-sm text-ink"
+                    >
+                      <option value="natural">自然优先〔默认〕</option>
+                      <option value="near">允许近似韵</option>
+                      <option value="exact">严格同韵</option>
+                      <option value="none">不要求押韵</option>
+                    </select>
+                  </label>
+                )}
+                <label className="text-xs font-medium text-ink-3">
+                  韵位
+                  <select
+                    value={constraints.rhymePositions ?? 'auto'}
+                    disabled={
+                      busy ||
+                      restoredSession ||
+                      constraints.poetryMode === 'off'
+                    }
+                    onChange={(event) =>
+                      setConstraints((current) => ({
+                        ...current,
+                        rhymePositions: event.target
+                          .value as TranslationConstraints['rhymePositions'],
+                      }))
+                    }
+                    className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-1.5 text-sm text-ink"
+                  >
+                    <option value="auto">自动规划</option>
+                    <option value="even_lines">偶数句</option>
+                    <option value="all_lines">句句押韵</option>
+                    <option value="custom">按下方韵式</option>
+                  </select>
+                </label>
+                <label className="text-xs font-medium text-ink-3">
+                  首句入韵
+                  <select
+                    value={constraints.firstLineRhyme ?? 'auto'}
+                    disabled={
+                      busy ||
+                      restoredSession ||
+                      constraints.poetryMode === 'off'
+                    }
+                    onChange={(event) =>
+                      setConstraints((current) => ({
+                        ...current,
+                        firstLineRhyme: event.target
+                          .value as TranslationConstraints['firstLineRhyme'],
+                      }))
+                    }
+                    className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-1.5 text-sm text-ink"
+                  >
+                    <option value="auto">自动</option>
+                    <option value="yes">是</option>
+                    <option value="no">否</option>
+                  </select>
+                </label>
+                <label className="text-xs font-medium text-ink-3">
+                  换韵
+                  <select
+                    value={constraints.rhymeChange ?? 'source'}
+                    disabled={
+                      busy ||
+                      restoredSession ||
+                      constraints.poetryMode === 'off'
+                    }
+                    onChange={(event) =>
+                      setConstraints((current) => ({
+                        ...current,
+                        rhymeChange: event.target
+                          .value as TranslationConstraints['rhymeChange'],
+                      }))
+                    }
+                    className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-1.5 text-sm text-ink"
+                  >
+                    <option value="source">跟随原文</option>
+                    <option value="single">一韵到底</option>
+                    <option value="by_stanza">逐节转韵</option>
+                    <option value="custom">自定义</option>
+                  </select>
+                </label>
+                <label className="text-xs font-medium text-ink-3">
+                  形式与语义
+                  <select
+                    value={constraints.poetryPriority ?? 'balanced'}
+                    disabled={
+                      busy ||
+                      restoredSession ||
+                      constraints.poetryMode === 'off'
+                    }
+                    onChange={(event) =>
+                      setConstraints((current) => ({
+                        ...current,
+                        poetryPriority: event.target
+                          .value as TranslationConstraints['poetryPriority'],
+                      }))
+                    }
+                    className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-1.5 text-sm text-ink"
+                  >
+                    <option value="balanced">平衡〔默认〕</option>
+                    <option value="meaning">语义优先</option>
+                    <option value="form">形式优先</option>
+                  </select>
+                </label>
+              </div>
+              <label className="block text-xs font-medium text-ink-3">
+                自定义韵式
+                <input
+                  value={constraints.rhymeScheme ?? ''}
+                  disabled={
+                    busy ||
+                    restoredSession ||
+                    constraints.poetryMode === 'off'
+                  }
+                  onChange={(event) =>
+                    setConstraints((current) => ({
+                      ...current,
+                      rhymeScheme: event.target.value,
+                    }))
+                  }
+                  placeholder="例如 AAxAxAxA、ABAB 或逐节说明"
+                  className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-1.5 text-sm text-ink"
+                />
+              </label>
+              <p className="text-xs leading-5 text-ink-4">
+                仅处理诗歌文本的诗行、韵位与节奏；暂不处理歌词的旋律适配、可唱性或音符级音节对齐。
+              </p>
+            </div>
+          </details>
           <div>
             <p className="mb-2 text-xs font-medium text-ink-3">允许主 Agent 调用</p>
             <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
@@ -351,7 +771,11 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
                     type="checkbox"
                     className="mt-0.5 accent-ink"
                     checked={allowedAgentVariantIds.includes(variant.id)}
-                    disabled={busy || restoredSession}
+                    disabled={
+                      busy ||
+                      restoredSession ||
+                      variant.archetypeId === 'cultural-context'
+                    }
                     onChange={(event) =>
                       setAllowedAgentVariantIds((current) =>
                         event.target.checked
@@ -362,6 +786,11 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
                   />
                   <span>
                     <span className="block font-medium text-ink">{variant.catalogName}</span>
+                    {variant.archetypeId === 'cultural-context' && (
+                      <span className="mb-0.5 block text-[0.6875rem] text-pine">
+                        固定前置 · 双模型并行
+                      </span>
+                    )}
                     <span className="line-clamp-2 text-ink-3">
                       {variant.catalogDescription}
                     </span>
@@ -369,7 +798,11 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
                 </label>
               ))}
             </div>
-            {allowedAgentVariantIds.length < 2 && (
+            {allowedAgentVariantIds.filter(
+              (id) =>
+                catalog.find((variant) => variant.id === id)?.archetypeId !==
+                'cultural-context',
+            ).length < 2 && (
               <p className="mt-2 text-xs text-cinnabar">至少选择两个不同角色。</p>
             )}
           </div>
@@ -440,12 +873,87 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
         </div>
       )}
 
-      {/* 卡片网格 */}
-      {cards.length > 0 ? (
+      {translationCards.length > 0 && (
+        <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-y border-line py-2">
+          <p className="text-xs font-medium text-ink-2">
+            候选译文 · 成功 {translationCards.filter((card) => card.status === 'complete').length}
+            {' · '}失败 {translationCards.filter((card) => card.status === 'error').length}
+          </p>
+          <div className="flex gap-1.5">
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => setTimelineOpen(true)}
+            >
+              查看调用时间线
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={
+                busy || !translationCards.some((card) => card.status === 'error')
+              }
+              onClick={() => setRetryAllOpen(true)}
+            >
+              重试全部失败项
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {contextAnalysisCards.length > 0 && (
+        <section className="mt-4">
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <p className="text-xs font-medium text-ink-2">
+              前置意象分析 · {contextAnalysisCards.length} 个独立模型
+            </p>
+            <span className="text-xs text-ink-4">完整分析将传给后续 Agent</span>
+          </div>
+          <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+            {contextAnalysisCards.map((card, index) => (
+              <AgentStreamCard
+                key={card.chainId ?? card.agentKey}
+                card={card}
+                enterDelayMs={index * 70}
+                retrying={retryingKey === card.agentKey}
+                retryDisabled={busy}
+                onRetry={retry}
+              />
+            ))}
+          </div>
+        </section>
+      )}
+
+      {poetryPlanCards.length > 0 && (
+        <section className="mt-4">
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <p className="text-xs font-medium text-ink-2">
+              诗体与韵律专项规划
+            </p>
+            <span className="text-xs text-ink-4">
+              仅在诗歌任务中启用，不包含歌词旋律适配
+            </span>
+          </div>
+          <div className="grid grid-cols-1 gap-4">
+            {poetryPlanCards.map((card) => (
+              <AgentStreamCard
+                key={card.chainId ?? card.agentKey}
+                card={card}
+                onRetry={retry}
+                retrying={retryingKey === card.agentKey}
+                retryDisabled={busy && retryingKey !== card.agentKey}
+              />
+            ))}
+          </div>
+        </section>
+      )}
+
+      {/* 候选译文卡片网格 */}
+      {translationCards.length > 0 ? (
         <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-2">
-          {cards.map((card, i) => (
+          {translationCards.map((card, i) => (
             <AgentStreamCard
-              key={card.agentKey}
+              key={card.chainId ?? card.agentKey}
               card={card}
               enterDelayMs={i * 70}
               retrying={retryingKey === card.agentKey}
@@ -466,6 +974,65 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
           <Toast tone="inverted" title="翻译出错" message={globalError} onClose={dismissError} />
         </div>
       )}
+      <Modal
+        open={retryAllOpen}
+        onClose={() => setRetryAllOpen(false)}
+        title="重试全部失败项"
+        footer={
+          <>
+            <Button variant="ghost" size="sm" onClick={() => setRetryAllOpen(false)}>
+              取消
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                setRetryAllOpen(false)
+                void retryAll('frozen')
+              }}
+            >
+              按会话冻结配置重试
+            </Button>
+            <Button
+              size="sm"
+              disabled={busy}
+              onClick={() => {
+                setRetryAllOpen(false)
+                void retryAll('current')
+              }}
+            >
+              使用当前配置重试
+            </Button>
+          </>
+        }
+      >
+        <p className="text-sm leading-6 text-ink-2">
+          将重试 {cards.filter((card) => card.status === 'error').length} 个失败 Agent。
+          使用当前配置时，会采用当前端点、模型、Agent 和提示词版本。
+        </p>
+      </Modal>
+      <Modal
+        open={timelineOpen}
+        onClose={() => setTimelineOpen(false)}
+        title="Agent 调用时间线"
+        footer={
+          <Button size="sm" onClick={() => setTimelineOpen(false)}>
+            关闭
+          </Button>
+        }
+      >
+        <ol className="space-y-2 text-sm leading-6 text-ink-2">
+          {cards.map((card) => (
+            <li key={card.chainId ?? card.agentKey}>
+              <span className="font-medium text-ink">{card.name}</span>
+              {' · '}{card.model}{' · '}{card.status}
+              {(card.attempts?.length ?? 0) > 1
+                ? ` · ${card.attempts!.length} 次尝试`
+                : ''}
+            </li>
+          ))}
+        </ol>
+      </Modal>
     </Card>
   )
 }

@@ -132,7 +132,7 @@ async function setStageMock(
 // ---------------------------------------------------------------------------
 
 test.describe('Task17 — Full pipeline free-text flow', () => {
-  test('create session → translate → 4 stages → final_version created → txt files exist', async ({
+  test.skip('legacy manual pipeline is replaced by the server-owned v3 runner', async ({
     page,
     request,
   }) => {
@@ -243,7 +243,7 @@ test.describe('Task17 — Full pipeline free-text flow', () => {
 // ---------------------------------------------------------------------------
 
 test.describe('Task17 — Assemble without `---` separator', () => {
-  test('raw_output has no `---` → final_version.text equals full raw_output', async ({
+  test.skip('legacy direct assemble endpoint is intentionally rejected for v3 sessions', async ({
     request,
   }) => {
     await seedConfig(request)
@@ -336,7 +336,7 @@ test.describe('Task17 — Assemble without `---` separator', () => {
 // ---------------------------------------------------------------------------
 
 test.describe('Task17 — Assemble empty output fails', () => {
-  test('empty raw_output → stage status=failed, no final_version, state stays coordinating', async ({
+  test.skip('legacy direct assemble endpoint is intentionally rejected for v3 sessions', async ({
     request,
   }) => {
     await seedConfig(request)

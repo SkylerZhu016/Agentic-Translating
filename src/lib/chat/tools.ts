@@ -17,7 +17,8 @@ export const REPLACE_TEXT_TOOL: NonNullable<ChatCompletionRequest['tools']>[numb
       'Replace a specific, verbatim fragment of the current text with new content. ' +
       'The old_string MUST be an exact, unique substring of the current document. ' +
       'Include enough surrounding context to make the match unambiguous. ' +
-      'For multiple edits, call this function once per edit.',
+      'Stay strictly within the user-requested scope and never make an unsolicited improvement. ' +
+      'For multiple explicitly requested edits, call this function once per edit.',
     parameters: {
       type: 'object',
       properties: {

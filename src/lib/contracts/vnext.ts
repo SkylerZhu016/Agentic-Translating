@@ -9,6 +9,19 @@ export type AgentCategory =
 
 export type ReviewMode = 'main_editor' | 'four_stage'
 export type TeamPolicy = 'fixed' | 'dynamic'
+export type PoetryMode = 'auto' | 'on' | 'off'
+export type PoetryTargetForm =
+  | 'preserve'
+  | 'free_verse'
+  | 'classical'
+  | 'regulated'
+  | 'custom'
+export type ChineseRhymeSystem = 'mandarin' | 'pingshui' | 'dual'
+export type EnglishRhymeMode = 'natural' | 'exact' | 'near' | 'none'
+export type RhymePositionMode = 'auto' | 'even_lines' | 'all_lines' | 'custom'
+export type FirstLineRhymeMode = 'auto' | 'yes' | 'no'
+export type RhymeChangeMode = 'source' | 'single' | 'by_stanza' | 'custom'
+export type PoetryPriority = 'meaning' | 'balanced' | 'form'
 
 export interface ModelBinding {
   endpointId: number | null
@@ -62,6 +75,16 @@ export interface TranslationConstraints {
   forbiddenTerms?: string[]
   requiredTerms?: string[]
   rhymeEvidence?: boolean
+  poetryMode?: PoetryMode
+  poetryTargetForm?: PoetryTargetForm
+  chineseRhymeSystem?: ChineseRhymeSystem
+  englishRhymeMode?: EnglishRhymeMode
+  rhymePositions?: RhymePositionMode
+  customRhymeLines?: number[]
+  rhymeScheme?: string
+  firstLineRhyme?: FirstLineRhymeMode
+  rhymeChange?: RhymeChangeMode
+  poetryPriority?: PoetryPriority
 }
 
 export interface WorkflowPresetContract {
@@ -108,6 +131,8 @@ export interface WorkspaceDraft {
   selectedPresetRevisionId: string | null
   allowedAgentVariantIds: string[]
   reviewMode: ReviewMode
+  promptBundleRevisionId?: string | null
+  constraints: TranslationConstraints
   updatedAt: string
 }
 
@@ -121,6 +146,7 @@ export interface SafeEndpointSnapshot {
   id: number
   name: string
   baseUrl: string
+  chatCompletionsPath: string
   hasApiKey: boolean
   contextWindow: number | null
 }
@@ -141,6 +167,7 @@ export interface ConfigSnapshotVNext {
     editingAgent: ModelBinding
   }
   presetRevisionSnapshot: WorkflowPresetRevision | null
+  promptBundleRevisionId?: string | null
   taskBrief: string
   constraints: TranslationConstraints
   orchestrationPolicy: {

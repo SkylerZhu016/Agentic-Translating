@@ -14,6 +14,7 @@ export interface EndpointRow {
   id: number
   name: string
   base_url: string
+  chat_completions_path?: string
   api_key: string
   context_window?: number | null
   created_at: string
@@ -65,6 +66,7 @@ export interface SessionRow {
   preset_revision_id?: string | null
   final_version_id?: number | null
   batch_item_id?: string | null
+  client_request_id?: string | null
   created_at: string
   updated_at: string
 }
@@ -119,17 +121,27 @@ export interface ChatMessageRow {
 // ── Endpoints Repository ──────────────────────────────────────────
 
 export function createEndpointsRepo(db: Database.Database) {
-  const hasContextWindow = (
+  const endpointColumns = (
     db.prepare('PRAGMA table_info(endpoints)').all() as Array<{ name: string }>
-  ).some((column) => column.name === 'context_window')
+  )
+  const hasContextWindow = endpointColumns.some(
+    (column) => column.name === 'context_window',
+  )
+  const hasChatPath = endpointColumns.some(
+    (column) => column.name === 'chat_completions_path',
+  )
   const insertStmt = db.prepare(
-    hasContextWindow
+    hasContextWindow && hasChatPath
+      ? 'INSERT INTO endpoints (name, base_url, chat_completions_path, api_key, context_window) VALUES (@name, @base_url, @chat_completions_path, @api_key, @context_window)'
+      : hasContextWindow
       ? 'INSERT INTO endpoints (name, base_url, api_key, context_window) VALUES (@name, @base_url, @api_key, @context_window)'
       : 'INSERT INTO endpoints (name, base_url, api_key) VALUES (@name, @base_url, @api_key)',
   )
   const getByIdStmt = db.prepare('SELECT * FROM endpoints WHERE id = ?')
   const updateStmt = db.prepare(
-    hasContextWindow
+    hasContextWindow && hasChatPath
+      ? 'UPDATE endpoints SET name = @name, base_url = @base_url, chat_completions_path = @chat_completions_path, api_key = @api_key, context_window = @context_window WHERE id = @id'
+      : hasContextWindow
       ? 'UPDATE endpoints SET name = @name, base_url = @base_url, api_key = @api_key, context_window = @context_window WHERE id = @id'
       : 'UPDATE endpoints SET name = @name, base_url = @base_url, api_key = @api_key WHERE id = @id',
   )
@@ -139,17 +151,21 @@ export function createEndpointsRepo(db: Database.Database) {
     row ? { ...row, api_key: decryptSecret(row.api_key) } : undefined
 
   return {
-    insert: (row: Pick<EndpointRow, 'name' | 'base_url' | 'api_key'> & { context_window?: number | null }) =>
+    insert: (row: Pick<EndpointRow, 'name' | 'base_url' | 'api_key'> & { chat_completions_path?: string; context_window?: number | null }) =>
       insertStmt.run({
         ...row,
+        chat_completions_path:
+          row.chat_completions_path ?? '/v1/chat/completions',
         api_key: encryptSecret(row.api_key),
         context_window: row.context_window ?? null,
       } as any),
     getById: (id: number) =>
       mapEndpoint(getByIdStmt.get(id) as EndpointRow | undefined),
-    update: (row: Pick<EndpointRow, 'id' | 'name' | 'base_url' | 'api_key'> & { context_window?: number | null }) =>
+    update: (row: Pick<EndpointRow, 'id' | 'name' | 'base_url' | 'api_key'> & { chat_completions_path?: string; context_window?: number | null }) =>
       updateStmt.run({
         ...row,
+        chat_completions_path:
+          row.chat_completions_path ?? '/v1/chat/completions',
         api_key: encryptSecret(row.api_key),
         context_window: row.context_window ?? null,
       } as any),

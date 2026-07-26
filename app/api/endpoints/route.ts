@@ -42,6 +42,7 @@ export async function POST(req: NextRequest) {
     const result = repos.endpoints.insert({
       name: parsed.data.name,
       base_url: parsed.data.base_url,
+      chat_completions_path: parsed.data.chat_completions_path,
       api_key: parsed.data.api_key,
       context_window: parsed.data.context_window ?? null,
     })

@@ -4,6 +4,11 @@ import type {
   TranslationConstraints,
   TranslationDirection,
 } from '../contracts/vnext'
+import {
+  analyzePoetrySource,
+  type PoetryBoundaryKind,
+} from '../poetry/analysis'
+import { findPingshuiGroups } from './pingshui-data'
 
 export interface EvidenceLine {
   lineNo: number
@@ -11,6 +16,8 @@ export interface EvidenceLine {
   measure: number
   ending: string
   rhyme: string | null
+  pingshuiGroups: string[]
+  boundary: PoetryBoundaryKind
 }
 
 export interface TranslationEvidenceReport {
@@ -22,6 +29,9 @@ export interface TranslationEvidenceReport {
   forbiddenTermsFound: string[]
   numberWarnings: string[]
   structureWarnings: string[]
+  punctuationWarnings: string[]
+  rhymeWarnings: string[]
+  boundaryWarnings: string[]
   caveat: string
   summary: string
   naturalLanguage: string
@@ -57,6 +67,20 @@ function stanzaCount(text: string) {
   return trimmed ? trimmed.split(/\r?\n\s*\r?\n+/).length : 0
 }
 
+function punctuationBoundary(line: string): PoetryBoundaryKind {
+  if (/[,，;；:：]\s*$/.test(line)) return 'continuation'
+  if (/[.!?。！？]\s*$/.test(line)) return 'closure'
+  return 'open'
+}
+
+function intersection(values: string[][]) {
+  if (values.length === 0) return []
+  return values.slice(1).reduce(
+    (common, current) => common.filter((value) => current.includes(value)),
+    [...values[0]],
+  )
+}
+
 function numbers(text: string) {
   return text.match(/\d+(?:[.,]\d+)*/g) ?? []
 }
@@ -86,6 +110,8 @@ export function checkTranslationEvidence(input: {
         measure: characters.length,
         ending,
         rhyme: chineseRhyme(ending),
+        pingshuiGroups: findPingshuiGroups(ending),
+        boundary: punctuationBoundary(line),
       }
     }
     if (input.direction === 'custom') {
@@ -99,6 +125,8 @@ export function checkTranslationEvidence(input: {
         measure: graphemes.length,
         ending: graphemes.at(-1) ?? '',
         rhyme: null,
+        pingshuiGroups: [],
+        boundary: punctuationBoundary(line),
       }
     }
     const words = line.match(/[A-Za-z]+(?:['’-][A-Za-z]+)*/g) ?? []
@@ -109,6 +137,8 @@ export function checkTranslationEvidence(input: {
       measure: words.length,
       ending,
       rhyme: englishRhyme(ending),
+      pingshuiGroups: [],
+      boundary: punctuationBoundary(line),
     }
   })
   const requiredTermsMissing = (constraints.requiredTerms ?? []).filter(
@@ -128,6 +158,27 @@ export function checkTranslationEvidence(input: {
     )
   const translatedStanzas = stanzaCount(input.translatedText)
   const structureWarnings: string[] = []
+  const punctuationWarnings: string[] = []
+  const rhymeWarnings: string[] = []
+  const boundaryWarnings: string[] = []
+  const sourceHasDash = /[—–]|——/.test(input.sourceText)
+  const translationHasDash = /[—–]|——/.test(input.translatedText)
+  const sourceHasSemicolon = /[;；]/.test(input.sourceText)
+  const translationHasSemicolon = /[;；]/.test(input.translatedText)
+  if (!sourceHasDash && translationHasDash) {
+    punctuationWarnings.push(
+      useEnglish
+        ? 'The translation introduces a dash although the source contains no dash.'
+        : '原文没有破折号，但译文新增了破折号。',
+    )
+  }
+  if (!sourceHasSemicolon && translationHasSemicolon) {
+    punctuationWarnings.push(
+      useEnglish
+        ? 'The translation introduces a semicolon although the source contains no semicolon.'
+        : '原文没有分号，但译文新增了分号。',
+    )
+  }
   if (
     constraints.expectedStanzas &&
     translatedStanzas !== constraints.expectedStanzas
@@ -160,14 +211,121 @@ export function checkTranslationEvidence(input: {
       )
     }
   }
+  const poetry = analyzePoetrySource({
+    sourceText: input.sourceText,
+    constraints,
+  })
+  if (poetry.isPoetry) {
+    if (poetry.lines.length !== lines.length) {
+      structureWarnings.push(
+        useEnglish
+          ? `Source analysis found ${poetry.lines.length} poetic lines; the translation has ${lines.length} non-empty lines.`
+          : `原文识别为 ${poetry.lines.length} 个诗句，译文有 ${lines.length} 个非空行。`,
+      )
+    }
+    const comparable = Math.min(poetry.lines.length, lines.length)
+    for (let index = 0; index < comparable; index++) {
+      const sourceBoundary = poetry.lines[index].boundary
+      const targetBoundary = lines[index].boundary
+      if (sourceBoundary === 'continuation' && targetBoundary === 'closure') {
+        boundaryWarnings.push(
+          useEnglish
+            ? `Line ${index + 1} continues in the source but ends with sentence-closing punctuation in the translation.`
+            : `第 ${index + 1} 行在原文中仍然延续，但译文使用了句末终止标点。`,
+        )
+      } else if (
+        sourceBoundary === 'closure' &&
+        targetBoundary === 'continuation'
+      ) {
+        boundaryWarnings.push(
+          useEnglish
+            ? `Line ${index + 1} closes in the source but remains syntactically open in the translation.`
+            : `第 ${index + 1} 行在原文中已经收束，但译文仍使用延续标点。`,
+        )
+      }
+    }
+
+    const schemeLabels = poetry.suggestedScheme
+      .replace(/[^A-Za-z]/g, '')
+      .slice(0, lines.length)
+    const labelledGroups = new Map<string, number[]>()
+    for (const lineNo of poetry.suggestedRhymeLines) {
+      const label = schemeLabels[lineNo - 1]?.toUpperCase() || 'A'
+      if (label === 'X') continue
+      labelledGroups.set(label, [
+        ...(labelledGroups.get(label) ?? []),
+        lineNo,
+      ])
+    }
+    const requireOneRhyme =
+      constraints.rhymeChange === 'single' || poetry.stanzaCount <= 1
+    if (requireOneRhyme) {
+      for (const [label, lineNumbers] of labelledGroups) {
+        const rhymeLines = lineNumbers
+          .map((lineNo) => lines[lineNo - 1])
+          .filter((line): line is EvidenceLine => Boolean(line))
+        if (rhymeLines.length < 2) continue
+        if (input.direction === 'en_to_zh') {
+        const system = constraints.chineseRhymeSystem ?? 'mandarin'
+        const knownMandarin = rhymeLines
+          .map((line) => line.rhyme)
+          .filter((rhyme): rhyme is string => Boolean(rhyme))
+        const mandarinMatches =
+          knownMandarin.length === rhymeLines.length &&
+          new Set(knownMandarin).size === 1
+        const knownPingshui = rhymeLines.map((line) => line.pingshuiGroups)
+        const pingshuiMatches =
+          knownPingshui.every((groups) => groups.length > 0) &&
+          intersection(knownPingshui).length > 0
+        if (
+          (system === 'mandarin' || system === 'dual') &&
+          !mandarinMatches
+        ) {
+          rhymeWarnings.push(
+              `普通话检查：${label} 韵位第 ${lineNumbers.join('、')} 行的韵母未保持一致。`,
+          )
+        }
+        if (
+          (system === 'pingshui' || system === 'dual') &&
+          !pingshuiMatches
+        ) {
+          rhymeWarnings.push(
+              `平水韵检查：${label} 韵位第 ${lineNumbers.join('、')} 行未找到共同韵部，或存在未识别韵脚。`,
+          )
+        }
+        } else if (
+          input.direction === 'zh_to_en' &&
+          constraints.englishRhymeMode === 'exact'
+        ) {
+        const known = rhymeLines
+          .map((line) => line.rhyme)
+          .filter((rhyme): rhyme is string => Boolean(rhyme))
+        if (
+          known.length !== rhymeLines.length ||
+          new Set(known).size !== 1
+        ) {
+          rhymeWarnings.push(
+              `Exact-rhyme check: ${label}-rhyme lines ${lineNumbers.join(', ')} do not share one known pronunciation signature.`,
+          )
+        }
+        }
+      }
+    }
+  }
   const warningCount =
     requiredTermsMissing.length +
     forbiddenTermsFound.length +
     numberWarnings.length +
-    structureWarnings.length
+    structureWarnings.length +
+    punctuationWarnings.length +
+    rhymeWarnings.length +
+    boundaryWarnings.length
   const caveat =
     input.direction === 'en_to_zh'
-      ? '普通话拼音韵母仅为韵脚辅助证据，不等同于平水韵裁决；多音字可能需要人工复核。'
+      ? constraints.chineseRhymeSystem === 'pingshui' ||
+        constraints.chineseRhymeSystem === 'dual'
+        ? '平水韵结果来自内置一百零六韵字表；普通话听感、古今音变化、多音字和通韵变体仍需人工复核。'
+        : '普通话拼音韵母仅为现代听感辅助证据，不等同于平水韵裁决；多音字和古典韵部仍需人工复核。'
       : input.direction === 'custom'
         ? 'Custom-direction evidence is limited to generic structural and terminology checks.'
       : 'Rhyme signatures are modern-English pronunciation aids only; unknown names and dialectal readings require human review.'
@@ -192,10 +350,16 @@ export function checkTranslationEvidence(input: {
             : '',
           ...numberWarnings,
           ...structureWarnings,
+          ...punctuationWarnings,
+          ...boundaryWarnings,
+          ...rhymeWarnings,
           `Line-ending evidence: ${lines
             .map(
               (line) =>
-                `${line.lineNo}:${line.ending || 'unknown'}/${line.rhyme ?? 'unknown'}`,
+                `${line.lineNo}:${line.ending || 'unknown'}/${line.rhyme ?? 'unknown'}` +
+                (line.pingshuiGroups.length
+                  ? `/PingShui=${line.pingshuiGroups.join('|')}`
+                  : ''),
             )
             .join('; ')}`,
           caveat,
@@ -211,10 +375,16 @@ export function checkTranslationEvidence(input: {
             : '',
           ...numberWarnings,
           ...structureWarnings,
+          ...punctuationWarnings,
+          ...boundaryWarnings,
+          ...rhymeWarnings,
           `行末证据：${lines
             .map(
               (line) =>
-                `${line.lineNo}:${line.ending || '未知'}/${line.rhyme ?? '未知'}`,
+                `${line.lineNo}:${line.ending || '未知'}/${line.rhyme ?? '未知'}` +
+                (line.pingshuiGroups.length
+                  ? `/平水=${line.pingshuiGroups.join('|')}`
+                  : ''),
             )
             .join('；')}`,
           caveat,
@@ -228,6 +398,9 @@ export function checkTranslationEvidence(input: {
     forbiddenTermsFound,
     numberWarnings,
     structureWarnings,
+    punctuationWarnings,
+    rhymeWarnings,
+    boundaryWarnings,
     caveat,
     summary,
     naturalLanguage,

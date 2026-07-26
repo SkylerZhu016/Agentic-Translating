@@ -34,6 +34,16 @@ export async function register() {
         WHERE status IN ('queued','running')
       `).run()
       db.prepare(`
+        UPDATE sessions
+        SET state=CASE
+              WHEN state='coordinating' THEN 'translated'
+              ELSE 'draft'
+            END,
+            updated_at=datetime('now')
+        WHERE state IN ('translating','coordinating')
+          AND final_version_id IS NULL
+      `).run()
+      db.prepare(`
         UPDATE batch_jobs
         SET status='paused',
             error=COALESCE(error, 'Application restarted; resume the batch to continue'),

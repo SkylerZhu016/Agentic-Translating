@@ -31,6 +31,7 @@ export interface EndpointConfig {
   id: number
   name: string
   base_url: string
+  chat_completions_path?: string
   api_key: string
   context_window?: number | null
   created_at: string
@@ -119,6 +120,7 @@ export interface SessionRow {
   preset_revision_id?: string | null
   final_version_id?: number | null
   batch_item_id?: string | null
+  client_request_id?: string | null
   created_at: string
   updated_at: string
 }
@@ -190,6 +192,7 @@ export interface ConfigSnapshot {
     id: number
     name: string
     baseUrl: string
+    chatCompletionsPath?: string
     apiKey: string
     hasApiKey: boolean
     contextWindow: number | null
@@ -200,6 +203,7 @@ export interface ConfigSnapshot {
     editingAgent: ModelBinding
   }
   presetRevisionSnapshot?: WorkflowPresetRevision | null
+  promptBundleRevisionId?: string | null
   taskBrief?: string
   constraints?: TranslationConstraints
   orchestrationPolicy?: {

@@ -17,13 +17,18 @@ import {
   type EndpointDeleteConflict,
 } from './api'
 import { Field, type NotifyFn } from './shared'
+import {
+  DEFAULT_CHAT_COMPLETIONS_PATH,
+  resolveChatCompletionsUrl,
+  splitEndpointAddress,
+} from '@/src/lib/llm/endpoint-url'
 
 const ENDPOINT_PRESETS = [
-  { name: 'OpenAI', base_url: 'https://api.openai.com/v1' },
-  { name: 'Gemini', base_url: 'https://generativelanguage.googleapis.com/v1beta/openai' },
-  { name: 'DeepSeek', base_url: 'https://api.deepseek.com/v1' },
-  { name: 'OpenRouter', base_url: 'https://openrouter.ai/api/v1' },
-  { name: 'Ollama', base_url: 'http://localhost:11434/v1' },
+  { name: 'OpenAI', base_url: 'https://api.openai.com', path: '/v1/chat/completions' },
+  { name: 'Gemini', base_url: 'https://generativelanguage.googleapis.com', path: '/v1beta/openai/chat/completions' },
+  { name: 'DeepSeek', base_url: 'https://api.deepseek.com', path: '/v1/chat/completions' },
+  { name: 'OpenRouter', base_url: 'https://openrouter.ai', path: '/api/v1/chat/completions' },
+  { name: 'Ollama', base_url: 'http://localhost:11434', path: '/v1/chat/completions' },
 ] as const
 
 export interface EndpointPanelProps {
@@ -44,11 +49,15 @@ export function EndpointPanel({ endpoints, agents, notify, onChanged }: Endpoint
   const [editing, setEditing] = useState<Endpoint | null>(null)
   const [name, setName] = useState('')
   const [baseUrl, setBaseUrl] = useState('')
+  const [chatPath, setChatPath] = useState(DEFAULT_CHAT_COMPLETIONS_PATH)
   const [apiKey, setApiKey] = useState('')
   const [contextWindow, setContextWindow] = useState('')
+  const [testModel, setTestModel] = useState('')
+  const [testStatus, setTestStatus] = useState('')
   const [showKey, setShowKey] = useState(false)
   const [errors, setErrors] = useState<FormErrors>({})
   const [saving, setSaving] = useState(false)
+  const [testing, setTesting] = useState(false)
 
   // ── 删除确认状态 ──
   const [deleteTarget, setDeleteTarget] = useState<Endpoint | null>(null)
@@ -61,6 +70,7 @@ export function EndpointPanel({ endpoints, agents, notify, onChanged }: Endpoint
     setEditing(null)
     setName('')
     setBaseUrl('')
+    setChatPath(DEFAULT_CHAT_COMPLETIONS_PATH)
     setApiKey('')
     setContextWindow('')
     setShowKey(false)
@@ -72,6 +82,7 @@ export function EndpointPanel({ endpoints, agents, notify, onChanged }: Endpoint
     setEditing(ep)
     setName(ep.name)
     setBaseUrl(ep.base_url)
+    setChatPath(ep.chat_completions_path)
     setApiKey('')
     setContextWindow(ep.context_window?.toString() ?? '')
     setShowKey(false)
@@ -82,6 +93,7 @@ export function EndpointPanel({ endpoints, agents, notify, onChanged }: Endpoint
   function applyPreset(preset: (typeof ENDPOINT_PRESETS)[number]) {
     setName(preset.name)
     setBaseUrl(preset.base_url)
+    setChatPath(preset.path)
     setErrors((prev) => ({ ...prev, name: undefined, base_url: undefined }))
   }
 
@@ -107,6 +119,7 @@ export function EndpointPanel({ endpoints, agents, notify, onChanged }: Endpoint
         await configApi.updateEndpoint(editing.id, {
           name: name.trim(),
           base_url: url,
+          chat_completions_path: chatPath,
           api_key: apiKey,
           context_window: contextWindow ? Number(contextWindow) : null,
         })
@@ -115,6 +128,7 @@ export function EndpointPanel({ endpoints, agents, notify, onChanged }: Endpoint
         await configApi.createEndpoint({
           name: name.trim(),
           base_url: url,
+          chat_completions_path: chatPath,
           api_key: apiKey,
           context_window: contextWindow ? Number(contextWindow) : null,
         })
@@ -126,6 +140,36 @@ export function EndpointPanel({ endpoints, agents, notify, onChanged }: Endpoint
       notify('保存失败', { message: isApiError(e) ? e.message : '网络错误，请重试' })
     } finally {
       setSaving(false)
+    }
+  }
+
+  async function testEndpoint() {
+    if (!editing || !testModel.trim()) return
+    setTesting(true)
+    setTestStatus('')
+    try {
+      const response = await fetch(`/api/endpoints/${editing.id}/test`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: testModel.trim() }),
+      })
+      const payload = await response.json() as {
+        latencyMs?: number
+        error?: string
+        diagnosticId?: string
+      }
+      if (!response.ok) {
+        throw new Error(
+          `${payload.error ?? '测试失败'}${
+            payload.diagnosticId ? `（诊断 ID：${payload.diagnosticId}）` : ''
+          }`,
+        )
+      }
+      setTestStatus(`连接成功 · ${payload.latencyMs ?? 0} ms`)
+    } catch (error) {
+      setTestStatus(error instanceof Error ? error.message : '测试失败')
+    } finally {
+      setTesting(false)
     }
   }
 
@@ -220,6 +264,7 @@ export function EndpointPanel({ endpoints, agents, notify, onChanged }: Endpoint
                   </div>
                   <p className="mt-0.5 break-all font-mono text-xs leading-5 text-ink-3">
                     {ep.base_url}
+                    {ep.chat_completions_path}
                   </p>
                 </div>
                 <Button variant="ghost" size="sm" onClick={() => openEdit(ep)}>
@@ -298,11 +343,66 @@ export function EndpointPanel({ endpoints, agents, notify, onChanged }: Endpoint
             <Input
               testId={TID.endpoint.baseUrlInput}
               value={baseUrl}
-              onChange={(e) => setBaseUrl(e.target.value)}
-              placeholder="https://api.openai.com/v1"
+              onChange={(e) => {
+                const value = e.target.value
+                try {
+                  const split = splitEndpointAddress(value)
+                  if (value.includes('/chat/completions')) {
+                    setBaseUrl(split.baseUrl)
+                    setChatPath(split.chatCompletionsPath)
+                    return
+                  }
+                } catch {
+                  // Keep the partial form value while the user is typing.
+                }
+                setBaseUrl(value)
+              }}
+              placeholder="https://api.openai.com"
               className="font-mono"
             />
           </Field>
+
+          <Field
+            label="请求路径"
+            hint={
+              baseUrl
+                ? `最终请求地址：${resolveChatCompletionsUrl({
+                    baseUrl,
+                    chatCompletionsPath: chatPath,
+                  })}`
+                : '默认 /v1/chat/completions；也可直接粘贴完整 Chat Completions URL。'
+            }
+          >
+            <Input
+              value={chatPath}
+              onChange={(event) => setChatPath(event.target.value)}
+              placeholder="/v1/chat/completions"
+              className="font-mono"
+            />
+          </Field>
+          {editing && (
+            <div className="rounded-sm border border-line bg-paper/55 px-3 py-3">
+              <p className="mb-2 text-xs font-medium text-ink-2">独立连接测试</p>
+              <div className="flex gap-2">
+                <Input
+                  value={testModel}
+                  onChange={(event) => setTestModel(event.target.value)}
+                  placeholder="用于测试的模型名称"
+                />
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={testing || !testModel.trim()}
+                  onClick={() => void testEndpoint()}
+                >
+                  {testing && <Spinner size="sm" />}测试
+                </Button>
+              </div>
+              {testStatus && (
+                <p className="mt-2 text-xs leading-5 text-ink-3">{testStatus}</p>
+              )}
+            </div>
+          )}
 
           <Field
             label="上下文上限"

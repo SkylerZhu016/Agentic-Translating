@@ -69,8 +69,85 @@ export interface MockLLMInstance {
    * 请求头 x-mock-behavior 存在时优先于 setBehavior。
    */
   setBehavior: (model: string, config: MockBehaviorConfig) => void;
+  /** Clear all per-model and catch-all behavior overrides. */
+  resetBehaviors: () => void;
   /** 获取所有已记录请求的快照 */
   getRequests: () => RequestLogEntry[];
+}
+
+function buildRequestedToolCall(body: unknown) {
+  const request =
+    body && typeof body === 'object'
+      ? body as Record<string, unknown>
+      : {}
+  const tools = Array.isArray(request.tools)
+    ? request.tools as Array<{
+        function?: { name?: string }
+      }>
+    : []
+  const choice = request.tool_choice
+  const forcedName =
+    choice && typeof choice === 'object'
+      ? (
+          choice as {
+            function?: { name?: string }
+          }
+        ).function?.name
+      : undefined
+  const name = forcedName ?? tools[0]?.function?.name ?? 'replace_text'
+  const messages = Array.isArray(request.messages)
+    ? request.messages as Array<{ content?: string }>
+    : []
+  const prompt = messages.map((message) => message.content ?? '').join('\n')
+
+  if (name === 'call_agents') {
+    const ids = [...prompt.matchAll(
+      /^- ([a-z0-9][a-z0-9.-]+):/gim,
+    )].map((match) => match[1])
+      .filter((id) => !id.startsWith('cultural-context.'))
+    return {
+      name,
+      arguments: {
+        calls: ids.slice(0, 2).map((agentVariantId) => ({
+          agentVariantId,
+          additionalInstruction: 'Produce a complete, careful candidate.',
+          selectionReason: 'Mock complementary role selection.',
+        })),
+      },
+    }
+  }
+  if (name === 'write_draft') {
+    const ids = [...new Set(
+      [...prompt.matchAll(
+        /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi,
+      )].map((match) => match[0]),
+    )]
+    return {
+      name,
+      arguments: {
+        text: 'Mock evidence-backed final translation.',
+        reason: 'Synthesized from the latest successful candidate bodies.',
+        evidenceInvocationIds: ids.slice(-2),
+      },
+    }
+  }
+  if (name === 'submit_final') {
+    const versionId = Number(prompt.match(/versionId=(\d+)/)?.[1] ?? 1)
+    return {
+      name,
+      arguments: {
+        versionId,
+        summary: 'Mock final submission.',
+      },
+    }
+  }
+  return {
+    name: 'replace_text',
+    arguments: {
+      old_string: 'original text',
+      new_string: 'replaced text',
+    },
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -412,16 +489,14 @@ export async function startMockLLM(
           case 'tool_call': {
             const toolCallContent = 'I will search for that.';
             const useStream = config.stream ?? false;
+            const requestedTool = buildRequestedToolCall(body);
 
             const toolCall = {
               id: `call_${Date.now()}`,
               type: 'function',
               function: {
-                name: 'replace_text',
-                arguments: JSON.stringify({
-                  old_string: 'original text',
-                  new_string: 'replaced text',
-                }),
+                name: requestedTool.name,
+                arguments: JSON.stringify(requestedTool.arguments),
               },
             };
 
@@ -568,6 +643,9 @@ export async function startMockLLM(
         },
         setBehavior: (model: string, config: MockBehaviorConfig) => {
           behaviorMap.set(model, config);
+        },
+        resetBehaviors: () => {
+          behaviorMap.clear();
         },
         getRequests: () => [...requests],
       });

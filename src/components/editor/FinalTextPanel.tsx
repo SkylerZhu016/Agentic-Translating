@@ -15,6 +15,7 @@ import type { SelectionSnapshot } from './types'
 export interface FinalTextPanelProps {
   /** 当前最新版本全文（空串 → 占位提示） */
   text: string
+  emptyHint?: string
   /** coordinating 中只读：锁徽章 + 禁用 popover */
   readonly: boolean
   /** 聊天请求进行中（抑制新 popover） */
@@ -52,7 +53,7 @@ function readSelection(container: HTMLElement): { snapshot: SelectionSnapshot; r
   }
 }
 
-export function FinalTextPanel({ text, readonly, busy = false, highlight, onSubmitEdit }: FinalTextPanelProps) {
+export function FinalTextPanel({ text, emptyHint, readonly, busy = false, highlight, onSubmitEdit }: FinalTextPanelProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const markRef = useRef<HTMLSpanElement>(null)
   const rangeRef = useRef<Range | null>(null)
@@ -144,7 +145,7 @@ export function FinalTextPanel({ text, readonly, busy = false, highlight, onSubm
     if (text.length === 0) {
       return (
         <span className="text-ink-4">
-          译文将在组装完成后呈现于此——宋体、松行距、微字距，适合中文长读。
+          {emptyHint ?? '最终译文将在工作流正式提交后显示。'}
         </span>
       )
     }

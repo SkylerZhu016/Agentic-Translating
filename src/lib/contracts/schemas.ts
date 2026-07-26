@@ -45,6 +45,7 @@ export const ALLOWED_TRANSITIONS: Record<SessionState, SessionState[]> = {
 export const endpointCreateSchema = z.object({
   name: z.string().min(1, 'Name is required'),
   base_url: z.string().url('Must be a valid URL'),
+  chat_completions_path: z.string().min(1).default('/v1/chat/completions'),
   api_key: z.string().min(0).default(''),
   context_window: z.number().int().positive().nullable().optional(),
 })
@@ -52,11 +53,13 @@ export const endpointCreateSchema = z.object({
 export const endpointUpdateSchema = z.object({
   name: z.string().min(1).optional(),
   base_url: z.string().url().optional(),
+  chat_completions_path: z.string().min(1).optional(),
   api_key: z.string().optional(),
   context_window: z.number().int().positive().nullable().optional(),
 })
 
 export const sessionCreateSchema = z.object({
+  clientRequestId: z.string().uuid().optional(),
   sourceText: z.string(),
   direction: z.enum(['en_to_zh', 'zh_to_en', 'custom']).default('en_to_zh'),
   sourceLang: z.string().min(1).optional(),
@@ -64,6 +67,7 @@ export const sessionCreateSchema = z.object({
   taskBrief: z.string().default(''),
   reviewMode: z.enum(['main_editor', 'four_stage']).default('main_editor'),
   presetRevisionId: z.string().min(1).nullable().optional(),
+  promptBundleRevisionId: z.string().min(1).nullable().optional(),
   allowedAgentVariantIds: z.array(z.string().min(1)).optional(),
   constraints: z.object({
     preserveParagraphs: z.boolean().optional(),
@@ -73,6 +77,27 @@ export const sessionCreateSchema = z.object({
     forbiddenTerms: z.array(z.string()).optional(),
     requiredTerms: z.array(z.string()).optional(),
     rhymeEvidence: z.boolean().optional(),
+    poetryMode: z.enum(['auto', 'on', 'off']).optional(),
+    poetryTargetForm: z.enum([
+      'preserve',
+      'free_verse',
+      'classical',
+      'regulated',
+      'custom',
+    ]).optional(),
+    chineseRhymeSystem: z.enum(['mandarin', 'pingshui', 'dual']).optional(),
+    englishRhymeMode: z.enum(['natural', 'exact', 'near', 'none']).optional(),
+    rhymePositions: z.enum([
+      'auto',
+      'even_lines',
+      'all_lines',
+      'custom',
+    ]).optional(),
+    customRhymeLines: z.array(z.number().int().positive()).optional(),
+    rhymeScheme: z.string().max(128).optional(),
+    firstLineRhyme: z.enum(['auto', 'yes', 'no']).optional(),
+    rhymeChange: z.enum(['source', 'single', 'by_stanza', 'custom']).optional(),
+    poetryPriority: z.enum(['meaning', 'balanced', 'form']).optional(),
   }).default({}),
 }).superRefine((value, context) => {
   if (

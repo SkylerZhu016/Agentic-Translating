@@ -16,7 +16,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { parseSSEChunk, type SSEEvent } from '@/src/lib/contracts/sse'
 import type { ConfigSnapshot, SessionRow } from '@/src/lib/contracts/types'
 import { emitSessionChanged } from '@/src/components/coordinator/session-bus'
-import type { BuiltinDirection, ReviewMode } from '@/src/lib/contracts/vnext'
+import type {
+  BuiltinDirection,
+  ReviewMode,
+  TranslationConstraints,
+} from '@/src/lib/contracts/vnext'
 import type { TranslationEvidenceReport } from '@/src/lib/evidence/checker'
 import { parseSemanticAgentOutput } from '@/src/lib/protocol/semantic-output'
 
@@ -26,14 +30,18 @@ export type AgentCardStatus = 'pending' | 'streaming' | 'complete' | 'error'
 
 export interface AgentCardState {
   agentKey: string
+  chainId?: string
+  kind?: 'translation' | 'context_analysis' | 'poetry_plan'
   name: string
   model: string
   status: AgentCardStatus
   /** 已累积的流式文本（complete 后以服务端 content 为准） */
   text: string
   error: string | null
+  lastActivityAt?: string
   annotation?: string | null
   evidence?: TranslationEvidenceReport | null
+  attempts?: RestorableInvocation[]
 }
 
 export type TranslatePhase = 'idle' | 'creating' | 'streaming' | 'done'
@@ -53,7 +61,9 @@ export interface StartTranslationInput {
   taskBrief: string
   reviewMode: ReviewMode
   allowedAgentVariantIds: string[]
+  constraints: TranslationConstraints
   presetRevisionId?: string | null
+  promptBundleRevisionId?: string | null
 }
 
 interface RestorableInvocation {
@@ -123,9 +133,18 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
   const [retryingKey, setRetryingKey] = useState<string | null>(null)
 
   const abortRef = useRef<AbortController | null>(null)
+  const clientRequestIdRef = useRef<string | null>(null)
   const mountedRef = useRef(true)
 
   useEffect(() => {
+    abortRef.current?.abort()
+    abortRef.current = null
+    clientRequestIdRef.current = null
+    setPhase('idle')
+    setCards([])
+    setSessionId(null)
+    setGlobalError(null)
+    setRetryingKey(null)
     setLangPair(
       direction === 'en_to_zh'
         ? { source: '英文', target: '中文' }
@@ -231,6 +250,11 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
               ...previous,
               {
                 agentKey: invocationId,
+                kind:
+                  data.roleKind === 'context_analysis' ||
+                  data.roleKind === 'poetry_plan'
+                    ? data.roleKind
+                    : 'translation',
                 name:
                   typeof data.name === 'string' ? data.name : variantId,
                 model:
@@ -253,6 +277,16 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
                 : card,
             ),
           )
+          break
+        }
+        case 'agent.activity': {
+          const invocationId = data.invocationId as string
+          patchCard(invocationId, {
+            lastActivityAt:
+              typeof data.receivedAt === 'string'
+                ? data.receivedAt
+                : new Date().toISOString(),
+          })
           break
         }
         case 'agent.completed': {
@@ -295,6 +329,13 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
           setGlobalError(
             typeof data.error === 'string' ? data.error : '运行被中断',
           )
+          emitSessionChanged()
+          break
+        }
+        case 'run.paused': {
+          setPhase('done')
+          setGlobalError(null)
+          emitSessionChanged()
           break
         }
         case 'agent_start': {
@@ -357,6 +398,7 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
   )
 
   const restoreSession = useCallback(async (id: string) => {
+    setGlobalError(null)
     const response = await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
       cache: 'no-store',
     })
@@ -364,10 +406,27 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
     const payload = await response.json() as {
       session: SessionRow
       invocations?: RestorableInvocation[]
+      invocationChains?: Array<{
+        rootInvocationId: string
+        currentInvocation: RestorableInvocation
+        attempts: RestorableInvocation[]
+        attemptCount: number
+      }>
       runs?: Array<{ status: string }>
-      events?: Array<{ event_type: string; payload_json: string }>
+      events?: Array<{
+        id: number
+        event_type: string
+        payload_json: string
+      }>
     }
-    const invocations = payload.invocations ?? []
+    const chains =
+      payload.invocationChains ??
+      (payload.invocations ?? []).map((invocation) => ({
+        rootInvocationId: invocation.id,
+        currentInvocation: invocation,
+        attempts: [invocation],
+        attemptCount: 1,
+      }))
     const evidenceByInvocation = new Map<string, TranslationEvidenceReport>()
     for (const event of payload.events ?? []) {
       if (event.event_type !== 'evidence.checked') continue
@@ -389,18 +448,30 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
       target: payload.session.target_lang,
     })
     setCards(
-      invocations.map((invocation) => {
+      chains.map((chain) => {
+        const invocation = chain.currentInvocation
         let name = invocation.agent_variant_id
+        let kind: AgentCardState['kind'] = 'translation'
         try {
           const snapshot = JSON.parse(invocation.agent_snapshot) as {
             catalogName?: string
+            roleKind?: string
+            analysisIndex?: number
           }
           name = snapshot.catalogName ?? name
+          if (snapshot.roleKind === 'context_analysis') {
+            kind = 'context_analysis'
+            name = `${name} ${snapshot.analysisIndex ?? ''}`.trim()
+          } else if (snapshot.roleKind === 'poetry_plan') {
+            kind = 'poetry_plan'
+          }
         } catch {
           // Preserve stable variant id when a legacy snapshot is malformed.
         }
         return {
           agentKey: invocation.id,
+          chainId: chain.rootInvocationId,
+          kind,
           name,
           model: invocation.model,
           status:
@@ -414,27 +485,58 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
           error: invocation.error,
           annotation: invocation.annotation_output,
           evidence: evidenceByInvocation.get(invocation.id) ?? null,
+          attempts: chain.attempts,
         }
       }),
     )
     const active = (payload.runs ?? []).some(
       (run) => run.status === 'queued' || run.status === 'running',
     )
+    const afterEventId =
+      payload.events && payload.events.length > 0
+        ? payload.events[payload.events.length - 1].id
+        : 0
+    let snapshot: ConfigSnapshot | null = null
+    try {
+      snapshot = JSON.parse(payload.session.config_snapshot) as ConfigSnapshot
+    } catch {
+      snapshot = null
+    }
     setPhase(active ? 'streaming' : 'done')
-    emitSessionChanged(id)
     if (active) {
       const controller = new AbortController()
       abortRef.current?.abort()
       abortRef.current = controller
-      const events = await fetch(`/api/sessions/${encodeURIComponent(id)}/events`, {
-        signal: controller.signal,
-      })
-      if (events.ok) await consumeSSE(events, applyEvent)
+      void (async () => {
+        try {
+          const events = await fetch(
+            `/api/sessions/${encodeURIComponent(id)}/events?after=${afterEventId}`,
+            { signal: controller.signal },
+          )
+          if (!events.ok) {
+            throw new Error(
+              await readErrorBody(events, '无法订阅会话事件'),
+            )
+          }
+          await consumeSSE(events, applyEvent)
+        } catch (error) {
+          if (!controller.signal.aborted && mountedRef.current) {
+            setGlobalError(
+              error instanceof Error ? error.message : '会话事件连接已中断',
+            )
+          }
+        }
+      })()
     }
     return {
       sourceText: payload.session.source_text,
       taskBrief: payload.session.task_brief ?? '',
       reviewMode: payload.session.review_mode ?? 'main_editor',
+      selectedPresetRevisionId: payload.session.preset_revision_id ?? null,
+      promptBundleRevisionId: snapshot?.promptBundleRevisionId ?? null,
+      constraints: snapshot?.constraints ?? {},
+      allowedAgentVariantIds:
+        snapshot?.agentVariantSnapshots?.map((variant) => variant.id) ?? [],
     }
   }, [applyEvent])
 
@@ -451,21 +553,32 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
 
       try {
         // 1. 创建会话（守卫在服务端：空原文/超长/无 Agent 均 400）
+        const clientRequestId =
+          clientRequestIdRef.current ?? crypto.randomUUID()
+        clientRequestIdRef.current = clientRequestId
         const createRes = await fetch('/api/sessions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(input),
+          body: JSON.stringify({
+            ...input,
+            clientRequestId,
+          }),
           signal: controller.signal,
         })
         if (!createRes.ok) {
           throw new Error(await readErrorBody(createRes, `创建会话失败（${createRes.status}）`))
         }
         const session = (await createRes.json()) as SessionRow
+        clientRequestIdRef.current = null
 
         // 2. 从配置快照播种卡片（快照即权威：名称+模型+数量）
         const snapshot = JSON.parse(session.config_snapshot) as ConfigSnapshot
         if (!mountedRef.current) return
         setSessionId(session.id)
+        const sessionUrl = new URL(window.location.href)
+        sessionUrl.search = ''
+        sessionUrl.searchParams.set('session', session.id)
+        window.history.replaceState(null, '', sessionUrl)
         // 通知统筹/译文面板锁定新会话（session-bus 松耦合集成）
         emitSessionChanged(session.id)
         setLangPair({ source: session.source_lang, target: session.target_lang })
@@ -577,24 +690,85 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
         )
         setGlobalError(err instanceof Error ? err.message : String(err))
       } finally {
-        if (mountedRef.current) setRetryingKey(null)
+        if (mountedRef.current) {
+          setRetryingKey(null)
+          emitSessionChanged(sessionId)
+        }
       }
     },
     [sessionId, retryingKey, applyEvent, patchCard],
+  )
+
+  const retryAll = useCallback(
+    async (configMode: 'frozen' | 'current') => {
+      if (!sessionId || retryingKey != null) return
+      const controller = new AbortController()
+      abortRef.current?.abort()
+      abortRef.current = controller
+      setGlobalError(null)
+      setRetryingKey('*')
+      try {
+        const response = await fetch(`/api/sessions/${sessionId}/retry`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            target: { type: 'all_failed' },
+            configMode,
+          }),
+          signal: controller.signal,
+        })
+        if (!response.ok) {
+          throw new Error(
+            await readErrorBody(response, `一键重试失败（${response.status}）`),
+          )
+        }
+        const payload = (await response.json()) as {
+          runs: Array<{ afterEventId: number }>
+        }
+        const after = Math.min(
+          ...payload.runs.map((run) => run.afterEventId),
+        )
+        const events = await fetch(
+          `/api/sessions/${sessionId}/events?after=${after}`,
+          { signal: controller.signal },
+        )
+        if (!events.ok) throw new Error('无法订阅重试事件')
+        await consumeSSE(events, applyEvent)
+        await restoreSession(sessionId)
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          setGlobalError(
+            error instanceof Error ? error.message : String(error),
+          )
+        }
+      } finally {
+        if (mountedRef.current) {
+          setRetryingKey(null)
+          emitSessionChanged(sessionId)
+        }
+      }
+    },
+    [applyEvent, restoreSession, retryingKey, sessionId],
   )
 
   const dismissError = useCallback(() => setGlobalError(null), [])
 
   // ── 派生状态 ───────────────────────────────────────────────────
   const busy = phase === 'creating' || phase === 'streaming' || retryingKey != null
+  const translationCards = cards.filter(
+    (card) =>
+      card.kind !== 'context_analysis' && card.kind !== 'poetry_plan',
+  )
   const summary = useMemo(() => {
-    if (cards.length === 0 || phase !== 'done') return null
+    if (translationCards.length === 0 || phase !== 'done') return null
     return {
-      succeeded: cards.filter((c) => c.status === 'complete').length,
-      failed: cards.filter((c) => c.status === 'error').length,
+      succeeded: translationCards.filter((c) => c.status === 'complete').length,
+      failed: translationCards.filter((c) => c.status === 'error').length,
     }
-  }, [cards, phase])
-  const allComplete = cards.length > 0 && cards.every((c) => c.status === 'complete')
+  }, [phase, translationCards])
+  const allComplete =
+    translationCards.length > 0 &&
+    translationCards.every((card) => card.status === 'complete')
 
   return {
     configStatus,
@@ -609,6 +783,7 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
     start,
     restoreSession,
     retry,
+    retryAll,
     dismissError,
   }
 }

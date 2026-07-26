@@ -124,6 +124,32 @@ describe('chatCompletion', () => {
       const resp = result as ChatCompletionResponse;
       expect(resp.content).toBe('Echo this back');
     });
+
+    it('forwards an explicit required tool choice', async () => {
+      llm.setBehavior('test-model', { behavior: 'non_stream' });
+
+      await chatCompletion(endpoint, makeRequest({
+        tools: [{
+          type: 'function',
+          function: {
+            name: 'call_agents',
+            parameters: { type: 'object' },
+          },
+        }],
+        toolChoice: {
+          type: 'function',
+          function: { name: 'call_agents' },
+        },
+      }));
+
+      const body = llm.getRequests()[0]?.body as {
+        tool_choice?: unknown
+      };
+      expect(body.tool_choice).toEqual({
+        type: 'function',
+        function: { name: 'call_agents' },
+      });
+    });
   });
 
   // =========================================================================
@@ -945,6 +971,58 @@ describe('chatCompletion', () => {
       };
     }
 
+    async function startSlowReasoningStreamServer(): Promise<{
+      url: string;
+      close: () => Promise<void>;
+    }> {
+      const http = await import('http');
+      const timers = new Set<ReturnType<typeof setTimeout>>();
+      const server = http.createServer((_req, res) => {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+        });
+        let index = 0;
+        const send = () => {
+          if (res.destroyed) return;
+          if (index < 4) {
+            const payload = {
+              choices: [{
+                index: 0,
+                delta: { reasoning_content: `private-${index}` },
+                finish_reason: null,
+              }],
+            };
+            res.write(`data: ${JSON.stringify(payload)}\n\n`);
+            index++;
+            const timer = setTimeout(send, 60);
+            timers.add(timer);
+            return;
+          }
+          res.write(`data: ${JSON.stringify({
+            choices: [{
+              index: 0,
+              delta: { content: 'Visible result' },
+              finish_reason: null,
+            }],
+          })}\n\n`);
+          res.write('data: [DONE]\n\n');
+          res.end();
+        };
+        send();
+      });
+      await new Promise<void>((resolve) => server.listen(0, () => resolve()));
+      const addr = server.address() as { port: number };
+      return {
+        url: `http://localhost:${addr.port}`,
+        close: () => {
+          for (const timer of timers) clearTimeout(timer);
+          return new Promise<void>((resolve) => server.close(() => resolve()));
+        },
+      };
+    }
+
     it('nonStreamCompletion with reasoning_content → only content returned', async () => {
       const srv = await startReasoningNonStreamServer('reasoning_content');
       try {
@@ -1031,6 +1109,50 @@ describe('chatCompletion', () => {
             expect((e as { content: string }).content).not.toContain('Internal reasoning');
           }
         }
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it('reasoning activity keeps a stream alive past the idle timeout', async () => {
+      const srv = await startSlowReasoningStreamServer();
+      const activity: number[] = [];
+      try {
+        const result = await chatCompletion(
+          { baseUrl: srv.url, apiKey: 'sk-test' },
+          makeRequest({
+            stream: true,
+            timeoutMs: 100,
+            maxDurationMs: 2_000,
+            onActivity: () => activity.push(Date.now()),
+          }),
+        );
+        const events = await collectStreamEvents(
+          result as AsyncIterable<LLMStreamEvent>,
+        );
+        const done = events.find((event) => event.type === 'done');
+        expect(done).toMatchObject({ type: 'done', content: 'Visible result' });
+        expect(activity.length).toBeGreaterThanOrEqual(4);
+        expect(JSON.stringify(events)).not.toContain('private-');
+      } finally {
+        await srv.close();
+      }
+    });
+
+    it('enforces an absolute hard cap even when reasoning stays active', async () => {
+      const srv = await startSlowReasoningStreamServer();
+      try {
+        const result = await chatCompletion(
+          { baseUrl: srv.url, apiKey: 'sk-test' },
+          makeRequest({
+            stream: true,
+            timeoutMs: 100,
+            maxDurationMs: 150,
+          }),
+        );
+        await expect(
+          collectStreamEvents(result as AsyncIterable<LLMStreamEvent>),
+        ).rejects.toThrow('maximum duration');
       } finally {
         await srv.close();
       }

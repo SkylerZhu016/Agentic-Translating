@@ -29,6 +29,27 @@ export const translationConstraintsSchema = z.object({
   forbiddenTerms: z.array(z.string()).optional(),
   requiredTerms: z.array(z.string()).optional(),
   rhymeEvidence: z.boolean().optional(),
+  poetryMode: z.enum(['auto', 'on', 'off']).optional(),
+  poetryTargetForm: z.enum([
+    'preserve',
+    'free_verse',
+    'classical',
+    'regulated',
+    'custom',
+  ]).optional(),
+  chineseRhymeSystem: z.enum(['mandarin', 'pingshui', 'dual']).optional(),
+  englishRhymeMode: z.enum(['natural', 'exact', 'near', 'none']).optional(),
+  rhymePositions: z.enum([
+    'auto',
+    'even_lines',
+    'all_lines',
+    'custom',
+  ]).optional(),
+  customRhymeLines: z.array(z.number().int().positive()).optional(),
+  rhymeScheme: z.string().max(128).optional(),
+  firstLineRhyme: z.enum(['auto', 'yes', 'no']).optional(),
+  rhymeChange: z.enum(['source', 'single', 'by_stanza', 'custom']).optional(),
+  poetryPriority: z.enum(['meaning', 'balanced', 'form']).optional(),
 })
 
 export const workflowPresetContractSchema = z.object({

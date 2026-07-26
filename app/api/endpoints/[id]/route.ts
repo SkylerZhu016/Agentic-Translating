@@ -64,6 +64,10 @@ export async function PUT(
       id,
       name: parsed.data.name ?? existing.name,
       base_url: parsed.data.base_url ?? existing.base_url,
+      chat_completions_path:
+        parsed.data.chat_completions_path ??
+        existing.chat_completions_path ??
+        '/v1/chat/completions',
       api_key:
         parsed.data.api_key == null || parsed.data.api_key === ''
           ? existing.api_key

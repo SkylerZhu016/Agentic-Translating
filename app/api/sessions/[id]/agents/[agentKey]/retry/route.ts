@@ -92,6 +92,8 @@ export async function POST(
     name: targetAgent.name,
     endpoint: {
       baseUrl: endpointConfig.base_url,
+      chatCompletionsPath:
+        endpointConfig.chat_completions_path ?? '/v1/chat/completions',
       apiKey: endpointConfig.api_key,
     },
     model: targetAgent.model,

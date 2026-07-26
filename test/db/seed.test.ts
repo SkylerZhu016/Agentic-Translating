@@ -84,6 +84,35 @@ describe('seed — built-in prompt templates', () => {
     expect(builtins.length).toBe(5)
   })
 
+  it('official upgrades never modify a user-defined Agent', () => {
+    seed(db)
+    const archetypeId = 'user-agent-preservation-test'
+    const variantId = `${archetypeId}.en_to_zh.1`
+    db.prepare(`
+      INSERT INTO agent_archetypes
+        (id, slug, display_name_zh, category, tags_json, is_builtin)
+      VALUES (?, ?, ?, 'expression', '["user"]', 0)
+    `).run(archetypeId, archetypeId, '用户 Agent')
+    db.prepare(`
+      INSERT INTO agent_direction_variants
+        (id, archetype_id, direction, catalog_name, catalog_description,
+         role_prompt, prompt_language, prompt_version, enabled,
+         endpoint_override_id, model_override, sort_order)
+      VALUES (?, ?, 'en_to_zh', '用户 Agent', '用户说明',
+              '用户自己的提示词', 'zh', 7, 0, NULL, 'user-model', 1234)
+    `).run(variantId, archetypeId)
+    const before = db.prepare(
+      'SELECT * FROM agent_direction_variants WHERE id=?',
+    ).get(variantId)
+
+    seed(db)
+
+    const after = db.prepare(
+      'SELECT * FROM agent_direction_variants WHERE id=?',
+    ).get(variantId)
+    expect(after).toEqual(before)
+  })
+
   it('covers all 5 required kinds', () => {
     seed(db)
     const repos = createRepositories(db)

@@ -52,6 +52,24 @@ async function seedBaselineConfig(
     })
     expect(agRes.status()).toBe(201)
   }
+  const binding = (model: string) => ({
+    endpointId: ep.id,
+    model,
+    contextWindow: 128000,
+  })
+  const profile = await request.put('/api/model-profiles/en_to_zh', {
+    data: {
+      defaultWorker: binding(models[0]),
+      mainAgent: binding('main-model'),
+      editingAgent: binding(models[1] ?? models[0]),
+    },
+  })
+  expect(profile.status()).toBe(200)
+  await setMockBehavior(request, {
+    behavior: 'tool_call',
+    model: 'main-model',
+    stream: true,
+  })
 }
 
 test.describe('AC18 — streaming agent grid', () => {
@@ -72,29 +90,38 @@ test.describe('AC18 — streaming agent grid', () => {
     await byTid(page, TID.translate.sourceInput).fill(SOURCE_TEXT)
     await byTid(page, TID.translate.translateButton).click()
 
-    await expect(byTid(page, TID.translate.agentStreamCard)).toHaveCount(2, {
+    const candidateCards = page.locator(
+      `${tid(TID.translate.agentStreamCard)}[data-agent-kind="translation"]`,
+    )
+    await expect(candidateCards).toHaveCount(2, {
       timeout: 10_000,
     })
 
     // Each card should transition through streaming → complete.
     // Web-first: wait for both mandatory fallback candidates.
     await expect(
-      byTid(page, TID.translate.agentStatusComplete),
+      candidateCards.locator(tid(TID.translate.agentStatusComplete)),
     ).toHaveCount(2, { timeout: 30_000 })
 
     // No error badges should be present
-    await expect(byTid(page, TID.translate.agentStatusError)).toHaveCount(0)
+    await expect(
+      candidateCards.locator(tid(TID.translate.agentStatusError)),
+    ).toHaveCount(0)
+    await expect(page.getByText('v1 · 主 Agent 成稿')).toBeVisible({
+      timeout: 30_000,
+    })
 
     await evidenceScreenshot(page, 'translate-all-complete')
   })
 
   test('cards show streaming badge while in flight', async ({ page, request }) => {
+    test.setTimeout(60_000)
     // Slower stream so the streaming badge is observable
     for (const model of ['gpt-4o', 'claude-3.7', 'gemini-2.0']) {
       await setMockBehavior(request, {
         behavior: 'stream',
         model,
-        delayMs: 100,
+        delayMs: 250,
       })
     }
 
@@ -104,18 +131,24 @@ test.describe('AC18 — streaming agent grid', () => {
     await byTid(page, TID.translate.sourceInput).fill(SOURCE_TEXT)
     await byTid(page, TID.translate.translateButton).click()
 
-    await expect(byTid(page, TID.translate.agentStreamCard)).toHaveCount(2, {
-      timeout: 10_000,
+    const candidateCards = page.locator(
+      `${tid(TID.translate.agentStreamCard)}[data-agent-kind="translation"]`,
+    )
+    await expect(candidateCards).toHaveCount(2, {
+      timeout: 30_000,
     })
 
     // At least one streaming badge should appear before any complete badge
-    await expect(byTid(page, TID.translate.agentStatusStreaming).first()).toBeVisible({
+    await expect(candidateCards.locator(tid(TID.translate.agentStatusStreaming)).first()).toBeVisible({
       timeout: 10_000,
     })
     await evidenceScreenshot(page, 'translate-streaming-in-flight')
 
     // Eventually all complete
-    await expect(byTid(page, TID.translate.agentStatusComplete)).toHaveCount(2, {
+    await expect(candidateCards.locator(tid(TID.translate.agentStatusComplete))).toHaveCount(2, {
+      timeout: 30_000,
+    })
+    await expect(page.getByText('v1 · 主 Agent 成稿')).toBeVisible({
       timeout: 30_000,
     })
   })

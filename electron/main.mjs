@@ -11,6 +11,7 @@ import {
 } from 'electron'
 import { spawn } from 'child_process'
 import {
+  copyFileSync,
   createWriteStream,
   existsSync,
   mkdirSync,
@@ -19,6 +20,7 @@ import {
   writeFileSync,
 } from 'fs'
 import { randomBytes } from 'crypto'
+import { createRequire } from 'module'
 import path from 'path'
 import JSZip from 'jszip'
 
@@ -29,6 +31,7 @@ let allowQuit = false
 const port = 3210
 const MAX_BATCH_FILES = 500
 const MAX_BATCH_FILE_BYTES = 5 * 1024 * 1024
+const require = createRequire(import.meta.url)
 
 if (!app.requestSingleInstanceLock()) {
   app.quit()
@@ -47,20 +50,146 @@ function appRoot() {
     : path.join(process.cwd(), '.next', 'standalone')
 }
 
-function ensureSecret(userData) {
-  const secretFile = path.join(userData, 'desktop-secret.bin')
-  if (!safeStorage.isEncryptionAvailable()) {
-    throw new Error('Windows safeStorage is unavailable; cannot protect BYOK credentials.')
+function backupRecoveryFiles(userData) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+  const backupDirectory = path.join(userData, 'recovery-backups', stamp)
+  mkdirSync(backupDirectory, { recursive: true })
+  for (const name of [
+    'desktop-secret.bin',
+    'app.db',
+    'app.db-shm',
+    'app.db-wal',
+  ]) {
+    const source = path.join(userData, name)
+    if (existsSync(source)) {
+      copyFileSync(source, path.join(backupDirectory, name))
+    }
   }
-  if (existsSync(secretFile)) {
-    return safeStorage.decryptString(
-      Buffer.from(readFileSync(secretFile, 'utf8'), 'base64'),
-    )
+  return backupDirectory
+}
+
+function scrubSnapshotCredentials(value) {
+  if (Array.isArray(value)) return value.map(scrubSnapshotCredentials)
+  if (!value || typeof value !== 'object') return value
+  const output = {}
+  for (const [key, child] of Object.entries(value)) {
+    output[key] =
+      key === 'apiKey' || key === 'api_key'
+        ? ''
+        : scrubSnapshotCredentials(child)
+  }
+  return output
+}
+
+function resetCredentialsPreservingData(userData) {
+  const backupDirectory = backupRecoveryFiles(userData)
+  const databaseFile = path.join(userData, 'app.db')
+  if (existsSync(databaseFile)) {
+    const Database = require('better-sqlite3')
+    const db = new Database(databaseFile)
+    try {
+      db.transaction(() => {
+        const endpointTable = db.prepare(
+          "SELECT 1 FROM sqlite_master WHERE type='table' AND name='endpoints'",
+        ).get()
+        if (endpointTable) db.prepare("UPDATE endpoints SET api_key=''").run()
+        const sessionTable = db.prepare(
+          "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'",
+        ).get()
+        if (sessionTable) {
+          const rows = db.prepare(
+            'SELECT id, config_snapshot FROM sessions',
+          ).all()
+          const update = db.prepare(
+            'UPDATE sessions SET config_snapshot=? WHERE id=?',
+          )
+          for (const row of rows) {
+            try {
+              const snapshot = JSON.parse(row.config_snapshot)
+              update.run(
+                JSON.stringify(scrubSnapshotCredentials(snapshot)),
+                row.id,
+              )
+            } catch {
+              // Preserve malformed historical snapshots byte-for-byte.
+            }
+          }
+        }
+      })()
+    } finally {
+      db.close()
+    }
   }
   const secret = randomBytes(32).toString('hex')
   const encrypted = safeStorage.encryptString(secret)
-  writeFileSync(secretFile, encrypted.toString('base64'), { mode: 0o600 })
-  return secret
+  writeFileSync(
+    path.join(userData, 'desktop-secret.bin'),
+    encrypted.toString('base64'),
+    { mode: 0o600 },
+  )
+  return { secret, backupDirectory }
+}
+
+function ensureSecret(userData) {
+  const secretFile = path.join(userData, 'desktop-secret.bin')
+  for (;;) {
+    if (!safeStorage.isEncryptionAvailable()) {
+      const unavailable = dialog.showMessageBoxSync({
+        type: 'error',
+        title: '无法使用 Windows 凭据保护',
+        message: '系统暂时无法提供安全存储，应用不会降级为明文保存密钥。',
+        detail: '可以重试、打开数据目录检查环境，或退出应用。',
+        buttons: ['重试', '打开数据目录', '退出'],
+        defaultId: 0,
+        cancelId: 2,
+      })
+      if (unavailable === 1) {
+        void shell.openPath(userData)
+        continue
+      }
+      if (unavailable === 2) throw new Error('safeStorage_unavailable')
+      continue
+    }
+    if (existsSync(secretFile)) {
+      try {
+        return safeStorage.decryptString(
+          Buffer.from(readFileSync(secretFile, 'utf8'), 'base64'),
+        )
+      } catch (error) {
+        const response = dialog.showMessageBoxSync({
+          type: 'warning',
+          title: '本地凭据无法解密',
+          message: '翻译历史仍然完好，但已保存的 API Key 当前无法恢复。',
+          detail:
+            '“保留数据并重置凭据”会先备份数据库和损坏密钥，只清空无法恢复的 API Key，不删除会话、译文或版本历史。',
+          buttons: ['重试', '打开数据目录', '保留数据并重置凭据', '退出'],
+          defaultId: 0,
+          cancelId: 3,
+        })
+        if (response === 1) {
+          void shell.openPath(userData)
+          continue
+        }
+        if (response === 2) {
+          const recovered = resetCredentialsPreservingData(userData)
+          dialog.showMessageBoxSync({
+            type: 'info',
+            title: '凭据已重置',
+            message: '翻译历史已保留，请重新填写 API Key。',
+            detail: `恢复备份：${recovered.backupDirectory}`,
+            buttons: ['继续启动'],
+          })
+          return recovered.secret
+        }
+        if (response === 3) throw error
+        continue
+      }
+    }
+    const secret = randomBytes(32).toString('hex')
+    const encrypted = safeStorage.encryptString(secret)
+    writeFileSync(secretFile, encrypted.toString('base64'), { mode: 0o600 })
+    return secret
+  }
 }
 
 function isSupportedTextFile(filePath) {
@@ -131,7 +260,7 @@ function safeZipRelativePath(value) {
 async function waitForServer() {
   for (let attempt = 0; attempt < 120; attempt++) {
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/api/settings`)
+      const response = await fetch(`http://127.0.0.1:${port}/api/health/ready`)
       if (response.ok) return
     } catch {
       // Embedded server is still starting.
@@ -164,6 +293,7 @@ function startServer() {
       NODE_ENV: 'production',
       AGENTIC_DESKTOP: '1',
       AGENTIC_DATA_DIR: userData,
+      AGENTIC_MIGRATIONS_DIR: path.join(root, 'migrations'),
       AGENTIC_SECRET_KEY: ensureSecret(userData),
       NODE_PATH: app.isPackaged
         ? path.join(process.resourcesPath, 'app.asar', 'node_modules')
@@ -228,15 +358,13 @@ function ensureTray() {
 }
 
 async function createWindow() {
-  startServer()
-  await waitForServer()
   mainWindow = new BrowserWindow({
     width: 1320,
     height: 880,
     minWidth: 880,
     minHeight: 640,
     backgroundColor: '#f7f4ec',
-    show: false,
+    show: true,
     webPreferences: {
       preload: path.join(import.meta.dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -244,7 +372,27 @@ async function createWindow() {
       sandbox: true,
     },
   })
-  mainWindow.once('ready-to-show', () => mainWindow.show())
+  await mainWindow.loadURL(
+    `data:text/html;charset=utf-8,${encodeURIComponent(`
+      <!doctype html>
+      <html lang="zh-CN">
+        <meta charset="utf-8">
+        <style>
+          html,body{height:100%;margin:0;background:#f7f4ec;color:#26231f}
+          body{display:grid;place-items:center;font-family:system-ui,sans-serif}
+          main{text-align:center}
+          .seal{display:inline-grid;place-items:center;width:56px;height:56px;border:1px solid #26231f;border-radius:10px;font-family:serif;font-size:28px}
+          h1{font:600 20px Georgia,serif;letter-spacing:.04em;margin:18px 0 8px}
+          p{font-size:13px;color:#777067}
+          i{display:inline-block;width:6px;height:6px;border-radius:50%;background:#26231f;animation:pulse 1.2s infinite}
+          @keyframes pulse{50%{opacity:.25}}
+        </style>
+        <main><div class="seal">译</div><h1>Agentic Translating</h1><p><i></i> 正在准备本地工作台……</p></main>
+      </html>
+    `)}`,
+  )
+  startServer()
+  await waitForServer()
   mainWindow.on('close', async (event) => {
     if (allowQuit || !(await hasRunningWork())) return
     event.preventDefault()

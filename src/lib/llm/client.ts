@@ -12,8 +12,9 @@
 // Wave 2 Task 8 — spec lines 641-702
 // ---------------------------------------------------------------------------
 
-import { AGENT_TIMEOUT_MS } from '../constants';
+import { AGENT_MAX_DURATION_MS, AGENT_TIMEOUT_MS } from '../constants';
 import { parseSSEChunk } from '../contracts/sse';
+import { resolveChatCompletionsUrl } from './endpoint-url';
 
 // =============================================================================
 // Error hierarchy
@@ -123,8 +124,21 @@ export interface ChatCompletionRequest {
       parameters: Record<string, unknown>;
     };
   }>;
+  toolChoice?:
+    | 'auto'
+    | 'required'
+    | 'none'
+    | {
+        type: 'function';
+        function: { name: string };
+      };
   stream?: boolean;
+  /** Maximum silence between response chunks. This is not a total-duration cap. */
   timeoutMs?: number;
+  /** Absolute duration cap for the whole request. */
+  maxDurationMs?: number;
+  /** Heartbeat for response activity, including reasoning chunks that are discarded. */
+  onActivity?: () => void;
   signal?: AbortSignal;
 }
 
@@ -190,6 +204,93 @@ interface OpenAIErrorBody {
     type?: string;
     code?: string;
   };
+}
+
+type AbortReason = 'idle_timeout' | 'max_duration' | 'external' | null;
+
+interface RequestGuard {
+  signal: AbortSignal;
+  reason: () => AbortReason;
+  touch: () => void;
+  cleanup: () => void;
+}
+
+function createRequestGuard(
+  idleTimeoutMs: number,
+  maxDurationMs: number,
+  externalSignal?: AbortSignal,
+): RequestGuard {
+  const controller = new AbortController();
+  let abortReason: AbortReason = null;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  let maxTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const abort = (reason: Exclude<AbortReason, null>) => {
+    if (controller.signal.aborted) return;
+    abortReason = reason;
+    controller.abort();
+  };
+  const touch = () => {
+    if (controller.signal.aborted) return;
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => abort('idle_timeout'), idleTimeoutMs);
+  };
+  const onExternalAbort = () => abort('external');
+
+  if (externalSignal?.aborted) {
+    abort('external');
+  } else {
+    externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
+    touch();
+    maxTimer = setTimeout(() => abort('max_duration'), maxDurationMs);
+  }
+
+  return {
+    signal: controller.signal,
+    reason: () => abortReason,
+    touch,
+    cleanup: () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      if (maxTimer) clearTimeout(maxTimer);
+      externalSignal?.removeEventListener('abort', onExternalAbort);
+    },
+  };
+}
+
+function throwGuardAbort(reason: AbortReason): never {
+  if (reason === 'idle_timeout') {
+    throw new TimeoutError('LLM request received no activity before the idle timeout');
+  }
+  if (reason === 'max_duration') {
+    throw new TimeoutError('LLM request exceeded the maximum duration');
+  }
+  throw new AbortedError();
+}
+
+async function readResponseText(
+  response: Response,
+  onActivity: () => void,
+): Promise<string> {
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      onActivity();
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+    return text;
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // Already released.
+    }
+  }
 }
 
 /**
@@ -293,11 +394,12 @@ function mapNetworkError(error: unknown): never {
 // =============================================================================
 
 async function nonStreamCompletion(
-  endpoint: { baseUrl: string; apiKey: string },
+  endpoint: { baseUrl: string; apiKey: string; chatCompletionsPath?: string },
   request: ChatCompletionRequest,
   signal: AbortSignal,
+  onActivity: () => void,
 ): Promise<ChatCompletionResponse> {
-  const response = await fetch(`${endpoint.baseUrl}/v1/chat/completions`, {
+  const response = await fetch(resolveChatCompletionsUrl(endpoint), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -307,12 +409,14 @@ async function nonStreamCompletion(
       model: request.model,
       messages: request.messages,
       ...(request.tools ? { tools: request.tools } : {}),
+      ...(request.toolChoice ? { tool_choice: request.toolChoice } : {}),
       stream: false,
     }),
     signal,
   });
 
-  const bodyText = await response.text();
+  onActivity();
+  const bodyText = await readResponseText(response, onActivity);
 
   if (!response.ok) {
     await normalizeError(response, bodyText);
@@ -358,11 +462,12 @@ async function nonStreamCompletion(
 // =============================================================================
 
 async function* streamCompletion(
-  endpoint: { baseUrl: string; apiKey: string },
+  endpoint: { baseUrl: string; apiKey: string; chatCompletionsPath?: string },
   request: ChatCompletionRequest,
   signal: AbortSignal,
+  onActivity: () => void,
 ): AsyncIterable<LLMStreamEvent> {
-  const response = await fetch(`${endpoint.baseUrl}/v1/chat/completions`, {
+  const response = await fetch(resolveChatCompletionsUrl(endpoint), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -372,15 +477,17 @@ async function* streamCompletion(
       model: request.model,
       messages: request.messages,
       ...(request.tools ? { tools: request.tools } : {}),
+      ...(request.toolChoice ? { tool_choice: request.toolChoice } : {}),
       stream: true,
     }),
     signal,
   });
+  onActivity();
 
   // Check for non-stream fallback: server returned JSON instead of SSE
   const contentType = response.headers.get('content-type') ?? '';
   if (contentType.includes('application/json')) {
-    const bodyText = await response.text();
+    const bodyText = await readResponseText(response, onActivity);
 
     if (!response.ok) {
       await normalizeError(response, bodyText);
@@ -431,7 +538,7 @@ async function* streamCompletion(
   // Non-ok response with non-JSON content — try to read body for error info
   if (!response.ok) {
     // Try to read error body
-    const bodyText = await response.text();
+    const bodyText = await readResponseText(response, onActivity);
     await normalizeError(response, bodyText);
   }
 
@@ -456,6 +563,7 @@ async function* streamCompletion(
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      onActivity();
 
       const chunk = decoder.decode(value, { stream: true });
       rawBuffer += chunk;
@@ -613,45 +721,50 @@ async function* streamCompletion(
  *   - AbortedError — non-retryable
  */
 export async function chatCompletion(
-  endpoint: { baseUrl: string; apiKey: string },
+  endpoint: { baseUrl: string; apiKey: string; chatCompletionsPath?: string },
   request: ChatCompletionRequest,
 ): Promise<ChatCompletionResponse | AsyncIterable<LLMStreamEvent>> {
-  // Build combined abort signal
-  const timeoutMs = request.timeoutMs ?? AGENT_TIMEOUT_MS;
-  const timeoutSignal = AbortSignal.timeout(timeoutMs);
-
-  let signal: AbortSignal;
-  if (request.signal) {
-    signal = AbortSignal.any([timeoutSignal, request.signal]);
-  } else {
-    signal = timeoutSignal;
-  }
+  const idleTimeoutMs = request.timeoutMs ?? AGENT_TIMEOUT_MS;
+  const maxDurationMs = request.maxDurationMs ?? AGENT_MAX_DURATION_MS;
+  const guard = createRequestGuard(
+    idleTimeoutMs,
+    Math.max(idleTimeoutMs, maxDurationMs),
+    request.signal,
+  );
+  const onActivity = () => {
+    guard.touch();
+    request.onActivity?.();
+  };
 
   try {
     if (request.stream) {
-      const iterable = streamCompletion(endpoint, request, signal);
-      return wrapAsyncIterable(iterable, signal, timeoutSignal, request.signal);
+      const iterable = streamCompletion(
+        endpoint,
+        request,
+        guard.signal,
+        onActivity,
+      );
+      return wrapAsyncIterable(iterable, guard);
     }
 
-    return await nonStreamCompletion(endpoint, request, signal);
+    return await nonStreamCompletion(
+      endpoint,
+      request,
+      guard.signal,
+      onActivity,
+    );
   } catch (error: unknown) {
     // If already an LLMError, re-throw as-is
     if (error instanceof LLMError) {
       throw error;
     }
 
-    // Check if the signal was aborted (distinguish timeout vs external)
-    if (signal.aborted) {
-      if (timeoutSignal.aborted && (!request.signal || !request.signal.aborted)) {
-        // Only the timeout fired
-        throw new TimeoutError();
-      }
-      // External signal or both — treat as aborted
-      throw new AbortedError();
-    }
+    if (guard.signal.aborted) throwGuardAbort(guard.reason());
 
     // Network/fetch errors
-    mapNetworkError(error);
+    return mapNetworkError(error);
+  } finally {
+    if (!request.stream) guard.cleanup();
   }
 }
 
@@ -665,9 +778,7 @@ export async function chatCompletion(
  */
 async function* wrapAsyncIterable(
   source: AsyncIterable<LLMStreamEvent>,
-  combinedSignal: AbortSignal,
-  timeoutSignal: AbortSignal,
-  externalSignal?: AbortSignal,
+  guard: RequestGuard,
 ): AsyncIterable<LLMStreamEvent> {
   try {
     for await (const event of source) {
@@ -684,15 +795,12 @@ async function* wrapAsyncIterable(
       error instanceof DOMException ||
       (error instanceof Error && error.name === 'AbortError')
     ) {
-      if (
-        timeoutSignal.aborted &&
-        (!externalSignal || !externalSignal.aborted)
-      ) {
-        throw new TimeoutError();
-      }
+      if (guard.signal.aborted) throwGuardAbort(guard.reason());
       throw new AbortedError();
     }
 
     mapNetworkError(error);
+  } finally {
+    guard.cleanup();
   }
 }

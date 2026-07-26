@@ -54,7 +54,7 @@ export interface SessionContext {
  * tests to inject a mock without vi.mock.
  */
 export type LLMCaller = (
-  endpoint: { baseUrl: string; apiKey: string },
+  endpoint: { baseUrl: string; apiKey: string; chatCompletionsPath?: string },
   request: ChatCompletionRequest,
 ) => Promise<ChatCompletionResponse | AsyncIterable<LLMStreamEvent>>;
 

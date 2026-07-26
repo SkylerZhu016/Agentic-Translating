@@ -48,12 +48,7 @@ function toView(message: ChatMessage): ChatMessageView {
 
 /** 会话全量中取最新版本文本 */
 function latestTextOf(full: SessionFullResponse | null): string {
-  if (!full) return ''
-  const latest = (full.versions ?? []).reduce<FinalVersion | null>(
-    (max, v) => (v.version_no > (max?.version_no ?? 0) ? v : max),
-    null,
-  )
-  return latest?.text ?? ''
+  return full?.finalVersion?.text ?? ''
 }
 
 // ── SSE data 载荷（与任务 19 服务端实现对齐）──────────────────
@@ -80,14 +75,17 @@ export function EditorSection() {
 
   // ── 派生：当前版本 / 当前文本 ───────────────────────────────
   const currentVersion = useMemo(
-    () => versions.reduce<FinalVersion | null>((max, v) => (v.version_no > (max?.version_no ?? 0) ? v : max), null),
-    [versions],
+    () => data?.finalVersion ?? null,
+    [data?.finalVersion],
   )
   const currentText = currentVersion?.text ?? ''
   const currentVersionNo = currentVersion?.version_no ?? null
 
   const readonly = sessionState === 'coordinating'
-  const canChat = sessionId != null && (sessionState === 'assembled' || sessionState === 'refining')
+  const canChat =
+    sessionId != null &&
+    currentVersion != null &&
+    (sessionState === 'assembled' || sessionState === 'refining')
   const disabledHint = readonly
     ? '统筹进行中，暂不可对话'
     : sessionState === 'done'
@@ -286,6 +284,11 @@ export function EditorSection() {
       >
         <FinalTextPanel
           text={currentText}
+          emptyHint={
+            data
+              ? `最终译文将在工作流正式提交后显示。当前状态：${data.session.state}`
+              : '创建任务后，正式提交的译文将在此显示。'
+          }
           readonly={readonly}
           busy={streaming}
           highlight={highlight}
@@ -306,7 +309,11 @@ export function EditorSection() {
         </Card>
 
         <Card overline="Versions" title="版本历史" padded={false}>
-          <VersionHistory versions={versions} currentVersionNo={currentVersionNo} onRestore={restoreVersion} />
+          <VersionHistory
+            versions={currentVersion ? versions : []}
+            currentVersionNo={currentVersionNo}
+            onRestore={restoreVersion}
+          />
           <RevisionEvidence
             sessionId={sessionId}
             patches={data?.patches ?? []}

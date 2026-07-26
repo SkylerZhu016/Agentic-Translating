@@ -23,6 +23,7 @@ import { encodeSSE } from '@/src/lib/contracts/sse'
 import type { ConfigSnapshot, SessionState } from '@/src/lib/contracts/types'
 import { createHash, randomUUID } from 'crypto'
 import { buildDiffSpans } from '@/src/lib/editing/diff-spans'
+import { decryptSecret } from '@/src/lib/security/secrets'
 
 // =============================================================================
 // Types
@@ -53,8 +54,38 @@ function buildUserMessage(body: ChatRequestBody): string {
   return body.message
 }
 
+export function expectedStrictReplacement(
+  message: string,
+  currentText: string,
+): string | null {
+  const strictScope =
+    /(?:只|仅|其余.{0,8}不变|其他.{0,8}不变|\bonly\b|leave .{0,24} unchanged)/iu
+  const replacementIntent = /(?:改为|替换为|换成|\breplace\b.{0,80}\bwith\b)/iu
+  if (!strictScope.test(message) || !replacementIntent.test(message)) {
+    return null
+  }
+  const quoted = [
+    ...message.matchAll(/[“"]([^”"]+)[”"]/gu),
+  ].map((match) => match[1])
+  if (quoted.length !== 2) return null
+  const [oldText, newText] = quoted
+  const first = currentText.indexOf(oldText)
+  if (
+    first < 0 ||
+    currentText.indexOf(oldText, first + oldText.length) >= 0
+  ) {
+    return null
+  }
+  return (
+    currentText.slice(0, first) +
+    newText +
+    currentText.slice(first + oldText.length)
+  )
+}
+
 function resolveChatConfig(snapshot: ConfigSnapshot): {
   baseUrl: string
+  chatCompletionsPath?: string
   apiKey: string
   model: string
 } | null {
@@ -66,7 +97,9 @@ function resolveChatConfig(snapshot: ConfigSnapshot): {
     if (endpoint) {
       return {
         baseUrl: endpoint.baseUrl,
-        apiKey: endpoint.apiKey,
+        chatCompletionsPath:
+          endpoint.chatCompletionsPath ?? '/v1/chat/completions',
+        apiKey: decryptSecret(endpoint.apiKey),
         model: editingBinding.model,
       }
     }
@@ -89,7 +122,9 @@ function resolveChatConfig(snapshot: ConfigSnapshot): {
 
   return {
     baseUrl: endpointConfig.base_url,
-    apiKey: endpointConfig.api_key,
+    chatCompletionsPath:
+      endpointConfig.chat_completions_path ?? '/v1/chat/completions',
+    apiKey: decryptSecret(endpointConfig.api_key),
     model,
   }
 }
@@ -162,10 +197,9 @@ export function createHandlers(db: Database.Database) {
       )
     }
 
-    // 5. Get current text and recent messages
+    // 5. Get current text
     const latestVersion = repos.finalVersions.getLatestBySession(sessionId)
     const currentText = latestVersion?.text ?? ''
-    const recentMessages = repos.chatMessages.listBySession(sessionId)
 
     // 6. Insert user message
     const userMessageContent = buildUserMessage(body)
@@ -177,6 +211,9 @@ export function createHandlers(db: Database.Database) {
       tool_results: null,
       version_id: null,
     })
+    // Read history only after persisting this turn so the model always receives
+    // the current instruction as the latest user message.
+    const recentMessages = repos.chatMessages.listBySession(sessionId)
 
     // 7. Build chat context
     const contextMessages = buildChatContext(
@@ -271,6 +308,22 @@ export function createHandlers(db: Database.Database) {
           })
 
           if (result.ok) {
+            const strictReplacement = expectedStrictReplacement(
+              body.message,
+              currentText,
+            )
+            if (
+              result.kind === 'edited' &&
+              strictReplacement != null &&
+              (
+                appliedToolCalls.length !== 1 ||
+                result.newText !== strictReplacement
+              )
+            ) {
+              throw new Error(
+                '编辑 Agent 超出了用户明确指定的单处修改范围，正文未发生变化',
+              )
+            }
             if (didProtocolFallback) {
               enqueue(
                 encodeSSE('delta', {

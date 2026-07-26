@@ -341,6 +341,26 @@ describe('Chat SSE Route', () => {
   // ===========================================================================
 
   describe('message turn (pure discussion)', () => {
+    it('includes the current user instruction in the LLM context', async () => {
+      mockLLM.setBehavior('echo-model', { behavior: 'echo' })
+      const sid = await createAssembledSession()
+      const instruction = '本轮唯一指令：只修改这一处'
+      const req = new NextRequest(`http://localhost/api/sessions/${sid}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: instruction }),
+      })
+
+      const resp = await handlers.POST(req, {
+        params: Promise.resolve({ id: sid }),
+      })
+      await readSSEEvents(resp)
+
+      const messages = repos.chatMessages.listBySession(sid)
+      const assistant = messages.find((message) => message.role === 'assistant')
+      expect(assistant?.content).toBe(instruction)
+    })
+
     it('returns SSE stream with expected events for a message turn', async () => {
       // Configure mock LLM to return a fixed content
       mockLLM.setBehavior('echo-model', { behavior: 'json_content', jsonContent: '好的，我来帮您。' })

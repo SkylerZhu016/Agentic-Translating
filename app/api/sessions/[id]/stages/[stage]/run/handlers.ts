@@ -23,6 +23,7 @@ import { chatCompletion } from '@/src/lib/llm/client'
 import { encodeSSE } from '@/src/lib/contracts/sse'
 import type { Stage, StageOutput, TranslationResult } from '@/src/lib/contracts/types'
 import type { SessionContext, StageRunResult } from '@/src/lib/orchestration/pipeline'
+import { decryptSecret } from '@/src/lib/security/secrets'
 
 // =============================================================================
 // Constants
@@ -133,6 +134,20 @@ export function createHandlers(db: Database.Database) {
     const session = repos.sessions.getById(sessionId)
     if (!session) {
       return NextResponse.json({ error: 'Session not found' }, { status: 404 })
+    }
+    try {
+      const snapshot = JSON.parse(session.config_snapshot) as { version?: number }
+      if (snapshot.version === 3) {
+        return NextResponse.json(
+          {
+            error: 'vnext_stage_is_automatic',
+            message: '新版会话的四阶段由服务端自动顺序执行，不能调用旧手动阶段接口。',
+          },
+          { status: 409 },
+        )
+      }
+    } catch {
+      // Legacy malformed snapshots continue through the existing validation.
     }
 
     // ── 2. Guard: session state ───────────────────────────────────
@@ -253,7 +268,13 @@ export function createHandlers(db: Database.Database) {
 
     const coordinatorEndpoint = {
       baseUrl: 'baseUrl' in endpoint ? endpoint.baseUrl : endpoint.base_url,
-      apiKey: 'apiKey' in endpoint ? endpoint.apiKey : endpoint.api_key,
+      chatCompletionsPath:
+        'baseUrl' in endpoint
+          ? endpoint.chatCompletionsPath ?? '/v1/chat/completions'
+          : endpoint.chat_completions_path ?? '/v1/chat/completions',
+      apiKey: decryptSecret(
+        'apiKey' in endpoint ? endpoint.apiKey : endpoint.api_key,
+      ),
     }
     const coordinatorModel =
       snapshot.modelBindings?.mainAgent.model ||

@@ -72,6 +72,7 @@ try {
   await run(process.execPath, ['scripts/generate-icon.mjs'])
   await run(process.execPath, [npmCli, 'run', 'build'])
   await run(process.execPath, ['scripts/prepare-standalone.mjs'])
+  await run(process.execPath, ['scripts/verify-release-tree.mjs'])
 
   cpSync(path.join(root, 'package.json'), path.join(stage, 'package.json'))
   cpSync(path.join(root, 'package-lock.json'), path.join(stage, 'package-lock.json'))
@@ -113,6 +114,21 @@ try {
     [builderCli, '--projectDir', stage, '--win', 'nsis', 'portable'],
     stage,
   )
+
+  const unpackedApp = path.join(
+    stage,
+    'dist-electron',
+    'win-unpacked',
+    'resources',
+    'app',
+  )
+  if (existsSync(unpackedApp)) {
+    await run(
+      process.execPath,
+      [path.join(root, 'scripts', 'verify-release-tree.mjs'), unpackedApp],
+      root,
+    )
+  }
 
   if (existsSync(output)) rmSync(output, { recursive: true, force: true })
   cpSync(path.join(stage, 'dist-electron'), output, { recursive: true })

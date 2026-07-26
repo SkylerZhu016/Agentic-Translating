@@ -1,5 +1,7 @@
 # Agentic Translating
 
+[**中文**](docs/readme_cn.md) | [**English**](#)
+
 A bidirectional translation system for difficult translation tasks. It supports multi-model, multi-perspective deliberation and evidence-based workflows.
 
 The key difference from a general-purpose coding agent is not treating translation as just another coding task. Instead, it lets multiple roles work on the same open problem. Disagreements between candidate versions are kept as comparable evidence. The main agent decides which perspectives to call on, how to deliberate and merge them, and produces the final version through traceable text operations.
@@ -66,13 +68,13 @@ Rules:
 - The `annotation` is for user reference only.
 - The four-stage process in the product does not require strict JSON.
 
-Configuration APIs, SSE events, and tool parameters use JSON for precise system state control. This is not part of the agent content protocol. See [docs/protocol-spec.md](docs/protocol-spec.md) for the full specification.
+Configuration APIs, SSE events, and tool parameters use JSON for precise system state control. This is not part of the agent content protocol. See [docs/protocol-spec.en.md](docs/protocol-spec.en.md) for the full specification.
 
 ## Presets and Batch
 
 A preset is a reusable work contract created by the user, not a translation strategy imposed by the system. Each content modification creates a new revision. Historical sessions and batches continue to use the frozen snapshot.
 
-Batch tasks must select a valid revision. They support UTF-8 encoded `.txt` and `.md` files, 1 to 4 concurrent tasks, pause and resume, retry on failure, path mirroring, BOM and line ending preservation, and web ZIP export. See [docs/preset-and-batch.md](docs/preset-and-batch.md) for details.
+Batch tasks must select a valid revision. They support UTF-8 encoded `.txt` and `.md` files, 1 to 4 concurrent tasks, pause and resume, retry on failure, path mirroring, BOM and line ending preservation, and web ZIP export. See [docs/preset-and-batch.en.md](docs/preset-and-batch.en.md) for details.
 
 ## Desktop and Self-Hosting
 
@@ -90,7 +92,7 @@ Docker:
 docker compose up --build
 ```
 
-Production web deployments must set the `AGENTIC_SECRET_KEY` environment variable. Build, backup, and upgrade instructions are in [docs/desktop-build.md](docs/desktop-build.md).
+Production web deployments must set the `AGENTIC_SECRET_KEY` environment variable. Build, backup, and upgrade instructions are in [docs/desktop-build.en.md](docs/desktop-build.en.md).
 
 ## Protocol Experiments
 
@@ -120,13 +122,13 @@ Running experiments with real models incurs API costs. The repository does not i
 
 ## Documentation
 
-- [Agent Architecture](docs/agent-architecture.md)
-- [Bidirectional Prompts](docs/bidirectional-prompts.md)
-- [Protocol Specification](docs/protocol-spec.md)
-- [Presets and Batch](docs/preset-and-batch.md)
-- [Desktop Build and Self-Hosting](docs/desktop-build.md)
-- [Design References and License](docs/design-references.md)
-- [Technical Report](docs/technical-report.md)
+- [Agent Architecture](docs/agent-architecture.en.md)
+- [Bidirectional Prompts](docs/bidirectional-prompts.en.md)
+- [Protocol Specification](docs/protocol-spec.en.md)
+- [Presets and Batch](docs/preset-and-batch.en.md)
+- [Desktop Build and Self-Hosting](docs/desktop-build.en.md)
+- [Design References and License](docs/design-references.en.md)
+- [Technical Report](docs/technical-report.en.md)
 
 ## Data and Security
 

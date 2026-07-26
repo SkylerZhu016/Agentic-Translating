@@ -36,7 +36,7 @@ export interface ChatCallbacks {
 
 /** Parameters for a single chat turn */
 export interface RunChatTurnParams {
-  endpoint: { baseUrl: string; apiKey: string };
+  endpoint: { baseUrl: string; apiKey: string; chatCompletionsPath?: string };
   model: string;
   messages: Array<{ role: string; content: string; name?: string; tool_call_id?: string }>;
   /** The current full text being edited */
@@ -221,7 +221,7 @@ async function collectStream(
 // =============================================================================
 
 async function callWithTools(
-  endpoint: { baseUrl: string; apiKey: string },
+  endpoint: { baseUrl: string; apiKey: string; chatCompletionsPath?: string },
   model: string,
   messages: Array<{ role: string; content: string; name?: string; tool_call_id?: string }>,
   onDelta?: (text: string) => void,
@@ -243,7 +243,7 @@ async function callWithTools(
 // =============================================================================
 
 async function callJsonFence(
-  endpoint: { baseUrl: string; apiKey: string },
+  endpoint: { baseUrl: string; apiKey: string; chatCompletionsPath?: string },
   model: string,
   messages: Array<{ role: string; content: string; name?: string; tool_call_id?: string }>,
   onDelta?: (text: string) => void,

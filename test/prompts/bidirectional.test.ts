@@ -58,4 +58,31 @@ describe('bidirectional built-in catalog', () => {
     expect(bundle.workerBasePrompt).not.toContain('五言')
     expect(bundle.mainAgentSystemPrompt).not.toContain('五言')
   })
+
+  it('forbids unsupported dashes and semicolons in every built-in direction', () => {
+    for (const bundle of BUILTIN_DIRECTION_BUNDLES) {
+      expect(bundle.workerBasePrompt).toMatch(/破折号|dash/)
+      expect(bundle.workerBasePrompt).toMatch(/分号|semicolon/)
+      expect(bundle.editingPrompt).toMatch(/其他不变|requested scope/)
+    }
+    for (const variant of BUILTIN_AGENT_VARIANTS.filter(
+      (item) => item.archetypeId !== 'cultural-context',
+    )) {
+      expect(variant.rolePrompt).toMatch(/破折号|dash/)
+      expect(variant.rolePrompt).toMatch(/分号|semicolon/)
+      expect(variant.promptVersion).toBe(5)
+    }
+    const analysts = BUILTIN_AGENT_VARIANTS.filter(
+      (item) => item.archetypeId === 'cultural-context',
+    )
+    expect(analysts).toHaveLength(2)
+    expect(
+      analysts.every((item) => /专有名词|proper nouns/.test(item.rolePrompt)),
+    ).toBe(true)
+    expect(
+      analysts.every(
+        (item) => !/思维链|chain-of-thought/.test(item.rolePrompt),
+      ),
+    ).toBe(true)
+  })
 })

@@ -29,7 +29,7 @@ test.describe('bidirectional workspace switching', () => {
 
     await byTid(page, TID.direction.zhToEnButton).click()
 
-    await expect(page).toHaveURL(/\?direction=zh_to_en$/)
+    await expect(page).toHaveURL(/\?direction=zh_to_en(?:&fresh=1)?$/)
     await expect(byTid(page, TID.direction.warningDialog)).toHaveCount(0)
     await expect(byTid(page, TID.direction.zhToEnButton)).toHaveAttribute(
       'aria-pressed',
@@ -79,7 +79,12 @@ test.describe('bidirectional workspace switching', () => {
     await byTid(page, TID.direction.suppressCheckbox).check()
     await byTid(page, TID.direction.confirmButton).click()
 
-    await expect(page).toHaveURL(/\?direction=zh_to_en$/)
+    await expect(page).toHaveURL(/\?direction=zh_to_en&fresh=1$/)
+    await expect(source).toHaveValue('')
+    await expect(
+      page.getByRole('button', { name: '恢复上次草稿' }),
+    ).toBeVisible()
+    await page.getByRole('button', { name: '恢复上次草稿' }).click()
     await expect(source).toHaveValue('目标方向中已保存的草稿')
     settings = await (await request.get('/api/settings')).json()
     expect(
@@ -96,7 +101,7 @@ test.describe('bidirectional workspace switching', () => {
     await page.reload()
     await byTid(page, TID.translate.sourceInput).waitFor()
     await byTid(page, TID.direction.enToZhButton).click()
-    await expect(page).toHaveURL(/\?direction=en_to_zh$/)
+    await expect(page).toHaveURL(/\?direction=en_to_zh(?:&fresh=1)?$/)
     await expect(byTid(page, TID.direction.warningDialog)).toHaveCount(0)
   })
 

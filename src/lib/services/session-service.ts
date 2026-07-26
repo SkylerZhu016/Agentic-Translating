@@ -20,6 +20,7 @@ import type {
   TranslationDirection,
 } from '../contracts/vnext'
 import { createVNextRepositories } from '../db/vnext-repositories'
+import { createWorkspaceModelProfilesRepo } from '../db/release-config-repositories'
 import type {
   SessionState,
   ConfigSnapshot,
@@ -29,6 +30,7 @@ import type {
   FinalVersionRow,
   ChatMessageRow,
 } from '../contracts/types'
+import { encryptSecret } from '../security/secrets'
 
 // ===========================================================================
 // Custom Errors
@@ -57,6 +59,7 @@ export class InvalidCustomDirectionError extends Error {
 // ===========================================================================
 
 export interface CreateSessionInput {
+  clientRequestId?: string
   sourceText: string
   sourceLang: string
   targetLang: string
@@ -64,6 +67,7 @@ export interface CreateSessionInput {
   taskBrief?: string
   reviewMode?: ReviewMode
   presetRevisionId?: string | null
+  promptBundleRevisionId?: string | null
   allowedAgentVariantIds?: string[]
   constraints?: TranslationConstraints
 }
@@ -141,6 +145,18 @@ export function createSessionService(
       // 1. Guards
       assertSourceNonEmpty(input.sourceText)
 
+      const supportsClientRequestId = (
+        db.prepare('PRAGMA table_info(sessions)').all() as Array<{
+          name: string
+        }>
+      ).some((column) => column.name === 'client_request_id')
+      if (input.clientRequestId && supportsClientRequestId) {
+        const existing = db.prepare(
+          'SELECT * FROM sessions WHERE client_request_id=?',
+        ).get(input.clientRequestId) as SessionRow | undefined
+        if (existing) return existing
+      }
+
       const agents = repos.translatorAgents.list()
       const direction = input.direction ?? 'en_to_zh'
       const vnext = tableExists(db, 'agent_direction_variants')
@@ -154,7 +170,38 @@ export function createSessionService(
       // 2. Deep-clone current config into snapshot
       const snapshot = buildConfigSnapshot(repos)
       if (vnext) {
-        const promptBundle = vnext.directionPrompts.getLatest(direction)
+        snapshot.endpoint = snapshot.endpoint
+          ? {
+              ...snapshot.endpoint,
+              api_key: encryptSecret(snapshot.endpoint.api_key),
+            }
+          : null
+        snapshot.endpoints = snapshot.endpoints?.map((endpoint) => ({
+          ...endpoint,
+          api_key: encryptSecret(endpoint.api_key),
+        }))
+        const selectedPromptRevision = input.promptBundleRevisionId
+          ? db.prepare(
+              `SELECT r.payload_json, f.direction
+               FROM prompt_bundle_revisions r
+               JOIN prompt_bundle_families f ON f.id=r.bundle_id
+               WHERE r.id=? AND f.deleted_at IS NULL`,
+            ).get(input.promptBundleRevisionId) as
+              | { payload_json: string; direction: TranslationDirection }
+              | undefined
+          : undefined
+        if (
+          input.promptBundleRevisionId &&
+          (!selectedPromptRevision ||
+            selectedPromptRevision.direction !== direction)
+        ) {
+          throw new InvalidCustomDirectionError(
+            'Prompt bundle revision is missing or does not match the session direction.',
+          )
+        }
+        const promptBundle = selectedPromptRevision
+          ? JSON.parse(selectedPromptRevision.payload_json)
+          : vnext.directionPrompts.getLatest(direction)
         if (!promptBundle) {
           throw new Error(`Missing direction prompt bundle: ${direction}`)
         }
@@ -201,10 +248,14 @@ export function createSessionService(
           )
         }
         const endpoints = repos.endpoints.list()
+        const profile = createWorkspaceModelProfilesRepo(db).get(direction)
         const firstAgent = agents[0]
         const coordinator = repos.coordinatorConfig.get()
         const defaultWorker =
-          presetRevision?.contract.defaultWorkerBinding ?? {
+          presetRevision?.contract.defaultWorkerBinding ??
+          (profile?.defaultWorker.endpointId && profile.defaultWorker.model
+            ? profile.defaultWorker
+            : {
             endpointId:
               firstAgent?.endpoint_id ??
               coordinator?.endpoint_id ??
@@ -212,17 +263,25 @@ export function createSessionService(
               null,
             model: firstAgent?.model ?? coordinator?.model ?? '',
             contextWindow: null,
-          }
-        const mainAgent = presetRevision?.contract.mainAgentBinding ?? {
+          })
+        const mainAgent =
+          presetRevision?.contract.mainAgentBinding ??
+          (profile?.mainAgent.endpointId && profile.mainAgent.model
+            ? profile.mainAgent
+            : {
           endpointId: coordinator?.endpoint_id ?? defaultWorker.endpointId,
           model: coordinator?.model ?? defaultWorker.model,
           contextWindow: null,
-        }
-        const editingAgent = presetRevision?.contract.editingAgentBinding ?? {
+        })
+        const editingAgent =
+          presetRevision?.contract.editingAgentBinding ??
+          (profile?.editingAgent.endpointId && profile.editingAgent.model
+            ? profile.editingAgent
+            : {
           endpointId: coordinator?.chat_endpoint_id ?? mainAgent.endpointId,
           model: coordinator?.chat_model || mainAgent.model,
           contextWindow: null,
-        }
+        })
         Object.assign(snapshot, {
           version: 3 as const,
           direction,
@@ -232,15 +291,20 @@ export function createSessionService(
             id: endpoint.id,
             name: endpoint.name,
             baseUrl: endpoint.base_url,
-            apiKey: endpoint.api_key,
+            chatCompletionsPath:
+              endpoint.chat_completions_path ?? '/v1/chat/completions',
+            apiKey: encryptSecret(endpoint.api_key),
             hasApiKey: endpoint.api_key.length > 0,
             contextWindow: endpoint.context_window ?? null,
           })),
           modelBindings: { defaultWorker, mainAgent, editingAgent },
           presetRevisionSnapshot: presetRevision,
+          promptBundleRevisionId: input.promptBundleRevisionId ?? null,
           taskBrief: input.taskBrief ?? '',
-          constraints:
-            input.constraints ?? presetRevision?.contract.constraints ?? {},
+          constraints: {
+            ...(presetRevision?.contract.constraints ?? {}),
+            ...(input.constraints ?? {}),
+          },
           orchestrationPolicy: {
             teamPolicy: presetRevision?.contract.teamPolicy ?? 'dynamic',
             reviewMode:
@@ -282,6 +346,14 @@ export function createSessionService(
             review_mode: input.reviewMode ?? 'main_editor',
             preset_revision_id: input.presetRevisionId ?? null,
           })
+        }
+        if (
+          input.clientRequestId &&
+          supportsClientRequestId
+        ) {
+          db.prepare(
+            'UPDATE sessions SET client_request_id=? WHERE id=?',
+          ).run(input.clientRequestId, id)
         }
 
         for (const agent of agents) {

@@ -71,15 +71,19 @@ describe('DB Migrations — In-Memory DB', () => {
     expect(tables).toContain('text_patches')
     expect(tables).toContain('batch_jobs')
     expect(tables).toContain('batch_items')
+    expect(tables).toContain('workspace_model_profiles')
+    expect(tables).toContain('prompt_bundle_families')
+    expect(tables).toContain('prompt_bundle_revisions')
+    expect(tables).toContain('session_run_controls')
     expect(tables.length).toBeGreaterThanOrEqual(24)
   })
 
   it('is idempotent — 3x migrate → 1 version', () => {
     migrate(db); migrate(db); migrate(db)
     const version = (db.prepare('SELECT MAX(version) as v FROM migrations').get() as { v: number | null }).v
-    expect(version).toBe(4)
+    expect(version).toBe(7)
     const count = (db.prepare('SELECT COUNT(*) as c FROM migrations').get() as { c: number }).c
-    expect(count).toBe(4)
+    expect(count).toBe(7)
   })
 
   it('creates config_presets and child tables (migration 0002)', () => {
@@ -103,7 +107,7 @@ describe('DB Migrations — In-Memory DB', () => {
     migrate(db)
     const cols = db.prepare("PRAGMA table_info('endpoints')").all() as { name: string }[]
     const names = cols.map(c => c.name)
-    ;['id','name','base_url','api_key','created_at'].forEach(n => expect(names).toContain(n))
+    ;['id','name','base_url','chat_completions_path','api_key','created_at'].forEach(n => expect(names).toContain(n))
   })
 
   it('CHECK on prompt_templates.kind', () => {
@@ -182,7 +186,7 @@ describe('DB Migrations — File DB', () => {
     db2.pragma('foreign_keys = ON')
     migrate(db2)
     const v = (db2.prepare('SELECT MAX(version) as v FROM migrations').get() as { v: number | null }).v
-    expect(v).toBe(4)
+    expect(v).toBe(7)
     expect(listTables(db2)).toContain('endpoints')
     expect(listTables(db2)).toContain('config_presets')
     expect(listTables(db2)).toContain('agent_direction_variants')

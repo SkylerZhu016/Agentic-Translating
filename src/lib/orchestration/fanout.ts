@@ -34,7 +34,7 @@ import {
 export interface AgentRuntime {
   agentKey: string;
   name: string;
-  endpoint: { baseUrl: string; apiKey: string };
+  endpoint: { baseUrl: string; apiKey: string; chatCompletionsPath?: string };
   model: string;
   messages: Array<{ role: string; content: string }>;
   timeoutMs?: number;
@@ -59,6 +59,8 @@ export interface FanOutSummary {
 /** Callbacks invoked during agent execution */
 export interface FanOutCallbacks {
   onAgentStart?(agentKey: string): void;
+  /** Network activity heartbeat; reasoning text is intentionally not exposed. */
+  onAgentActivity?(agentKey: string): void;
   onToken?(agentKey: string, content: string): void;
   onAgentComplete?(agentKey: string, result: AgentResult): void;
   onAgentError?(agentKey: string, error: Error): void;
@@ -90,7 +92,7 @@ export interface RetryableError extends Error {
 
 /** LLM caller signature matching chatCompletion */
 export type LLMCaller = (
-  endpoint: { baseUrl: string; apiKey: string },
+  endpoint: { baseUrl: string; apiKey: string; chatCompletionsPath?: string },
   request: ChatCompletionRequest,
 ) => Promise<ChatCompletionResponse | AsyncIterable<LLMStreamEvent>>;
 
@@ -191,6 +193,7 @@ async function runOneAgent(
         messages: agent.messages,
         stream: true,
         timeoutMs: agent.timeoutMs ?? AGENT_TIMEOUT_MS,
+        onActivity: () => callbacks.onAgentActivity?.(agent.agentKey),
         signal,
       };
 

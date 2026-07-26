@@ -69,7 +69,12 @@ export async function POST(
         ].join('\n\n')
   try {
     const response = await chatCompletion(
-      { baseUrl: endpoint.base_url, apiKey: endpoint.api_key },
+      {
+        baseUrl: endpoint.base_url,
+        chatCompletionsPath:
+          endpoint.chat_completions_path ?? '/v1/chat/completions',
+        apiKey: endpoint.api_key,
+      },
       {
         model,
         stream: false,

@@ -31,7 +31,7 @@ function StatusBadge({ status }: { status: AgentCardState['status'] }) {
         data-testid={TID.translate.agentStatusStreaming}
         className="inline-flex items-center gap-1.5 rounded-xs border border-line-2 px-1.5 py-0.5 text-[0.6875rem] font-medium leading-4 tracking-wide text-ink"
       >
-        <span className="h-1.5 w-1.5 animate-breathe rounded-full bg-ink" aria-hidden />
+        <Spinner size="sm" />
         翻译中
       </span>
     )
@@ -74,6 +74,7 @@ export function AgentStreamCard({
     <article
       data-testid={TID.translate.agentStreamCard}
       data-agent-key={card.agentKey}
+      data-agent-kind={card.kind ?? 'translation'}
       style={{ animationDelay: `${enterDelayMs}ms` }}
       className={[
         'flex min-h-40 animate-rise flex-col rounded-md border bg-paper-raise shadow-card transition-colors duration-200',
@@ -89,6 +90,15 @@ export function AgentStreamCard({
           </span>
         </div>
         <div className="flex items-center gap-1.5">
+          {(card.attempts?.length ?? 0) > 1 && (
+            <Badge variant="subtle">尝试 {card.attempts!.length}</Badge>
+          )}
+          {card.kind === 'context_analysis' && (
+            <Badge variant="outline">前置分析</Badge>
+          )}
+          {card.kind === 'poetry_plan' && (
+            <Badge variant="outline">诗体规划</Badge>
+          )}
           {card.evidence && (
             <Badge variant={card.evidence.summary.startsWith('未发现') ? 'outline' : 'subtle'}>
               {card.evidence.summary}
@@ -133,11 +143,42 @@ export function AgentStreamCard({
             </p>
           )
         ) : (
-          <p className="text-sm leading-6 text-ink-4">
-            {card.status === 'streaming' ? '等待首个字词抵达…' : '排队等待开始…'}
-          </p>
+          card.status === 'streaming' ? (
+            <div
+              role="status"
+              aria-label={`${card.name} 正在思考`}
+              className="flex min-h-24 items-center justify-center gap-2 text-sm leading-6 text-ink-4"
+            >
+              <Spinner size="sm" />
+              <span>
+                {card.lastActivityAt
+                  ? '模型仍在工作，刚刚收到活动信号…'
+                  : '模型正在思考，等待首个字词…'}
+              </span>
+            </div>
+          ) : (
+            <p className="text-sm leading-6 text-ink-4">排队等待开始…</p>
+          )
         )}
       </div>
+      {card.status === 'complete' && card.kind === 'translation' && (
+        <div className="flex justify-end border-t border-line px-4 py-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            disabled={retryDisabled || retrying}
+            onClick={() => onRetry(card.agentKey)}
+          >
+            {retrying ? (
+              <>
+                <Spinner size="sm" /> 重刷中
+              </>
+            ) : (
+              '重刷此 Agent'
+            )}
+          </Button>
+        </div>
+      )}
       {card.status === 'complete' && (card.annotation || card.evidence) && (
         <div className="border-t border-line px-4 py-2">
           {card.annotation && (
@@ -160,6 +201,23 @@ export function AgentStreamCard({
               </p>
             </details>
           )}
+        </div>
+      )}
+      {(card.attempts?.length ?? 0) > 1 && (
+        <div className="border-t border-line px-4 py-2">
+          <details>
+            <summary className="cursor-pointer text-xs font-medium text-ink-3">
+              查看尝试记录
+            </summary>
+            <ol className="mt-2 space-y-1 text-xs leading-5 text-ink-3">
+              {card.attempts!.map((attempt, index) => (
+                <li key={attempt.id}>
+                  第 {index + 1} 次 · {attempt.model} · {attempt.status}
+                  {attempt.error ? ` · ${attempt.error}` : ''}
+                </li>
+              ))}
+            </ol>
+          </details>
         </div>
       )}
     </article>

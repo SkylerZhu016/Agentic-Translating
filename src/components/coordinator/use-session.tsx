@@ -5,7 +5,16 @@
 // 监听 session-bus 变更信号；翻译进行中轻量轮询以便完成后自动解锁统筹
 // ---------------------------------------------------------------------------
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react'
+import { useSearchParams } from 'next/navigation'
 import type {
   ChatMessageRow,
   FinalVersionRow,
@@ -23,7 +32,23 @@ export interface SessionFullResponse {
   results: TranslationResultRow[]
   stages: StageOutputRow[]
   versions: FinalVersionRow[]
+  finalVersion: FinalVersionRow | null
   messages: ChatMessageRow[]
+  invocations?: Array<{
+    id: string
+    status: string
+    model: string
+    agent_snapshot: string
+    body_output: string | null
+    error: string | null
+  }>
+  runs?: Array<{ id: string; status: string; phase: string; error: string | null }>
+  runControl?: {
+    pause_requested: number
+    candidates_stale: number
+    updated_at: string | null
+  }
+  events?: Array<{ id: number; event_type: string; payload_json: string }>
   patches?: TextPatchView[]
   final_evidence?: TranslationEvidenceReport | null
   latest_version_no: number | null
@@ -31,29 +56,36 @@ export interface SessionFullResponse {
 
 const TRANSLATING_POLL_MS = 3000
 
-export function useSessionFull() {
+interface SessionWorkspaceContextValue {
+  data: SessionFullResponse | null
+  sessionId: string | null
+  loading: boolean
+  refresh: () => Promise<SessionFullResponse | null>
+}
+
+const SessionWorkspaceContext =
+  createContext<SessionWorkspaceContextValue | null>(null)
+
+export function SessionWorkspaceProvider({
+  children,
+}: {
+  children: ReactNode
+}) {
+  const searchParams = useSearchParams()
+  const routeSessionId = searchParams.get('session')
   const [data, setData] = useState<SessionFullResponse | null>(null)
-  const [sessionId, setSessionId] = useState<string | null>(null)
+  const [sessionId, setSessionId] = useState<string | null>(routeSessionId)
   const [loading, setLoading] = useState(true)
-  const idRef = useRef<string | null>(null)
+  const idRef = useRef<string | null>(routeSessionId)
 
   const refresh = useCallback(async (): Promise<SessionFullResponse | null> => {
     try {
-      let id = idRef.current
+      const id = idRef.current
       if (!id) {
-        id =
-          typeof window === 'undefined'
-            ? null
-            : new URLSearchParams(window.location.search).get('session')
-        if (!id) {
-          idRef.current = null
-          setSessionId(null)
-          setData(null)
-          setLoading(false)
-          return null
-        }
-        idRef.current = id
-        setSessionId(id)
+        setSessionId(null)
+        setData(null)
+        setLoading(false)
+        return null
       }
 
       const res = await fetch(`/api/sessions/${id}`, { cache: 'no-store' })
@@ -78,10 +110,14 @@ export function useSessionFull() {
     }
   }, [])
 
-  // 初次装载
+  // URL 是方向与正式会话的唯一权威来源。
   useEffect(() => {
+    idRef.current = routeSessionId
+    setSessionId(routeSessionId)
+    setData(null)
+    setLoading(Boolean(routeSessionId))
     void refresh()
-  }, [refresh])
+  }, [refresh, routeSessionId])
 
   // 会话变更信号：锁定新 sessionId 并重取
   useEffect(() => {
@@ -89,22 +125,41 @@ export function useSessionFull() {
       if (detail.sessionId) {
         idRef.current = detail.sessionId
         setSessionId(detail.sessionId)
-        const url = new URL(window.location.href)
-        url.search = ''
-        url.searchParams.set('session', detail.sessionId)
-        window.history.replaceState(null, '', url)
       }
       void refresh()
     })
   }, [refresh])
 
-  // 翻译进行中轻量轮询：翻译完成后 stepper 自动解锁
+  // 服务端运行轻量轮询：断线续跑、暂停和重新成稿都不依赖旧 SSE 生命周期。
   const state = data?.session?.state
+  const hasActiveRun = data?.runs?.some(
+    (run) => run.status === 'queued' || run.status === 'running',
+  )
   useEffect(() => {
-    if (state !== 'translating' && state !== 'draft') return
+    if (
+      !hasActiveRun &&
+      state !== 'translating' &&
+      state !== 'coordinating'
+    ) return
     const timer = setInterval(() => void refresh(), TRANSLATING_POLL_MS)
     return () => clearInterval(timer)
-  }, [state, refresh])
+  }, [hasActiveRun, state, refresh])
 
-  return { data, sessionId, loading, refresh }
+  return (
+    <SessionWorkspaceContext.Provider
+      value={{ data, sessionId, loading, refresh }}
+    >
+      {children}
+    </SessionWorkspaceContext.Provider>
+  )
+}
+
+export function useSessionFull() {
+  const context = useContext(SessionWorkspaceContext)
+  if (!context) {
+    throw new Error(
+      'useSessionFull must be used inside SessionWorkspaceProvider',
+    )
+  }
+  return context
 }

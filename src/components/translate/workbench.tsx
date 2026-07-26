@@ -11,7 +11,10 @@
 import { useState } from 'react'
 import { Card } from '@/src/components/ui'
 import { PageHeader } from '@/src/components/shell/PageHeader'
-import { CoordinatorPanel } from '@/src/components/coordinator'
+import {
+  CoordinatorPanel,
+  SessionWorkspaceProvider,
+} from '@/src/components/coordinator'
 import { EditorSection } from '@/src/components/editor/EditorSection'
 import { TranslatePanel } from './translate-panel'
 
@@ -20,6 +23,7 @@ export function Workbench() {
   const [translateReady, setTranslateReady] = useState(false)
 
   return (
+    <SessionWorkspaceProvider>
     <div className="mx-auto max-w-7xl px-4 py-6 sm:px-6">
       <PageHeader
         overline="Workbench"
@@ -56,5 +60,6 @@ export function Workbench() {
         <EditorSection />
       </div>
     </div>
+    </SessionWorkspaceProvider>
   )
 }

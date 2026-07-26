@@ -9,6 +9,7 @@ import type {
   AgentDirectionVariant,
   BuiltinDirection,
 } from '@/src/lib/contracts/vnext'
+import type { ModelBinding } from '@/src/lib/contracts/vnext'
 import type { NotifyFn } from './shared'
 
 interface EndpointSummary {
@@ -227,11 +228,22 @@ export function AgentLibraryPanel({ notify }: { notify: NotifyFn }) {
   const [otherDescription, setOtherDescription] = useState('')
   const [otherPrompt, setOtherPrompt] = useState('')
   const [category, setCategory] = useState<AgentCategory>('expression')
+  const [profile, setProfile] = useState<{
+    defaultWorker: ModelBinding
+    mainAgent: ModelBinding
+    editingAgent: ModelBinding
+  }>({
+    defaultWorker: { endpointId: null, model: '' },
+    mainAgent: { endpointId: null, model: '' },
+    editingAgent: { endpointId: null, model: '' },
+  })
+  const [profileSaving, setProfileSaving] = useState(false)
 
   const load = useCallback(async () => {
-    const [response, endpointResponse] = await Promise.all([
+    const [response, endpointResponse, profileResponse] = await Promise.all([
       fetch(`/api/agent-catalog?direction=${direction}&includeDisabled=1`),
       fetch('/api/endpoints'),
+      fetch(`/api/model-profiles/${direction}`),
     ])
     if (!response.ok) return
     const payload = await response.json() as {
@@ -243,7 +255,31 @@ export function AgentLibraryPanel({ notify }: { notify: NotifyFn }) {
     if (endpointResponse.ok) {
       setEndpoints(await endpointResponse.json())
     }
+    if (profileResponse.ok) {
+      const value = await profileResponse.json()
+      if (value) setProfile(value)
+    }
   }, [direction])
+
+  async function saveProfile() {
+    setProfileSaving(true)
+    try {
+      const response = await fetch(`/api/model-profiles/${direction}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(profile),
+      })
+      if (!response.ok) throw new Error('默认模型分工保存失败')
+      setProfile(await response.json())
+      notify('默认模型分工已保存', { tone: 'inverted' })
+    } catch (error) {
+      notify('保存失败', {
+        message: error instanceof Error ? error.message : '请重试',
+      })
+    } finally {
+      setProfileSaving(false)
+    }
+  }
 
   useEffect(() => {
     void load()
@@ -357,6 +393,65 @@ export function AgentLibraryPanel({ notify }: { notify: NotifyFn }) {
         </Button>
       }
     >
+      <details className="mb-4 rounded-sm border border-line bg-paper/55" open>
+        <summary className="cursor-pointer px-3 py-2 text-sm font-medium text-ink-2">
+          默认模型分工
+        </summary>
+        <div className="space-y-3 border-t border-line px-3 py-3">
+          {([
+            ['defaultWorker', '默认翻译 Agent', '无单独覆盖时使用'],
+            ['mainAgent', '主 Agent / 四阶段', '组队、成稿与统筹'],
+            ['editingAgent', '编辑 Agent', '最终版本对话修改'],
+          ] as const).map(([key, label, hint]) => (
+            <div key={key} className="grid gap-2 sm:grid-cols-[1fr_1fr_1.2fr] sm:items-center">
+              <div>
+                <p className="text-xs font-medium text-ink">{label}</p>
+                <p className="text-xs text-ink-4">{hint}</p>
+              </div>
+              <select
+                value={profile[key].endpointId?.toString() ?? ''}
+                onChange={(event) =>
+                  setProfile((current) => ({
+                    ...current,
+                    [key]: {
+                      ...current[key],
+                      endpointId: event.target.value
+                        ? Number(event.target.value)
+                        : null,
+                    },
+                  }))
+                }
+                className="h-9 rounded-sm border border-line-2 bg-paper-raise px-2 text-sm"
+              >
+                <option value="">未配置</option>
+                {endpoints.map((endpoint) => (
+                  <option key={endpoint.id} value={endpoint.id}>
+                    {endpoint.name}
+                  </option>
+                ))}
+              </select>
+              <Input
+                value={profile[key].model}
+                onChange={(event) =>
+                  setProfile((current) => ({
+                    ...current,
+                    [key]: { ...current[key], model: event.target.value },
+                  }))
+                }
+                placeholder="模型名称"
+              />
+            </div>
+          ))}
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={profileSaving}
+            onClick={() => void saveProfile()}
+          >
+            {profileSaving && <Spinner size="sm" />}保存默认分工
+          </Button>
+        </div>
+      </details>
       <Input
         value={search}
         onChange={(event) => setSearch(event.target.value)}
@@ -380,6 +475,16 @@ export function AgentLibraryPanel({ notify }: { notify: NotifyFn }) {
                   <p className="mt-1 text-xs leading-5 text-ink-3">
                     {variant.catalogDescription}
                   </p>
+                  {archetype?.isBuiltin && (
+                    <details className="mt-2">
+                      <summary className="cursor-pointer text-xs text-ink-3">
+                        查看完整提示词（只读）
+                      </summary>
+                      <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap rounded-sm border border-line bg-paper px-3 py-2 text-xs leading-5 text-ink-2">
+                        {variant.rolePrompt}
+                      </pre>
+                    </details>
+                  )}
                 </div>
                 <div className="flex shrink-0 gap-1">
                   <Button variant="ghost" size="sm" onClick={() => void clone(variant.id)}>

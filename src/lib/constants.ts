@@ -2,8 +2,11 @@
 // All thresholds are centralized here — guards and services import values
 // rather than hardcoding them.
 
-/** Per-agent LLM request timeout */
+/** Maximum silence between response chunks for one model request. */
 export const AGENT_TIMEOUT_MS = 120_000
+
+/** Absolute safety ceiling for one model call, even while the stream is active. */
+export const AGENT_MAX_DURATION_MS = 15 * 60_000
 
 /** Max concurrent translation agents */
 export const MAX_CONCURRENCY = 8

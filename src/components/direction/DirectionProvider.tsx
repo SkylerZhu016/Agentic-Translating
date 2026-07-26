@@ -96,16 +96,18 @@ export function DirectionProvider({ children }: { children: ReactNode }) {
 
   const performSwitch = useCallback(async (target: BuiltinDirection, suppress: boolean) => {
     await draftController.current?.flush()
-    await saveSetting('workspace_direction', target)
+    await saveSetting('workspace_direction', target).catch(() => undefined)
     if (suppress) {
-      await saveSetting('suppress_direction_switch_warning', '1')
+      await saveSetting('suppress_direction_switch_warning', '1').catch(
+        () => undefined,
+      )
       setSuppressed(true)
     }
-    setDirection(target)
     setPending(null)
     setSuppressChecked(false)
     const query = new URLSearchParams()
     query.set('direction', target)
+    if (pathname === '/') query.set('fresh', '1')
     router.push(`${pathname}?${query.toString()}`)
   }, [pathname, router])
 

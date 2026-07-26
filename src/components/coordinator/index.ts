@@ -8,7 +8,11 @@ export { CoordinatorFinalText } from './CoordinatorFinalText'
 export { StageStepper, type StageStepperProps } from './StageStepper'
 export { StageOutputPanel, type StageOutputPanelProps } from './StageOutputPanel'
 export { emitSessionChanged, SESSION_CHANGED_EVENT } from './session-bus'
-export { useSessionFull, type SessionFullResponse } from './use-session'
+export {
+  SessionWorkspaceProvider,
+  useSessionFull,
+  type SessionFullResponse,
+} from './use-session'
 export {
   STAGES,
   STAGE_INDEX,

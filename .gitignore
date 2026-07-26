@@ -23,6 +23,9 @@ next-env.d.ts
 # Private design notes
 初步设想.txt
 
+# Local-only iteration and release verification notes
+迭代文档/
+
 # OS
 Thumbs.db
 .DS_Store

@@ -4,6 +4,8 @@ export interface PublicEndpointDto {
   id: number
   name: string
   base_url: string
+  chat_completions_path: string
+  request_url: string
   has_api_key: boolean
   context_window: number | null
   created_at: string
@@ -14,6 +16,9 @@ export function toPublicEndpointDto(endpoint: EndpointRow): PublicEndpointDto {
     id: endpoint.id,
     name: endpoint.name,
     base_url: endpoint.base_url,
+    chat_completions_path:
+      endpoint.chat_completions_path ?? '/v1/chat/completions',
+    request_url: `${endpoint.base_url.replace(/\/+$/, '')}${endpoint.chat_completions_path ?? '/v1/chat/completions'}`,
     has_api_key: endpoint.api_key.length > 0,
     context_window: endpoint.context_window ?? null,
     created_at: endpoint.created_at,

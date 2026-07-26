@@ -17,6 +17,7 @@
     "typecheck": "node node_modules/typescript/lib/tsc.js --noEmit",
     "e2e": "npm run build:standalone && playwright test",
     "build:standalone": "next build && node scripts/prepare-standalone.mjs",
+    "verify:release-tree": "node scripts/verify-release-tree.mjs",
     "desktop": "electron .",
     "icon:build": "node scripts/generate-icon.mjs",
     "package:win": "node scripts/package-win.mjs",
@@ -82,7 +83,8 @@
       "deleteAppDataOnUninstall": false
     },
     "portable": {
-      "artifactName": "${productName}-${version}-portable-${arch}.${ext}"
+      "artifactName": "${productName}-${version}-portable-${arch}.${ext}",
+      "splashImage": "build/portable-splash.bmp"
     }
   }
 }

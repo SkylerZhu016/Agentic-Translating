@@ -8,50 +8,31 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Button, Card } from '@/src/components/ui'
 import { PageHeader } from '@/src/components/shell/PageHeader'
-import {
-  configApi,
-  isApiError,
-  type Agent,
-  type CoordinatorConfig,
-  type Endpoint,
-  type PromptTemplate,
-} from './api'
-import { AgentPanel } from './AgentPanel'
-import { CoordinatorPanel } from './CoordinatorPanel'
+import { configApi, type Agent, type Endpoint } from './api'
 import { EndpointPanel } from './EndpointPanel'
-import { PromptPanel } from './PromptPanel'
 import { Skeleton, ToastStack, useToasts } from './shared'
 import { DirectionSettingsCard } from './DirectionSettingsCard'
 import { AgentLibraryPanel } from './AgentLibraryPanel'
 import { WorkflowPresetPanel } from './WorkflowPresetPanel'
+import { PromptBundlePanel } from './PromptBundlePanel'
 
 export function ConfigPanels() {
   const [loading, setLoading] = useState(true)
-  const [loadError, setLoadError] = useState<string | null>(null)
+  const [endpointError, setEndpointError] = useState<string | null>(null)
   const [endpoints, setEndpoints] = useState<Endpoint[]>([])
   const [agents, setAgents] = useState<Agent[]>([])
-  const [coordinator, setCoordinator] = useState<CoordinatorConfig | null>(null)
-  const [prompts, setPrompts] = useState<PromptTemplate[]>([])
   const { toasts, push, dismiss } = useToasts()
 
   const loadAll = useCallback(async () => {
-    setLoadError(null)
-    try {
-      const [ep, ag, co, pr] = await Promise.all([
+    setEndpointError(null)
+    const [epResult, agentResult] = await Promise.allSettled([
         configApi.listEndpoints(),
         configApi.listAgents(),
-        configApi.getCoordinator(),
-        configApi.listPrompts(),
-      ])
-      setEndpoints(ep)
-      setAgents(ag)
-      setCoordinator(co)
-      setPrompts(pr)
-    } catch (e) {
-      setLoadError(isApiError(e) ? e.message : '网络错误，无法加载配置')
-    } finally {
-      setLoading(false)
-    }
+    ])
+    if (epResult.status === 'fulfilled') setEndpoints(epResult.value)
+    else setEndpointError('端点列表加载失败；其他配置区域仍可使用。')
+    if (agentResult.status === 'fulfilled') setAgents(agentResult.value)
+    setLoading(false)
   }, [])
 
   useEffect(() => {
@@ -63,14 +44,6 @@ export function ConfigPanels() {
     const [ep, ag] = await Promise.all([configApi.listEndpoints(), configApi.listAgents()])
     setEndpoints(ep)
     setAgents(ag)
-  }, [])
-
-  const refreshAgents = useCallback(async () => {
-    setAgents(await configApi.listAgents())
-  }, [])
-
-  const refreshPrompts = useCallback(async () => {
-    setPrompts(await configApi.listPrompts())
   }, [])
 
   return (
@@ -93,34 +66,26 @@ export function ConfigPanels() {
             </Card>
           ))}
         </div>
-      ) : loadError != null ? (
-        <div className="mx-auto grid max-w-3xl grid-cols-1 gap-5">
-          <Card title="加载失败">
-            <p className="text-sm leading-6 text-ink-2">{loadError}</p>
-            <Button size="sm" className="mt-3" onClick={() => void loadAll()}>
-              重试
-            </Button>
-          </Card>
-        </div>
       ) : (
         <div className="mx-auto grid max-w-3xl grid-cols-1 gap-5">
           <DirectionSettingsCard notify={push} />
           <AgentLibraryPanel notify={push} />
           <WorkflowPresetPanel endpoints={endpoints} notify={push} />
+          {endpointError && (
+            <Card title="端点区域暂不可用">
+              <p className="text-sm leading-6 text-ink-2">{endpointError}</p>
+              <Button size="sm" className="mt-3" onClick={() => void loadAll()}>
+                重试端点加载
+              </Button>
+            </Card>
+          )}
           <EndpointPanel
             endpoints={endpoints}
             agents={agents}
             notify={push}
             onChanged={refreshEndpoints}
           />
-          <AgentPanel
-            agents={agents}
-            endpoints={endpoints}
-            notify={push}
-            onChanged={refreshAgents}
-          />
-          <CoordinatorPanel coordinator={coordinator} endpoints={endpoints} notify={push} />
-          <PromptPanel prompts={prompts} notify={push} onChanged={refreshPrompts} />
+          <PromptBundlePanel notify={push} />
         </div>
       )}
 

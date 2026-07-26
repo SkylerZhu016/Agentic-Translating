@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   AGENT_TIMEOUT_MS,
+  AGENT_MAX_DURATION_MS,
   MAX_CONCURRENCY,
   HARD_CONCURRENCY_CAP,
   RETRY_DELAYS_MS,
@@ -13,6 +14,10 @@ import {
 describe('operational constants', () => {
   it('AGENT_TIMEOUT_MS = 120000', () => {
     expect(AGENT_TIMEOUT_MS).toBe(120_000)
+  })
+
+  it('AGENT_MAX_DURATION_MS = 15 minutes', () => {
+    expect(AGENT_MAX_DURATION_MS).toBe(15 * 60_000)
   })
 
   it('MAX_CONCURRENCY = 8', () => {
@@ -49,6 +54,7 @@ describe('operational constants', () => {
 
   it('all constants are numbers (RETRY_DELAYS_MS is array of numbers)', () => {
     expect(typeof AGENT_TIMEOUT_MS).toBe('number')
+    expect(typeof AGENT_MAX_DURATION_MS).toBe('number')
     expect(typeof MAX_CONCURRENCY).toBe('number')
     expect(typeof HARD_CONCURRENCY_CAP).toBe('number')
     expect(Array.isArray(RETRY_DELAYS_MS)).toBe(true)

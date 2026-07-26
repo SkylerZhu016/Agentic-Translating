@@ -26,7 +26,8 @@ import http from 'http'
 import { startMockLLM, type MockBehavior, type MockBehaviorConfig, type MockLLMInstance } from './mock-llm'
 
 export interface ControlPayload {
-  behavior: MockBehavior
+  behavior?: MockBehavior
+  reset?: boolean
   model?: string
   delayMs?: number
   status?: number
@@ -112,6 +113,13 @@ export async function startMockLLMServer(
 
       if (isControl) {
         const body = await readJsonBody(req)
+        if (body != null && typeof body === 'object' && (body as ControlPayload).reset === true) {
+          behaviorMap.clear()
+          upstream.resetBehaviors()
+          res.writeHead(204)
+          res.end()
+          return
+        }
         if (body == null || typeof body !== 'object' || typeof (body as ControlPayload).behavior !== 'string') {
           res.writeHead(400, { 'Content-Type': 'application/json' })
           res.end(JSON.stringify({ error: 'invalid_control_payload', message: 'behavior is required' }))
@@ -120,7 +128,7 @@ export async function startMockLLMServer(
         const payload = body as ControlPayload
         const model = payload.model ?? DEFAULT_MODEL_SLOT
         const config: MockBehaviorConfig = {
-          behavior: payload.behavior,
+          behavior: payload.behavior!,
           chunkDelayMs: payload.delayMs,
           status: payload.status,
           jsonContent: payload.jsonContent,
@@ -172,6 +180,10 @@ export async function startMockLLMServer(
         setBehavior: (model: string, config: MockBehaviorConfig) => {
           behaviorMap.set(model, config)
           upstream.setBehavior(model, config)
+        },
+        resetBehaviors: () => {
+          behaviorMap.clear()
+          upstream.resetBehaviors()
         },
         getRequests: () => upstream.getRequests(),
       }
