@@ -1,0 +1,29 @@
+{
+  "runName": "quality-v1",
+  "dataset": "FSBP_Test/datasets/quality-test.jsonl",
+  "endpoint": {
+    "baseUrl": "https://example.invalid",
+    "chatCompletionsPath": "/v1/chat/completions",
+    "apiKeyEnv": "FSBP_EXPERIMENT_API_KEY"
+  },
+  "models": {
+    "direct": "replace-with-strong-model",
+    "analysis": [
+      "replace-with-analysis-model-a",
+      "replace-with-analysis-model-b"
+    ],
+    "candidates": [
+      "replace-with-candidate-model-a",
+      "replace-with-candidate-model-b",
+      "replace-with-candidate-model-c"
+    ],
+    "editor": "replace-with-strong-model"
+  },
+  "generation": {
+    "temperature": 0.3,
+    "maxTokens": 8192,
+    "timeoutMs": 900000,
+    "retries": 2,
+    "sampleConcurrency": 2
+  }
+}

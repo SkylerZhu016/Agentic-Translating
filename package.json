@@ -21,8 +21,14 @@
     "desktop": "electron .",
     "icon:build": "node scripts/generate-icon.mjs",
     "package:win": "node scripts/package-win.mjs",
-    "experiment:protocol": "node scripts/protocol-experiment.mjs",
-    "experiment:report": "node scripts/protocol-report.mjs"
+    "dataset:validate": "node scripts/validate-fsbp-dataset.mjs",
+    "dataset:validate:locked": "node scripts/validate-fsbp-dataset.mjs --locked",
+    "experiment:quality": "node --experimental-strip-types scripts/run-fsbp-quality-experiment.mjs",
+    "experiment:blind": "node scripts/prepare-fsbp-blind-review.mjs",
+    "experiment:blind:b2": "node scripts/build-fsbp-b2-blind-review.mjs",
+    "experiment:blind:decode": "node scripts/decode-fsbp-blind-review.mjs",
+    "experiment:gate:round2": "node scripts/run-round2-five-sample-gate.mjs",
+    "experiment:gate:round2:blind": "node scripts/build-round2-gate-blind-review.mjs"
   },
   "dependencies": {
     "better-sqlite3": "13.0.1",

@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "status": "locked",
+  "datasetVersion": "0.1.0",
+  "expectedCounts": {
+    "dev": 8,
+    "test": 16,
+    "annotationStress": 12
+  },
+  "lockedAt": "2026-07-28T13:11:00.539Z"
+}

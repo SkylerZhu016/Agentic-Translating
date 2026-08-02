@@ -10,6 +10,10 @@ const directionSchema = z.enum(['en_to_zh', 'zh_to_en', 'custom'])
 const putSchema = z.object({
   defaultWorker: modelBindingSchema,
   mainAgent: modelBindingSchema,
+  reviewAgent: modelBindingSchema.optional(),
+  filterAgent: modelBindingSchema.optional(),
+  orchestrateAgent: modelBindingSchema.optional(),
+  assembleAgent: modelBindingSchema.optional(),
   editingAgent: modelBindingSchema,
 })
 
@@ -37,5 +41,13 @@ export async function PUT(
   if (!direction.success || !body.success) {
     return Response.json({ error: 'invalid_body' }, { status: 400 })
   }
-  return Response.json(repo().upsert({ direction: direction.data, ...body.data }))
+  const mainAgent = body.data.mainAgent
+  return Response.json(repo().upsert({
+    direction: direction.data,
+    ...body.data,
+    reviewAgent: body.data.reviewAgent ?? mainAgent,
+    filterAgent: body.data.filterAgent ?? mainAgent,
+    orchestrateAgent: body.data.orchestrateAgent ?? mainAgent,
+    assembleAgent: body.data.assembleAgent ?? mainAgent,
+  }))
 }

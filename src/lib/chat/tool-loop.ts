@@ -14,9 +14,11 @@
 
 import { chatCompletion, isAsyncIterable, ToolsNotSupportedError } from '../llm/client';
 import type { ChatCompletionRequest, ChatCompletionResponse, LLMStreamEvent } from '../llm/client';
-import { applyReplacementBatch, type Edit } from '../editing/replace';
+import { applyExactReplacementBatch, type Edit } from '../editing/replace';
 import { REPLACE_TEXT_TOOL } from './tools';
 import { CHAT_LOOP_MAX } from '../constants';
+
+const MAX_EDIT_CORRECTION_ATTEMPTS = 1;
 
 // =============================================================================
 // Types
@@ -24,6 +26,8 @@ import { CHAT_LOOP_MAX } from '../constants';
 
 /** Callbacks for observing chat turn progress */
 export interface ChatCallbacks {
+  /** Called when the provider sends activity, including hidden reasoning. */
+  onActivity?: () => void;
   /** Called for each text delta during streaming */
   onDelta?: (text: string) => void;
   /** Called when the model invokes a replace_text tool */
@@ -88,6 +92,29 @@ function parseToolArgs(rawArgs: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+function buildExactMatchCorrectionMessage(params: {
+  failedIndex: number;
+  reason: string;
+  suggestions?: string[];
+  currentText: string;
+}): string {
+  const suggestions = params.suggestions?.filter(Boolean).slice(0, 3) ?? [];
+  return (
+    `Edit failed (edit #${params.failedIndex + 1}): ${params.reason}\n\n` +
+    (suggestions.length > 0
+      ? 'Closest exact excerpts from the current translation (diagnostic only):\n' +
+        suggestions.map((item, index) => `${index + 1}. ${JSON.stringify(item)}`).join('\n') +
+        '\n\n'
+      : '') +
+    'You have one correction attempt. Copy old_string character-for-character ' +
+    'from CURRENT COMPLETE TRANSLATION below. Do not copy a quotation from the ' +
+    'audit, source, or an earlier version. The system will not apply fuzzy matches. ' +
+    'Every replacement must be unique; include unchanged surrounding context when needed.\n\n' +
+    'CURRENT COMPLETE TRANSLATION:\n' +
+    params.currentText
+  );
 }
 
 /**
@@ -225,6 +252,7 @@ async function callWithTools(
   model: string,
   messages: Array<{ role: string; content: string; name?: string; tool_call_id?: string }>,
   onDelta?: (text: string) => void,
+  onActivity?: () => void,
   stream: boolean = true,
 ): Promise<CollectedStreamResult> {
   const request: ChatCompletionRequest = {
@@ -232,6 +260,7 @@ async function callWithTools(
     messages,
     tools: [REPLACE_TEXT_TOOL],
     stream,
+    onActivity,
   };
 
   const result = await chatCompletion(endpoint, request);
@@ -247,11 +276,13 @@ async function callJsonFence(
   model: string,
   messages: Array<{ role: string; content: string; name?: string; tool_call_id?: string }>,
   onDelta?: (text: string) => void,
+  onActivity?: () => void,
 ): Promise<CollectedStreamResult> {
   const request: ChatCompletionRequest = {
     model,
     messages,
     stream: false, // Non-streaming for easier JSON parsing
+    onActivity,
   };
 
   const result = await chatCompletion(endpoint, request);
@@ -292,6 +323,7 @@ export async function runChatTurn(
   } = params;
 
   const onDelta = callbacks?.onDelta;
+  const onActivity = callbacks?.onActivity;
   const onToolCall = callbacks?.onToolCall;
   const onToolResult = callbacks?.onToolResult;
   const onProtocolFallback = callbacks?.onProtocolFallback;
@@ -300,6 +332,7 @@ export async function runChatTurn(
   const messages = cloneMessages(inputMessages);
   let useFallbackProtocol = false;
   let fallbackSystemInjected = false;
+  let editCorrectionAttempts = 0;
 
   for (let iteration = 0; iteration < CHAT_LOOP_MAX; iteration++) {
     let collected: CollectedStreamResult;
@@ -327,10 +360,17 @@ export async function runChatTurn(
           onProtocolFallback();
         }
 
-        collected = await callJsonFence(endpoint, model, messages, onDelta);
+        collected = await callJsonFence(endpoint, model, messages, onDelta, onActivity);
       } else {
         // Native tools protocol
-        collected = await callWithTools(endpoint, model, messages, onDelta, stream);
+        collected = await callWithTools(
+          endpoint,
+          model,
+          messages,
+          onDelta,
+          onActivity,
+          stream,
+        );
       }
     } catch (error: unknown) {
       // ToolsNotSupportedError → switch to fallback protocol
@@ -373,7 +413,7 @@ export async function runChatTurn(
       }
 
       // Apply the fence edits
-      const batchResult = applyReplacementBatch(currentText, fenceEdits);
+      const batchResult = applyExactReplacementBatch(currentText, fenceEdits);
 
       if (batchResult.ok) {
         // Fire callbacks for each edit
@@ -400,18 +440,31 @@ export async function runChatTurn(
         };
       }
 
-      // Batch failed — inject error and retry
+      if (onToolResult) onToolResult(false);
+      if (editCorrectionAttempts >= MAX_EDIT_CORRECTION_ATTEMPTS) {
+        return {
+          ok: false,
+          code: 'chat_edit_correction_failed',
+          message:
+            `Edit #${batchResult.failedIndex + 1} still did not identify an exact unique passage after one correction: ` +
+            batchResult.reason,
+        };
+      }
+      editCorrectionAttempts += 1;
+
+      // Batch failed — inject one bounded exact-match correction.
       messages.push({
         role: 'assistant',
         content,
       });
       messages.push({
         role: 'user',
-        content:
-          `Edit failed (edit #${batchResult.failedIndex + 1}): ${batchResult.reason}\n\n` +
-          'Current text for reference:\n\n' +
-          currentText +
-          '\n\nPlease correct the old_string to match the text exactly.',
+        content: buildExactMatchCorrectionMessage({
+          failedIndex: batchResult.failedIndex,
+          reason: batchResult.reason,
+          suggestions: batchResult.suggestions,
+          currentText,
+        }),
       });
       continue;
     }
@@ -477,7 +530,7 @@ export async function runChatTurn(
     // ---------------------------------------------------------------
     // Step 4: Apply edits transactionally
     // ---------------------------------------------------------------
-    const batchResult = applyReplacementBatch(currentText, edits);
+    const batchResult = applyExactReplacementBatch(currentText, edits);
 
     if (batchResult.ok) {
       const diffSummary = buildDiffSummary(edits);
@@ -502,6 +555,17 @@ export async function runChatTurn(
     if (onToolResult) {
       onToolResult(false);
     }
+
+    if (editCorrectionAttempts >= MAX_EDIT_CORRECTION_ATTEMPTS) {
+      return {
+        ok: false,
+        code: 'chat_edit_correction_failed',
+        message:
+          `Edit #${batchResult.failedIndex + 1} still did not identify an exact unique passage after one correction: ` +
+          batchResult.reason,
+      };
+    }
+    editCorrectionAttempts += 1;
 
     // Add the assistant message with tool_calls to the conversation
     messages.push({
@@ -529,11 +593,12 @@ export async function runChatTurn(
           'This edit was not applied because a subsequent edit in the same batch failed. ' +
           `The batch was rolled back. Failed at edit #${batchResult.failedIndex + 1}: ${batchResult.reason}`;
       } else if (i === batchResult.failedIndex) {
-        toolContent =
-          `Edit failed: ${batchResult.reason}\n\n` +
-          'Current text for reference:\n\n' +
-          currentText +
-          '\n\nPlease use a more specific old_string that uniquely matches the text.';
+        toolContent = buildExactMatchCorrectionMessage({
+          failedIndex: batchResult.failedIndex,
+          reason: batchResult.reason,
+          suggestions: batchResult.suggestions,
+          currentText,
+        });
       } else {
         toolContent =
           'This edit was not attempted because a prior edit in the same batch failed.';

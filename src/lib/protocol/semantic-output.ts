@@ -3,13 +3,19 @@ import type { SemanticAgentOutput } from '../contracts/vnext'
 /**
  * Parse the free-form semantic boundary protocol.
  *
- * Only the first line whose trimmed value is exactly `---` is a boundary.
+ * Only the last line whose trimmed value is exactly `---` is a boundary.
  * Everything before it is downstream-visible body; everything after it is
  * human-facing annotation. The raw value is never rewritten.
  */
 export function parseSemanticAgentOutput(raw: string): SemanticAgentOutput {
-  const lines = raw.split(/\r?\n/)
-  const boundary = lines.findIndex((line) => line.trim() === '---')
+  const lines = raw.split(/\r\n?|\n/)
+  let boundary = -1
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (lines[index].trim() === '---') {
+      boundary = index
+      break
+    }
+  }
 
   if (boundary < 0) {
     return {

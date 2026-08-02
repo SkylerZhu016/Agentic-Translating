@@ -14,12 +14,12 @@ describe('FSBP semantic output', () => {
     })
   })
 
-  it('recognizes the first standalone boundary with LF', () => {
-    const raw = '正文\n --- \n注释\n---\n注释中的分隔线'
+  it('recognizes the last standalone boundary with LF', () => {
+    const raw = '正文\n --- \n正文中的分隔线\n---\n最终注释'
     expect(parseSemanticAgentOutput(raw)).toEqual({
       raw,
-      body: '正文',
-      annotation: '注释\n---\n注释中的分隔线',
+      body: '正文\n --- \n正文中的分隔线',
+      annotation: '最终注释',
     })
   })
 
@@ -29,6 +29,15 @@ describe('FSBP semantic output', () => {
     expect(parsed.raw).toBe(raw)
     expect(parsed.body).toBe('body')
     expect(parsed.annotation).toBe('annotation')
+  })
+
+  it('recognizes a bare CR boundary while preserving raw', () => {
+    const raw = 'body\r---\rannotation'
+    expect(parseSemanticAgentOutput(raw)).toEqual({
+      raw,
+      body: 'body',
+      annotation: 'annotation',
+    })
   })
 
   it('does not treat inline or longer hyphens as a boundary', () => {
@@ -42,6 +51,20 @@ describe('FSBP semantic output', () => {
       raw: '---\nnotes',
       body: '',
       annotation: 'notes',
+    })
+  })
+
+  it('keeps an earlier standalone divider in the body', () => {
+    expect(semanticBody('第一部分\n---\n第二部分\n---\n说明')).toBe(
+      '第一部分\n---\n第二部分',
+    )
+  })
+
+  it('uses a trailing standalone divider as an empty annotation boundary', () => {
+    expect(parseSemanticAgentOutput('正文\n---')).toEqual({
+      raw: '正文\n---',
+      body: '正文',
+      annotation: null,
     })
   })
 })

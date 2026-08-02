@@ -47,9 +47,15 @@ function scan(directory, relativeBase = '') {
     const relative = path.join(relativeBase, entry.name)
     const segments = relative.split(path.sep)
     const absolute = path.join(directory, entry.name)
+    const fsbpIndex = segments.indexOf('FSBP_Test')
+    const isPrivateFsbpPath =
+      fsbpIndex >= 0 &&
+      ['private', 'results', 'cache'].includes(segments[fsbpIndex + 1])
     if (
       segments.some((segment) => forbiddenSegments.has(segment)) ||
-      segments[1] === 'data'
+      segments[1] === 'data' ||
+      isPrivateFsbpPath ||
+      (fsbpIndex >= 0 && /\.local\./i.test(entry.name))
     ) {
       violations.push(`forbidden path: ${relative}`)
       continue

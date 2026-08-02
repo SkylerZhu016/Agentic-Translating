@@ -115,7 +115,7 @@ function seedVNext(db: Database.Database): void {
     ).run()
     db.prepare(`
       INSERT INTO seed_versions (key, version, updated_at)
-      VALUES ('vnext_builtin_agents', 3, datetime('now'))
+      VALUES ('vnext_builtin_agents', 10, datetime('now'))
       ON CONFLICT(key) DO UPDATE SET version=excluded.version, updated_at=datetime('now')
     `).run()
   })()

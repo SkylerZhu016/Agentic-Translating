@@ -10,6 +10,10 @@ export interface WorkspaceModelProfile {
   direction: TranslationDirection
   defaultWorker: ModelBinding
   mainAgent: ModelBinding
+  reviewAgent: ModelBinding
+  filterAgent: ModelBinding
+  orchestrateAgent: ModelBinding
+  assembleAgent: ModelBinding
   editingAgent: ModelBinding
   updatedAt: string
 }
@@ -43,15 +47,32 @@ export function createWorkspaceModelProfilesRepo(db: Database.Database) {
             direction: TranslationDirection
             default_worker_json: string
             main_agent_json: string
+            review_agent_json: string | null
+            filter_agent_json: string | null
+            orchestrate_agent_json: string | null
+            assemble_agent_json: string | null
             editing_agent_json: string
             updated_at: string
           }
         | undefined
       if (!row) return null
+      const mainAgent = parseJson<ModelBinding>(row.main_agent_json)
       return {
         direction: row.direction,
         defaultWorker: parseJson(row.default_worker_json),
-        mainAgent: parseJson(row.main_agent_json),
+        mainAgent,
+        reviewAgent: row.review_agent_json
+          ? parseJson(row.review_agent_json)
+          : mainAgent,
+        filterAgent: row.filter_agent_json
+          ? parseJson(row.filter_agent_json)
+          : mainAgent,
+        orchestrateAgent: row.orchestrate_agent_json
+          ? parseJson(row.orchestrate_agent_json)
+          : mainAgent,
+        assembleAgent: row.assemble_agent_json
+          ? parseJson(row.assemble_agent_json)
+          : mainAgent,
         editingAgent: parseJson(row.editing_agent_json),
         updatedAt: row.updated_at,
       }
@@ -59,17 +80,27 @@ export function createWorkspaceModelProfilesRepo(db: Database.Database) {
     upsert(profile: Omit<WorkspaceModelProfile, 'updatedAt'>) {
       db.prepare(`
         INSERT INTO workspace_model_profiles (
-          direction, default_worker_json, main_agent_json, editing_agent_json, updated_at
-        ) VALUES (?, ?, ?, ?, datetime('now'))
+          direction, default_worker_json, main_agent_json,
+          review_agent_json, filter_agent_json, orchestrate_agent_json,
+          assemble_agent_json, editing_agent_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         ON CONFLICT(direction) DO UPDATE SET
           default_worker_json=excluded.default_worker_json,
           main_agent_json=excluded.main_agent_json,
+          review_agent_json=excluded.review_agent_json,
+          filter_agent_json=excluded.filter_agent_json,
+          orchestrate_agent_json=excluded.orchestrate_agent_json,
+          assemble_agent_json=excluded.assemble_agent_json,
           editing_agent_json=excluded.editing_agent_json,
           updated_at=datetime('now')
       `).run(
         profile.direction,
         JSON.stringify(profile.defaultWorker),
         JSON.stringify(profile.mainAgent),
+        JSON.stringify(profile.reviewAgent),
+        JSON.stringify(profile.filterAgent),
+        JSON.stringify(profile.orchestrateAgent),
+        JSON.stringify(profile.assembleAgent),
         JSON.stringify(profile.editingAgent),
       )
       return this.get(profile.direction)!

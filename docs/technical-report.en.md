@@ -2,7 +2,7 @@
 
 ## Abstract
 
-This project tackles high-stakes bidirectional translation across literature, poetry, normative texts, and academic technical writing — domains where no single correct answer exists. Rather than treating multiple agents as independent task parallelizers, the system uses them as candidate generators that offer different perspectives on the same problem. The master agent handles casting, comparison, deliberation, fusion, and versioned revision. The core method, FSBP (Free-Stream Body Protocol), uses the first standalone `---` to separate body from annotations, blocking annotation propagation downstream while preserving free-form expression.
+This project tackles high-stakes bidirectional translation across literature, poetry, normative texts, and academic technical writing — domains where no single correct answer exists. Rather than treating multiple agents as independent task parallelizers, the system uses them as candidate generators that offer different perspectives on the same problem. The master agent handles casting, comparison, deliberation, fusion, and versioned revision. The core method, FSBP, combines free text, a stage-body semantic contract, the final standalone `---` boundary, raw archival, body-only inheritance, and annotation isolation. It preserves free-form expression while preventing candidate self-explanation from propagating downstream.
 
 vNext adds 10 agent prototypes, 20 language-direction variants, bidirectional prompt packs, dynamic/fixed teaming, two drafting pipelines, evidence-based editing, revision presets, batch queuing, history recovery, Windows Electron and Docker self-deployment, and fixes for context truncation, multi-endpoint snapshots, and API key leak boundaries.
 
@@ -24,7 +24,7 @@ This project therefore addresses three questions simultaneously:
 
 ### 2.2 FSBP
 
-Models return complete free-form text. The system saves the raw output, parses the body and annotation separately, and passes only the body to all downstream agents. The protocol does not require strict JSON within the product, nor does it mandate fixed fields. Precise state changes are still handled by minimal tool JSON.
+Models return complete free-form text. The system saves the raw output, parses the body and annotation separately, and passes only the body to all downstream agents. The protocol does not mandate fixed fields, but it does assign a stable purpose to each stage body: review carries error and risk evidence, filtering carries keep and repair decisions, orchestration carries a complete working translation, and assembly carries the final translation. Process notes and self-evaluation belong in the annotation. Precise state changes are still handled by minimal tool JSON.
 
 ### 2.3 Bidirectional Prompts
 
@@ -55,36 +55,28 @@ The backend checks paragraphs/sections, non-empty lines, required/forbidden word
 
 Checkers do not modify or reject candidates; they only pass natural-language evidence to the deliberation agent.
 
-## 6. Protocol Ablation Experiments
+## 6. FSBP Validation Plan
 
-The repository provides an interrupt-resumable CLI using a fixed set of 20 public-domain samples (10 per direction, including poetry and prose) and 6 misleading-annotation stress samples. First drafts from three candidate models are generated once and frozen; all three groups share the same candidates:
+The samples, runner, and outputs from the early pilot have been retired and
+must not be treated as quality evidence for the current architecture. The
+replacement work in `FSBP_Test/` separates three questions:
 
-1. `strict-json`: stage outputs in strict JSON, with one allowed format-fix retry;
-2. `freeform-raw`: free text, annotations passed downstream;
-3. `fsbp-v1`: free text, only body passed downstream.
+1. protocol reliability for JSON and FSBP;
+2. annotation isolation for raw and body-only inheritance;
+3. end-to-end quality for direct translation, multi-agent raw, and multi-agent
+   FSBP.
 
-The deliberation model, stage objectives, and sampling parameters are consistent across all groups. An independent judge performs anonymous ranking, then re-evaluates in reverse order. Run records include format success, retries, stage completion, latency, tokens, scores, and failure reasons; reports compute win rates, Wilson 95% confidence intervals, and paired sign tests.
-
-### 6.1 First Real Run
-
-Run `2026-07-24T15-25-09-239Z-e5ee2aaa` used three candidate models, one deliberation model, and one independent judge model, completing all 20 public-domain samples (6 of which included misleading-annotation stress conditions). A total of 60 frozen candidates, 240 stage invocations, and 40 judge evaluations with swapped candidate order were recorded. No invocation or stage failures occurred. Stage completion rates and minimum verse-structure compliance rates were 100% across all three groups. `strict-json` incurred 1 format-fix retry; both free-text protocols had 0.
-
-When aggregating the two ordered evaluations per source sample, 12 samples yielded a single unique preference, and 8 were ties. The sample-level unique-preference win rates were:
-
-- `strict-json`: 33.3%, Wilson 95% CI 13.8%–60.9%;
-- `freeform-raw`: 41.7%, Wilson 95% CI 19.3%–68.0%;
-- `fsbp-v1`: 25.0%, Wilson 95% CI 8.9%–53.2%.
-
-All paired sign tests failed to reach statistical significance. Among the 6 stress samples, unique preferences were `strict-json=1`, `freeform-raw=2`, `fsbp-v1=1`, with 2 ties. Therefore, this small-sample automated evaluation **did not demonstrate that FSBP produces superior translation quality compared to either control group, nor did it confirm that annotation isolation increases judge preference under the current stress design**. This is a negative result and should not be rewritten as a supportive conclusion.
-
-FSBP consumed 118,719 stage tokens in this run, lower than `strict-json`'s 153,619 and `freeform-raw`'s 155,766 — reductions of approximately 22.7% and 23.8%, respectively. However, its average stage latency of 22.0 seconds was faster than `freeform-raw`'s 25.1 seconds but slower than `strict-json`'s 18.0 seconds. FSBP's current, more defensible value proposition is "structural invariants that prevent annotations from reaching downstream while preserving raw output for auditability," rather than experimentally proven quality gains.
-
-The forward and reverse judge preference agreement rate was only 35.0% (7/20), indicating significant model-judge noise and positional sensitivity. Future work should expand the sample size, improve stress construction, and incorporate expert human blind evaluation. Full data is available at `experiments/results/2026-07-24T15-25-09-239Z-e5ee2aaa/`; auto-generated Markdown/HTML reports at `experiments/reports/2026-07-24T15-25-09-239Z-e5ee2aaa.*`.
+The planned dataset contains 8 development samples and 24 locked test samples,
+balanced by direction and four high-difficulty text categories. Annotation
+stress cases must come from genuine errors in normal model calls and require
+human confirmation; misleading annotations may not be fabricated. No texts
+have been approved yet, so this report currently makes no experimental quality
+claim.
 
 ## 7. Threats and Limitations
 
 - Model judges may favor their own writing style; order swapping can only mitigate positional bias, not eliminate it.
-- 20 samples are suitable for engineering ablation and failure analysis but insufficient to represent all languages and domains.
+- Public-domain and open-license requirements introduce period bias, and the dataset cannot represent every language or domain.
 - FSBP can isolate explicit annotations but cannot detect meta-instructions disguised as translation text within the body.
 - Token estimation is not each vendor's precise tokenizer; when `contextWindow` is unconfigured, only a warning can be issued.
 - Pinyin rhyme and CMU approximate rhyme carry no classical or poetic authority.
@@ -92,7 +84,7 @@ The forward and reverse judge preference agreement rate was only 35.0% (7/20), i
 
 ## 8. Engineering Completeness
 
-This delivery expands the prototype into a complete system encompassing data migration, protocols, bidirectional agents, server-side orchestration, auditable versioning, batch processing, desktop distribution, self-deployment, and experimental tooling. The final quality gate relies on `typecheck`, Vitest, Next build, Playwright, Windows packaging, and Docker health checks. Actual execution status should be determined by development delivery records; this report does not pre-assert passage.
+This delivery expands the prototype into a complete system encompassing data migration, protocols, bidirectional agents, server-side orchestration, auditable versioning, batch processing, desktop distribution, self-deployment, and dataset validation tooling. The final quality gate relies on `typecheck`, Vitest, Next build, Playwright, Windows packaging, and Docker health checks. Actual execution status should be determined by development delivery records; this report does not pre-assert passage.
 
 ## 9. Future Work
 

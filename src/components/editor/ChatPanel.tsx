@@ -16,11 +16,18 @@ export interface ChatPanelProps {
   messages: ChatMessageView[]
   /** 有聊天请求在飞（禁用输入） */
   streaming: boolean
+  /** 请求由另一个标签页或自动化客户端发起 */
+  remoteStreaming?: boolean
+  /** 本轮请求开始时间，用于显示持续等待而非“假死” */
+  activityStartedAt?: number | null
+  activityPhase?: 'waiting_for_model' | 'thinking' | 'generating' | 'applying_edits'
   /** 会话处于可聊天状态（assembled/refining） */
   canChat: boolean
   /** 不可聊天时的占位提示 */
   disabledHint: string
   onSend: (message: string) => void
+  /** 把普通用户的模糊感受细化为可审阅的局部修订意见；不会自动发送或改文 */
+  onSuggest?: (message: string) => Promise<string>
 }
 
 // ── 工具调用徽章 ──────────────────────────────────────────────
@@ -112,8 +119,29 @@ function MessageItem({ message }: { message: ChatMessageView }) {
 
 // ── 面板 ─────────────────────────────────────────────────────
 
-export function ChatPanel({ messages, streaming, canChat, disabledHint, onSend }: ChatPanelProps) {
+function formatElapsed(milliseconds: number): string {
+  const seconds = Math.max(0, Math.floor(milliseconds / 1000))
+  const minutes = Math.floor(seconds / 60)
+  const remainder = seconds % 60
+  return minutes > 0 ? `${minutes} 分 ${remainder} 秒` : `${remainder} 秒`
+}
+
+export function ChatPanel({
+  messages,
+  streaming,
+  remoteStreaming = false,
+  activityStartedAt = null,
+  activityPhase = 'waiting_for_model',
+  canChat,
+  disabledHint,
+  onSend,
+  onSuggest,
+}: ChatPanelProps) {
   const [draft, setDraft] = useState('')
+  const [suggesting, setSuggesting] = useState(false)
+  const [suggestionStartedAt, setSuggestionStartedAt] = useState<number | null>(null)
+  const [suggestionError, setSuggestionError] = useState<string | null>(null)
+  const [clock, setClock] = useState(() => Date.now())
   const scrollRef = useRef<HTMLDivElement>(null)
 
   // 新内容出现（含流式 delta）时吸附到底部
@@ -124,6 +152,17 @@ export function ChatPanel({ messages, streaming, canChat, disabledHint, onSend }
     if (el) el.scrollTop = el.scrollHeight
   }, [scrollSignal])
 
+  useEffect(() => {
+    if (!streaming && !suggesting) return
+    setClock(Date.now())
+    const timer = window.setInterval(() => setClock(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [streaming, suggesting])
+
+  const elapsed = activityStartedAt == null
+    ? null
+    : formatElapsed(clock - activityStartedAt)
+
   const send = () => {
     const value = draft.trim()
     if (!value || streaming || !canChat) return
@@ -131,12 +170,58 @@ export function ChatPanel({ messages, streaming, canChat, disabledHint, onSend }
     onSend(value)
   }
 
-  const inputDisabled = !canChat || streaming
+  const suggest = async () => {
+    const value = draft.trim()
+    if (!value || streaming || suggesting || !canChat || !onSuggest) return
+    setSuggesting(true)
+    setSuggestionStartedAt(Date.now())
+    setSuggestionError(null)
+    try {
+      const feedback = (await onSuggest(value)).trim()
+      if (!feedback) throw new Error('模型没有返回可用建议')
+      setDraft(feedback)
+    } catch (error) {
+      setSuggestionError(
+        error instanceof Error ? error.message : '细化修改意见失败',
+      )
+    } finally {
+      setSuggesting(false)
+      setSuggestionStartedAt(null)
+    }
+  }
+
+  const inputDisabled = !canChat || streaming || suggesting
+  const activityLabel = activityPhase === 'waiting_for_model'
+    ? '正在等待模型开始输出'
+    : activityPhase === 'thinking'
+      ? '已收到模型活动，正在思考'
+    : activityPhase === 'applying_edits'
+      ? '正在核对并应用修改'
+      : '正在生成回复'
+  const suggestionElapsed = suggestionStartedAt == null
+    ? null
+    : formatElapsed(clock - suggestionStartedAt)
 
   return (
     <div data-testid={TID.edit.chatPanel} className="flex h-full flex-col">
       {/* 消息流 */}
       <div ref={scrollRef} className="max-h-96 min-h-56 flex-1 overflow-y-auto px-5 py-4">
+        {streaming && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="mb-3 flex items-center gap-2 rounded-sm border border-line bg-paper-sink/55 px-3 py-2 text-xs text-ink-3"
+          >
+            <Spinner size="sm" className="shrink-0" />
+            <span>
+              {remoteStreaming
+                ? `另一处正在执行对话修订 · ${activityLabel}`
+                : `统筹 Agent ${activityLabel}`}
+              {elapsed ? ` · 已等待 ${elapsed}` : ''}
+              {' · 页面仍在工作'}
+            </span>
+          </div>
+        )}
         {messages.length === 0 ? (
           <div className="flex h-full min-h-44 items-center justify-center">
             <p className="max-w-60 text-center text-sm leading-6 text-ink-4">
@@ -170,12 +255,31 @@ export function ChatPanel({ messages, streaming, canChat, disabledHint, onSend }
           className="resize-none"
         />
         <div className="mt-2 flex items-center justify-between">
-          <span className="text-[0.6875rem] text-ink-4">
-            {streaming ? '统筹 Agent 回复中…' : '修改通过替换工具落版，历史可追溯'}
+          <span className={`min-w-0 pr-2 text-[0.6875rem] ${suggestionError ? 'text-cinnabar' : 'text-ink-4'}`}>
+            {suggestionError
+              ? suggestionError
+              : suggesting
+                ? `目标语读者与双语核验者正在分别定位问题${suggestionElapsed ? ` · 已等待 ${suggestionElapsed}` : ''}，结果只会回填输入框`
+              : streaming
+              ? `${remoteStreaming ? '其他客户端正在修订' : '统筹 Agent 回复中'}${elapsed ? ` · ${elapsed}` : ''}`
+              : '修改通过替换工具落版，历史可追溯'}
           </span>
-          <Button size="sm" onClick={send} disabled={inputDisabled || draft.trim().length === 0}>
-            {streaming ? <Spinner size="sm" /> : '发送'}
-          </Button>
+          <div className="flex shrink-0 flex-wrap justify-end gap-2">
+            {onSuggest && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => void suggest()}
+                disabled={inputDisabled || draft.trim().length === 0}
+                title="让两个隔离审查镜头把当前感受细化为具体修改意见；不会自动发送"
+              >
+                {suggesting ? <Spinner size="sm" /> : '细化意见'}
+              </Button>
+            )}
+            <Button size="sm" onClick={send} disabled={inputDisabled || draft.trim().length === 0}>
+              {streaming ? <Spinner size="sm" /> : '发送'}
+            </Button>
+          </div>
         </div>
       </div>
     </div>

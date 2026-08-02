@@ -11,23 +11,58 @@ import type {
 } from '@/src/lib/contracts/vnext'
 import type { ModelBinding } from '@/src/lib/contracts/vnext'
 import type { NotifyFn } from './shared'
+import { ModelPicker } from './ModelPicker'
 
 interface EndpointSummary {
   id: number
   name: string
   base_url: string
+  context_window?: number | null
+}
+
+interface IndependentTestResult {
+  raw?: string
+  body: string
+  annotation: string | null
+}
+
+function IndependentTestOutput({ result }: { result: IndependentTestResult }) {
+  return (
+    <div className="mt-3 space-y-2 rounded-sm border border-line bg-paper px-3 py-3">
+      <div>
+        <p className="text-[11px] font-medium uppercase tracking-wide text-ink-4">
+          正文
+        </p>
+        <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap text-xs leading-5 text-ink-2">
+          {result.body}
+        </pre>
+      </div>
+      {result.annotation && (
+        <details className="border-t border-line pt-2">
+          <summary className="cursor-pointer text-xs text-ink-3">
+            查看注释（不会传给下游）
+          </summary>
+          <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap text-xs leading-5 text-ink-2">
+            {result.annotation}
+          </pre>
+        </details>
+      )}
+    </div>
+  )
 }
 
 function VariantEditor({
   variant,
   builtin,
   endpoints,
+  defaultBinding,
   notify,
   onChanged,
 }: {
   variant: AgentDirectionVariant
   builtin: boolean
   endpoints: EndpointSummary[]
+  defaultBinding: ModelBinding
   notify: NotifyFn
   onChanged: () => Promise<void>
 }) {
@@ -40,7 +75,10 @@ function VariantEditor({
   )
   const [model, setModel] = useState(variant.modelOverride ?? '')
   const [source, setSource] = useState('')
-  const [result, setResult] = useState('')
+  const [taskBrief, setTaskBrief] = useState('')
+  const [additionalInstruction, setAdditionalInstruction] = useState('')
+  const [result, setResult] = useState<IndependentTestResult | null>(null)
+  const [testError, setTestError] = useState('')
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
 
@@ -88,12 +126,17 @@ function VariantEditor({
   }
 
   async function testAgent() {
-    if (!source.trim() || !endpointId || !model.trim()) {
+    const effectiveEndpointId = endpointId
+      ? Number(endpointId)
+      : defaultBinding.endpointId
+    const effectiveModel = model.trim() || defaultBinding.model.trim()
+    if (!source.trim() || !effectiveEndpointId || !effectiveModel) {
       notify('测试需要原文、端点和模型')
       return
     }
     setTesting(true)
-    setResult('')
+    setResult(null)
+    setTestError('')
     try {
       const response = await fetch(
         `/api/agent-catalog/${encodeURIComponent(variant.id)}/test`,
@@ -102,25 +145,27 @@ function VariantEditor({
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             sourceText: source,
-            taskBrief: '仅用于 Agent 配置测试，不创建会话。',
-            endpointId: Number(endpointId),
-            model: model.trim(),
+            taskBrief,
+            additionalInstruction,
+            endpointId: effectiveEndpointId,
+            model: effectiveModel,
           }),
         },
       )
       const payload = await response.json() as {
+        raw?: string
         body?: string
         annotation?: string | null
         error?: string
       }
       if (!response.ok) throw new Error(payload.error ?? '测试调用失败')
-      setResult(
-        `${payload.body ?? ''}${
-          payload.annotation ? `\n\n---\n${payload.annotation}` : ''
-        }`,
-      )
+      setResult({
+        raw: payload.raw,
+        body: payload.body ?? '',
+        annotation: payload.annotation ?? null,
+      })
     } catch (error) {
-      setResult(error instanceof Error ? error.message : '测试调用失败')
+      setTestError(error instanceof Error ? error.message : '测试调用失败')
     } finally {
       setTesting(false)
     }
@@ -129,7 +174,12 @@ function VariantEditor({
   return (
     <details className="mt-3 rounded-sm border border-line bg-paper/55">
       <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-ink-2">
-        配置、启停与测试
+        独立模型、启停与测试
+        <span className="ml-2 font-normal text-ink-4">
+          {variant.modelOverride
+            ? `当前：${variant.modelOverride}`
+            : `当前：跟随默认${defaultBinding.model ? `（${defaultBinding.model}）` : ''}`}
+        </span>
       </summary>
       <div className="space-y-3 border-t border-line px-3 py-3">
         <label className="flex items-center gap-2 text-xs text-ink-2">
@@ -144,7 +194,10 @@ function VariantEditor({
         <div className="grid gap-3 sm:grid-cols-2">
           <select
             value={endpointId}
-            onChange={(event) => setEndpointId(event.target.value)}
+            onChange={(event) => {
+              setEndpointId(event.target.value)
+              setModel('')
+            }}
             className="h-9 rounded-sm border border-line-2 bg-paper-raise px-2 text-sm"
             aria-label={`${variant.catalogName} 端点覆盖`}
           >
@@ -155,11 +208,18 @@ function VariantEditor({
               </option>
             ))}
           </select>
-          <Input
+          <ModelPicker
+            endpointId={
+              endpointId ? Number(endpointId) : defaultBinding.endpointId
+            }
             value={model}
-            onChange={(event) => setModel(event.target.value)}
-            placeholder="模型覆盖（留空则跟随工作流）"
-            aria-label={`${variant.catalogName} 模型覆盖`}
+            onChange={setModel}
+            emptyLabel={
+              defaultBinding.model
+                ? `跟随默认：${defaultBinding.model}`
+                : '跟随工作流默认模型'
+            }
+            ariaLabel={`${variant.catalogName} 独立模型`}
           />
         </div>
         {!builtin && (
@@ -186,27 +246,48 @@ function VariantEditor({
         <Button size="sm" disabled={saving} onClick={() => void save()}>
           {saving && <Spinner size="sm" />}保存配置
         </Button>
-        <div className="border-t border-line pt-3">
+        <div className="space-y-2 border-t border-line pt-3">
+          <div>
+            <p className="text-xs font-medium text-ink">独立文本测试</p>
+            <p className="mt-1 text-xs leading-5 text-ink-4">
+              只调用当前 Agent，不创建会话，也不进入正式实验结果。
+            </p>
+          </div>
           <Textarea
             rows={3}
             value={source}
             onChange={(event) => setSource(event.target.value)}
-            placeholder="输入一小段原文进行测试；测试不会创建会话。"
+            placeholder="输入用于校准这个角色的独立原文"
+            aria-label={`${variant.catalogName} 独立测试原文`}
+          />
+          <Textarea
+            rows={2}
+            value={taskBrief}
+            onChange={(event) => setTaskBrief(event.target.value)}
+            placeholder="可选：本次测试的翻译要求"
+            aria-label={`${variant.catalogName} 独立测试任务要求`}
+          />
+          <Textarea
+            rows={2}
+            value={additionalInstruction}
+            onChange={(event) => setAdditionalInstruction(event.target.value)}
+            placeholder="可选：只对这个 Agent 生效的补充要求"
+            aria-label={`${variant.catalogName} 独立测试补充要求`}
           />
           <Button
-            className="mt-2"
             variant="outline"
             size="sm"
             disabled={testing}
             onClick={() => void testAgent()}
           >
-            {testing && <Spinner size="sm" />}测试调用
+            {testing && <Spinner size="sm" />}运行独立测试
           </Button>
-          {result && (
-            <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded-sm border border-line bg-paper px-3 py-2 text-xs leading-5 text-ink-2">
-              {result}
-            </pre>
+          {testError && (
+            <p className="rounded-sm border border-cinnabar/30 bg-cinnabar/5 px-3 py-2 text-xs text-cinnabar">
+              {testError}
+            </p>
           )}
+          {result && <IndependentTestOutput result={result} />}
         </div>
       </div>
     </details>
@@ -228,16 +309,35 @@ export function AgentLibraryPanel({ notify }: { notify: NotifyFn }) {
   const [otherDescription, setOtherDescription] = useState('')
   const [otherPrompt, setOtherPrompt] = useState('')
   const [category, setCategory] = useState<AgentCategory>('expression')
+  const [previewSource, setPreviewSource] = useState('')
+  const [previewTaskBrief, setPreviewTaskBrief] = useState('')
+  const [previewInstruction, setPreviewInstruction] = useState('')
+  const [previewEndpointId, setPreviewEndpointId] = useState('')
+  const [previewModel, setPreviewModel] = useState('')
+  const [previewResult, setPreviewResult] =
+    useState<IndependentTestResult | null>(null)
+  const [previewError, setPreviewError] = useState('')
+  const [previewTesting, setPreviewTesting] = useState(false)
   const [profile, setProfile] = useState<{
     defaultWorker: ModelBinding
     mainAgent: ModelBinding
+    reviewAgent: ModelBinding
+    filterAgent: ModelBinding
+    orchestrateAgent: ModelBinding
+    assembleAgent: ModelBinding
     editingAgent: ModelBinding
   }>({
     defaultWorker: { endpointId: null, model: '' },
     mainAgent: { endpointId: null, model: '' },
+    reviewAgent: { endpointId: null, model: '' },
+    filterAgent: { endpointId: null, model: '' },
+    orchestrateAgent: { endpointId: null, model: '' },
+    assembleAgent: { endpointId: null, model: '' },
     editingAgent: { endpointId: null, model: '' },
   })
   const [profileSaving, setProfileSaving] = useState(false)
+  const [testingRole, setTestingRole] = useState<string | null>(null)
+  const [roleTestStatus, setRoleTestStatus] = useState<Record<string, string>>({})
 
   const load = useCallback(async () => {
     const [response, endpointResponse, profileResponse] = await Promise.all([
@@ -278,6 +378,52 @@ export function AgentLibraryPanel({ notify }: { notify: NotifyFn }) {
       })
     } finally {
       setProfileSaving(false)
+    }
+  }
+
+  async function testProfileBinding(
+    key: keyof typeof profile,
+    label: string,
+  ) {
+    const binding = profile[key]
+    if (!binding.endpointId || !binding.model.trim()) {
+      setRoleTestStatus((current) => ({
+        ...current,
+        [key]: '请先选择端点和模型。',
+      }))
+      return
+    }
+    setTestingRole(key)
+    setRoleTestStatus((current) => ({ ...current, [key]: '正在发送最小请求…' }))
+    try {
+      const response = await fetch(`/api/endpoints/${binding.endpointId}/test`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: binding.model }),
+      })
+      const payload = await response.json().catch(() => null) as {
+        latencyMs?: number
+        error?: string
+        diagnosticId?: string
+      } | null
+      if (!response.ok) {
+        throw new Error(
+          `${payload?.error ?? '连接测试失败'}${
+            payload?.diagnosticId ? `（诊断 ID：${payload.diagnosticId}）` : ''
+          }`,
+        )
+      }
+      setRoleTestStatus((current) => ({
+        ...current,
+        [key]: `连接成功 · ${payload?.latencyMs ?? 0} ms`,
+      }))
+    } catch (error) {
+      setRoleTestStatus((current) => ({
+        ...current,
+        [key]: error instanceof Error ? error.message : `${label}连接测试失败`,
+      }))
+    } finally {
+      setTestingRole(null)
     }
   }
 
@@ -372,6 +518,13 @@ export function AgentLibraryPanel({ notify }: { notify: NotifyFn }) {
       setOtherDescription('')
       setOtherPrompt('')
       setBoth(false)
+      setPreviewSource('')
+      setPreviewTaskBrief('')
+      setPreviewInstruction('')
+      setPreviewEndpointId('')
+      setPreviewModel('')
+      setPreviewResult(null)
+      setPreviewError('')
       notify('自定义 Agent 已创建', { tone: 'inverted' })
       await load()
     } catch (error) {
@@ -380,6 +533,58 @@ export function AgentLibraryPanel({ notify }: { notify: NotifyFn }) {
       })
     } finally {
       setSaving(false)
+    }
+  }
+
+  async function previewCustomAgent() {
+    const effectiveEndpointId = previewEndpointId
+      ? Number(previewEndpointId)
+      : profile.defaultWorker.endpointId
+    const effectiveModel =
+      previewModel.trim() || profile.defaultWorker.model.trim()
+    if (!prompt.trim()) {
+      notify('请先填写当前方向的角色提示词')
+      return
+    }
+    if (!previewSource.trim() || !effectiveEndpointId || !effectiveModel) {
+      notify('独立测试需要原文、端点和模型')
+      return
+    }
+
+    setPreviewTesting(true)
+    setPreviewResult(null)
+    setPreviewError('')
+    try {
+      const response = await fetch('/api/agent-catalog/preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          direction,
+          promptLanguage: direction === 'en_to_zh' ? 'zh' : 'en',
+          rolePrompt: prompt,
+          sourceText: previewSource,
+          taskBrief: previewTaskBrief,
+          additionalInstruction: previewInstruction,
+          endpointId: effectiveEndpointId,
+          model: effectiveModel,
+        }),
+      })
+      const payload = await response.json() as {
+        raw?: string
+        body?: string
+        annotation?: string | null
+        error?: string
+      }
+      if (!response.ok) throw new Error(payload.error ?? '独立测试失败')
+      setPreviewResult({
+        raw: payload.raw,
+        body: payload.body ?? '',
+        annotation: payload.annotation ?? null,
+      })
+    } catch (error) {
+      setPreviewError(error instanceof Error ? error.message : '独立测试失败')
+    } finally {
+      setPreviewTesting(false)
     }
   }
 
@@ -400,46 +605,84 @@ export function AgentLibraryPanel({ notify }: { notify: NotifyFn }) {
         <div className="space-y-3 border-t border-line px-3 py-3">
           {([
             ['defaultWorker', '默认翻译 Agent', '无单独覆盖时使用'],
-            ['mainAgent', '主 Agent / 四阶段', '组队、成稿与统筹'],
+            ['mainAgent', '主 Agent', '理解任务与选择候选 Agent'],
+            ['reviewAgent', '审查', '核对忠实度、误读、漏译与约束'],
+            ['filterAgent', '筛选', '比较候选并保留可用方案'],
+            ['orchestrateAgent', '编排', '平衡候选并审查用词、句法与连贯性'],
+            ['assembleAgent', '组装', '依据审议结果形成正式译文'],
             ['editingAgent', '编辑 Agent', '最终版本对话修改'],
           ] as const).map(([key, label, hint]) => (
-            <div key={key} className="grid gap-2 sm:grid-cols-[1fr_1fr_1.2fr] sm:items-center">
+            <div
+              key={key}
+              className="grid min-w-0 gap-3 border-b border-line/70 pb-3 last:border-b-0 last:pb-0 md:grid-cols-[minmax(8rem,0.55fr)_minmax(0,1.8fr)] md:items-start"
+            >
               <div>
                 <p className="text-xs font-medium text-ink">{label}</p>
                 <p className="text-xs text-ink-4">{hint}</p>
               </div>
-              <select
-                value={profile[key].endpointId?.toString() ?? ''}
-                onChange={(event) =>
-                  setProfile((current) => ({
-                    ...current,
-                    [key]: {
-                      ...current[key],
-                      endpointId: event.target.value
-                        ? Number(event.target.value)
-                        : null,
-                    },
-                  }))
-                }
-                className="h-9 rounded-sm border border-line-2 bg-paper-raise px-2 text-sm"
-              >
-                <option value="">未配置</option>
-                {endpoints.map((endpoint) => (
-                  <option key={endpoint.id} value={endpoint.id}>
-                    {endpoint.name}
-                  </option>
-                ))}
-              </select>
-              <Input
-                value={profile[key].model}
-                onChange={(event) =>
-                  setProfile((current) => ({
-                    ...current,
-                    [key]: { ...current[key], model: event.target.value },
-                  }))
-                }
-                placeholder="模型名称"
-              />
+              <div className="grid min-w-0 gap-2 xl:grid-cols-[minmax(7rem,0.7fr)_minmax(0,1.7fr)_4rem] xl:items-start">
+                <select
+                  value={profile[key].endpointId?.toString() ?? ''}
+                  aria-label={`${label}端点`}
+                  onChange={(event) =>
+                    setProfile((current) => ({
+                      ...current,
+                      [key]: {
+                        endpointId: event.target.value
+                          ? Number(event.target.value)
+                          : null,
+                        model: '',
+                        contextWindow:
+                          endpoints.find(
+                            (endpoint) => endpoint.id === Number(event.target.value),
+                          )?.context_window ?? null,
+                      },
+                    }))
+                  }
+                  className="h-9 min-w-0 w-full rounded-sm border border-line-2 bg-paper-raise px-2 text-sm"
+                >
+                  <option value="">未配置</option>
+                  {endpoints.map((endpoint) => (
+                    <option key={endpoint.id} value={endpoint.id}>
+                      {endpoint.name}
+                    </option>
+                  ))}
+                </select>
+                <ModelPicker
+                  endpointId={profile[key].endpointId}
+                  value={profile[key].model}
+                  onChange={(model) =>
+                    setProfile((current) => ({
+                      ...current,
+                      [key]: { ...current[key], model },
+                    }))
+                  }
+                  emptyLabel="选择模型"
+                  ariaLabel={`${label}模型`}
+                />
+                <div className="min-h-[3.25rem] min-w-0">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    className="w-full"
+                    disabled={testingRole != null}
+                    onClick={() => void testProfileBinding(key, label)}
+                  >
+                    {testingRole === key && <Spinner size="sm" />}
+                    测试
+                  </Button>
+                  <p
+                    className={`mt-1 min-h-4 break-words text-[10px] leading-4 ${
+                      roleTestStatus[key]?.startsWith('连接成功')
+                        ? 'text-ink-4'
+                        : 'text-cinnabar'
+                    }`}
+                  >
+                    {roleTestStatus[key] ?? ''}
+                  </p>
+                </div>
+              </div>
             </div>
           ))}
           <Button
@@ -471,6 +714,11 @@ export function AgentLibraryPanel({ notify }: { notify: NotifyFn }) {
                       {archetype?.isBuiltin ? '内置' : '自定义'}
                     </Badge>
                     <Badge variant="subtle">{archetype?.category ?? 'custom'}</Badge>
+                    <Badge variant={variant.modelOverride ? 'outline' : 'subtle'}>
+                      {variant.modelOverride
+                        ? `独立：${variant.modelOverride}`
+                        : '跟随默认模型'}
+                    </Badge>
                   </div>
                   <p className="mt-1 text-xs leading-5 text-ink-3">
                     {variant.catalogDescription}
@@ -505,6 +753,7 @@ export function AgentLibraryPanel({ notify }: { notify: NotifyFn }) {
                 variant={variant}
                 builtin={Boolean(archetype?.isBuiltin)}
                 endpoints={endpoints}
+                defaultBinding={profile.defaultWorker}
                 notify={notify}
                 onChanged={load}
               />
@@ -564,6 +813,86 @@ export function AgentLibraryPanel({ notify }: { notify: NotifyFn }) {
                 : 'Role prompt for this direction (English)'
             }
           />
+          <details className="rounded-sm border border-line bg-paper/55" open>
+            <summary className="cursor-pointer px-3 py-2 text-sm font-medium text-ink-2">
+              用独立文本试跑未保存的提示词
+            </summary>
+            <div className="space-y-2 border-t border-line px-3 py-3">
+              <p className="text-xs leading-5 text-ink-4">
+                只校准当前角色，不创建 Agent、会话或实验记录。不同角色不需要得出相同译文。
+              </p>
+              <Textarea
+                rows={4}
+                value={previewSource}
+                onChange={(event) => setPreviewSource(event.target.value)}
+                placeholder="独立测试原文"
+                aria-label="新建 Agent 独立测试原文"
+              />
+              <Textarea
+                rows={2}
+                value={previewTaskBrief}
+                onChange={(event) => setPreviewTaskBrief(event.target.value)}
+                placeholder="可选：本次测试的翻译要求"
+                aria-label="新建 Agent 独立测试任务要求"
+              />
+              <Textarea
+                rows={2}
+                value={previewInstruction}
+                onChange={(event) => setPreviewInstruction(event.target.value)}
+                placeholder="可选：只对这个 Agent 生效的补充要求"
+                aria-label="新建 Agent 独立测试补充要求"
+              />
+              <div className="grid gap-2 sm:grid-cols-2">
+                <select
+                  value={previewEndpointId}
+                  onChange={(event) => {
+                    setPreviewEndpointId(event.target.value)
+                    setPreviewModel('')
+                  }}
+                  className="h-9 rounded-sm border border-line-2 bg-paper-raise px-2 text-sm"
+                  aria-label="新建 Agent 独立测试端点"
+                >
+                  <option value="">跟随默认翻译 Agent 端点</option>
+                  {endpoints.map((endpoint) => (
+                    <option key={endpoint.id} value={endpoint.id}>
+                      {endpoint.name}
+                    </option>
+                  ))}
+                </select>
+                <ModelPicker
+                  endpointId={
+                    previewEndpointId
+                      ? Number(previewEndpointId)
+                      : profile.defaultWorker.endpointId
+                  }
+                  value={previewModel}
+                  onChange={setPreviewModel}
+                  emptyLabel={
+                    profile.defaultWorker.model
+                      ? `跟随默认：${profile.defaultWorker.model}`
+                      : '选择测试模型'
+                  }
+                  ariaLabel="新建 Agent 独立测试模型"
+                />
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={previewTesting}
+                onClick={() => void previewCustomAgent()}
+              >
+                {previewTesting && <Spinner size="sm" />}运行独立测试
+              </Button>
+              {previewError && (
+                <p className="rounded-sm border border-cinnabar/30 bg-cinnabar/5 px-3 py-2 text-xs text-cinnabar">
+                  {previewError}
+                </p>
+              )}
+              {previewResult && (
+                <IndependentTestOutput result={previewResult} />
+              )}
+            </div>
+          </details>
           <label className="flex items-center gap-2 text-sm text-ink-2">
             <input
               type="checkbox"

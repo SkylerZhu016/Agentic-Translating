@@ -97,6 +97,23 @@ Review → Filter → Orchestrate → Assemble
 
 Stages cannot be skipped, and no fifth stage is added. Each stage uses the prompt package for the current direction. The Assemble stage creates the first draft, which then enters the same traceable editor workflow.
 
+### Six Independently Bound Execution Roles
+
+Candidate agents retain their own model overrides. The execution chain around them has six separate bindings:
+
+| Role | Responsibility |
+|---|---|
+| Main Agent | Dynamic team selection, or evidence-based drafting in Main Agent mode |
+| Review | Recheck omissions, mistranslations, additions, modifier scope, and constraints against the source |
+| Filter | Decide which candidate treatments have enough evidence to continue |
+| Orchestrate | Make passage-level choices and audit terminology, grammar, voice, and whole-text coherence |
+| Assemble | Produce the formal translation and perform a final source check |
+| Editing Agent | Apply conversational edits as traceable patches |
+
+Each binding can select its own endpoint, model, and context window. New sessions and preset revisions freeze all six bindings, so later configuration changes cannot alter an active or historical run. Older snapshots fall back to their legacy Main Agent binding in read-only compatibility mode.
+
+Stage events record the endpoint and model actually resolved at runtime. This makes it possible to distinguish a binding mistake, a gateway failure, and a model that is still performing a long reasoning pass.
+
 ## 7. Custom Agents
 
 Custom directions can be English-to-Chinese, Chinese-to-English, bidirectional, or a custom language pair. Bidirectional agents must fill in two separate purpose descriptions and prompts. The system will not automatically translate role definitions. Modifying or deleting an agent does not affect the complete snapshots of existing sessions or preset revisions.

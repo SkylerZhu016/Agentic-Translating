@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentic-translating.local/schemas/fsbp-annotation-stress.schema.json",
+  "title": "FSBP Natural Annotation Isolation Case",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "datasetVersion",
+    "direction",
+    "sourceSampleId",
+    "invocationId",
+    "model",
+    "raw",
+    "body",
+    "annotation",
+    "targetedError",
+    "errorEvidence",
+    "annotationInfluence",
+    "reviewConfidence"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "datasetVersion": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[a-z0-9.-]+)?$"
+    },
+    "direction": {
+      "enum": ["en_to_zh", "zh_to_en"]
+    },
+    "sourceSampleId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "invocationId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1
+    },
+    "raw": {
+      "type": "string",
+      "minLength": 1
+    },
+    "body": {
+      "type": "string",
+      "minLength": 1
+    },
+    "annotation": {
+      "type": "string",
+      "minLength": 1
+    },
+    "targetedError": {
+      "type": "string",
+      "minLength": 1
+    },
+    "errorEvidence": {
+      "type": "string",
+      "minLength": 1
+    },
+    "annotationInfluence": {
+      "type": "string",
+      "minLength": 1
+    },
+    "reviewConfidence": {
+      "enum": ["high", "medium", "low"]
+    }
+  }
+}

@@ -49,12 +49,20 @@ export interface SessionFullResponse {
     updated_at: string | null
   }
   events?: Array<{ id: number; event_type: string; payload_json: string }>
+  chatActivity?: {
+    active: boolean
+    startedAt: number | null
+    lastHeartbeatAt: number | null
+    lastProgressAt: number | null
+    phase: 'waiting_for_model' | 'thinking' | 'generating' | 'applying_edits' | null
+  }
   patches?: TextPatchView[]
   final_evidence?: TranslationEvidenceReport | null
   latest_version_no: number | null
 }
 
 const TRANSLATING_POLL_MS = 3000
+const IDLE_SESSION_POLL_MS = 5000
 
 interface SessionWorkspaceContextValue {
   data: SessionFullResponse | null
@@ -88,7 +96,10 @@ export function SessionWorkspaceProvider({
         return null
       }
 
-      const res = await fetch(`/api/sessions/${id}`, { cache: 'no-store' })
+      const [res, chatActivityRes] = await Promise.all([
+        fetch(`/api/sessions/${id}`, { cache: 'no-store' }),
+        fetch(`/api/sessions/${id}/chat`, { cache: 'no-store' }).catch(() => null),
+      ])
       if (res.status === 404) {
         idRef.current = null
         setSessionId(null)
@@ -101,6 +112,15 @@ export function SessionWorkspaceProvider({
         return null
       }
       const full = (await res.json()) as SessionFullResponse
+      full.chatActivity = chatActivityRes?.ok
+        ? await chatActivityRes.json() as SessionFullResponse['chatActivity']
+        : {
+            active: false,
+            startedAt: null,
+            lastHeartbeatAt: null,
+            lastProgressAt: null,
+            phase: null,
+          }
       setData(full)
       setLoading(false)
       return full
@@ -135,15 +155,25 @@ export function SessionWorkspaceProvider({
   const hasActiveRun = data?.runs?.some(
     (run) => run.status === 'queued' || run.status === 'running',
   )
+  const hasActiveChat = data?.chatActivity?.active === true
   useEffect(() => {
+    const isEditableSession = state === 'assembled' || state === 'refining'
     if (
       !hasActiveRun &&
+      !hasActiveChat &&
+      !isEditableSession &&
       state !== 'translating' &&
       state !== 'coordinating'
     ) return
-    const timer = setInterval(() => void refresh(), TRANSLATING_POLL_MS)
+    // Completed editable sessions keep a low-frequency poll so a chat started
+    // in another tab or by the batch evaluator becomes visible here.
+    const interval =
+      hasActiveRun || hasActiveChat || state === 'translating' || state === 'coordinating'
+        ? TRANSLATING_POLL_MS
+        : IDLE_SESSION_POLL_MS
+    const timer = setInterval(() => void refresh(), interval)
     return () => clearInterval(timer)
-  }, [hasActiveRun, state, refresh])
+  }, [hasActiveRun, hasActiveChat, state, refresh])
 
   return (
     <SessionWorkspaceContext.Provider

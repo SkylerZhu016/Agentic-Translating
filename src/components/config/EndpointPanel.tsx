@@ -22,6 +22,7 @@ import {
   resolveChatCompletionsUrl,
   splitEndpointAddress,
 } from '@/src/lib/llm/endpoint-url'
+import { ModelPicker } from './ModelPicker'
 
 const ENDPOINT_PRESETS = [
   { name: 'OpenAI', base_url: 'https://api.openai.com', path: '/v1/chat/completions' },
@@ -73,6 +74,8 @@ export function EndpointPanel({ endpoints, agents, notify, onChanged }: Endpoint
     setChatPath(DEFAULT_CHAT_COMPLETIONS_PATH)
     setApiKey('')
     setContextWindow('')
+    setTestModel('')
+    setTestStatus('')
     setShowKey(false)
     setErrors({})
     setFormOpen(true)
@@ -85,6 +88,8 @@ export function EndpointPanel({ endpoints, agents, notify, onChanged }: Endpoint
     setChatPath(ep.chat_completions_path)
     setApiKey('')
     setContextWindow(ep.context_window?.toString() ?? '')
+    setTestModel('')
+    setTestStatus('')
     setShowKey(false)
     setErrors({})
     setFormOpen(true)
@@ -382,12 +387,17 @@ export function EndpointPanel({ endpoints, agents, notify, onChanged }: Endpoint
           </Field>
           {editing && (
             <div className="rounded-sm border border-line bg-paper/55 px-3 py-3">
-              <p className="mb-2 text-xs font-medium text-ink-2">独立连接测试</p>
-              <div className="flex gap-2">
-                <Input
+              <p className="text-xs font-medium text-ink-2">模型列表与连接测试</p>
+              <p className="mb-2 mt-1 text-xs leading-5 text-ink-4">
+                通过服务端读取此端点的 /models；API Key 不会进入浏览器。
+              </p>
+              <div className="space-y-2">
+                <ModelPicker
+                  endpointId={editing.id}
                   value={testModel}
-                  onChange={(event) => setTestModel(event.target.value)}
-                  placeholder="用于测试的模型名称"
+                  onChange={setTestModel}
+                  emptyLabel="选择用于测试的模型"
+                  ariaLabel="端点测试模型"
                 />
                 <Button
                   size="sm"

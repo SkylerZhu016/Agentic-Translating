@@ -12,12 +12,12 @@ import {
 } from '../../src/lib/constants'
 
 describe('operational constants', () => {
-  it('AGENT_TIMEOUT_MS = 120000', () => {
-    expect(AGENT_TIMEOUT_MS).toBe(120_000)
+  it('AGENT_TIMEOUT_MS = 20 minutes', () => {
+    expect(AGENT_TIMEOUT_MS).toBe(20 * 60_000)
   })
 
-  it('AGENT_MAX_DURATION_MS = 15 minutes', () => {
-    expect(AGENT_MAX_DURATION_MS).toBe(15 * 60_000)
+  it('AGENT_MAX_DURATION_MS = 90 minutes', () => {
+    expect(AGENT_MAX_DURATION_MS).toBe(90 * 60_000)
   })
 
   it('MAX_CONCURRENCY = 8', () => {

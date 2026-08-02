@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentic-translating.local/schemas/fsbp-sample.schema.json",
+  "title": "FSBP Translation Quality Sample",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "datasetVersion",
+    "split",
+    "direction",
+    "category",
+    "sourceForm",
+    "genre",
+    "era",
+    "canonicality",
+    "sourceText",
+    "taskBrief",
+    "difficultyTags",
+    "deterministicConstraints",
+    "source",
+    "reviewerChecklist",
+    "contentHash"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "datasetVersion": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[a-z0-9.-]+)?$"
+    },
+    "split": {
+      "enum": ["dev", "test"]
+    },
+    "direction": {
+      "enum": ["en_to_zh", "zh_to_en"]
+    },
+    "category": {
+      "enum": ["poetry", "literary", "cultural_argument", "nonliterary"]
+    },
+    "sourceForm": {
+      "enum": [
+        "poetry",
+        "english_prose",
+        "classical_chinese_prose",
+        "modern_chinese_prose"
+      ]
+    },
+    "genre": {
+      "type": "string",
+      "minLength": 1
+    },
+    "era": {
+      "enum": ["ancient", "medieval", "early_modern", "modern", "contemporary"]
+    },
+    "canonicality": {
+      "enum": ["low", "medium", "high"]
+    },
+    "sourceText": {
+      "type": "string",
+      "minLength": 1
+    },
+    "contextBefore": {
+      "type": "string"
+    },
+    "contextAfter": {
+      "type": "string"
+    },
+    "taskBrief": {
+      "type": "string",
+      "minLength": 1
+    },
+    "difficultyTags": {
+      "type": "array",
+      "minItems": 2,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "deterministicConstraints": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "author",
+        "title",
+        "edition",
+        "url",
+        "excerptBounds",
+        "rightsBasis"
+      ],
+      "properties": {
+        "author": {
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "year": {
+          "type": "integer"
+        },
+        "edition": {
+          "type": "string",
+          "minLength": 1
+        },
+        "url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "excerptBounds": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rightsBasis": {
+          "type": "string",
+          "minLength": 1
+        },
+        "licenseUrl": {
+          "type": "string",
+          "format": "uri"
+        }
+      }
+    },
+    "reviewerChecklist": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "contentHash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    }
+  }
+}

@@ -13,8 +13,7 @@ const nextConfig: NextConfig = {
       './e2e/**/*',
       './playwright-report/**/*',
       './test-results/**/*',
-      './experiments/results/**/*',
-      './experiments/reports/**/*',
+      './FSBP_Test/**/*',
     ],
   },
 };

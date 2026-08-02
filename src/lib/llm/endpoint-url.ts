@@ -33,3 +33,21 @@ export function resolveChatCompletionsUrl(endpoint: {
 }): string {
   return `${endpoint.baseUrl.replace(/\/+$/, '')}${normalizeChatCompletionsPath(endpoint.chatCompletionsPath)}`
 }
+
+/**
+ * Resolve the OpenAI-compatible model catalogue next to the configured chat
+ * completions endpoint. Keeping this derivation server-side means API keys
+ * never need to be exposed to the browser.
+ */
+export function resolveModelsUrl(endpoint: {
+  baseUrl: string
+  chatCompletionsPath?: string | null
+}): string {
+  const chatPath = normalizeChatCompletionsPath(
+    endpoint.chatCompletionsPath,
+  ).replace(/\/+$/, '')
+  const modelsPath = /\/chat\/completions$/i.test(chatPath)
+    ? chatPath.replace(/\/chat\/completions$/i, '/models')
+    : '/v1/models'
+  return `${endpoint.baseUrl.replace(/\/+$/, '')}${modelsPath}`
+}

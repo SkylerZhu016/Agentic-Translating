@@ -200,6 +200,10 @@ export interface ConfigSnapshot {
   modelBindings?: {
     defaultWorker: ModelBinding
     mainAgent: ModelBinding
+    reviewAgent?: ModelBinding
+    filterAgent?: ModelBinding
+    orchestrateAgent?: ModelBinding
+    assembleAgent?: ModelBinding
     editingAgent: ModelBinding
   }
   presetRevisionSnapshot?: WorkflowPresetRevision | null
@@ -210,6 +214,7 @@ export interface ConfigSnapshot {
     teamPolicy: TeamPolicy
     reviewMode: ReviewMode
     maxAgentCalls: number
+    candidateAnnotationMode?: import('./vnext').CandidateAnnotationMode
   }
 }
 

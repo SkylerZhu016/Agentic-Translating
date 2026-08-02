@@ -6,4 +6,7 @@
 // at app/api/sessions/[id]/chat/handlers.ts (Wave 3 Task 19).
 // ---------------------------------------------------------------------------
 
-export { createHandlers as createChatHandlers } from '@/app/api/sessions/[id]/chat/handlers'
+export {
+  buildRevisionReferenceMessage,
+  createHandlers as createChatHandlers,
+} from '@/app/api/sessions/[id]/chat/handlers'

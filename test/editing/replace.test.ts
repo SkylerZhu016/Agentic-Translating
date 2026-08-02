@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { applyReplacement, applyReplacementBatch } from '@/src/lib/editing/replace';
+import {
+  applyExactReplacement,
+  applyExactReplacementBatch,
+  applyReplacement,
+  applyReplacementBatch,
+} from '@/src/lib/editing/replace';
 import type { ReplaceResult, BatchResult } from '@/src/lib/editing/replace';
 
 describe('applyReplacement — single', () => {
@@ -178,5 +183,40 @@ describe('applyReplacementBatch — transactional', () => {
     ]) as Extract<BatchResult, { ok: true }>;
     expect(r.ok).toBe(true);
     expect(r.newText).toBe('A\r\nBB\r\nC');
+  });
+});
+
+describe('exact-only replacement for LLM tool calls', () => {
+  it('rejects a close fuzzy phrase and returns a diagnostic excerpt', () => {
+    const result = applyExactReplacement(
+      'hello world',
+      'helo world',
+      'hi there',
+    ) as Extract<ReplaceResult, { ok: false }>;
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toContain('character-for-character');
+    expect(result.suggestions).toContain('hello world');
+  });
+
+  it('rejects an ambiguous exact phrase', () => {
+    const result = applyExactReplacement(
+      'X Y X',
+      'X',
+      'Z',
+    ) as Extract<ReplaceResult, { ok: false }>;
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toContain('ambiguous exact match');
+    expect(result.matchCount).toBe(2);
+  });
+
+  it('applies a sequential batch transactionally when every span is exact', () => {
+    const result = applyExactReplacementBatch('alpha beta gamma', [
+      { old_string: 'alpha', new_string: 'A' },
+      { old_string: 'beta', new_string: 'B' },
+    ]) as Extract<BatchResult, { ok: true }>;
+
+    expect(result.newText).toBe('A B gamma');
   });
 });

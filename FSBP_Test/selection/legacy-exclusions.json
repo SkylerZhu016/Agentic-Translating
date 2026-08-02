@@ -1,0 +1,125 @@
+{
+  "description": "Fingerprints of the removed pilot dataset. These entries prevent accidental reuse without retaining the old source texts or experimental outputs.",
+  "samples": [
+    {
+      "legacyId": "en-01-tyger",
+      "direction": "en_to_zh",
+      "source": "William Blake, The Tyger (1794)",
+      "sourceTextHash": "ee436af07ddf3bf2abe72fe5c2988ce4a0cb97674d3b9af3f7f1c632658683c1"
+    },
+    {
+      "legacyId": "en-02-daffodils",
+      "direction": "en_to_zh",
+      "source": "William Wordsworth, I Wandered Lonely as a Cloud (1807)",
+      "sourceTextHash": "c55eae1eb87ce261c307702fe6aa1d7ad607de4c166c62bed5c2bb7da9c0f237"
+    },
+    {
+      "legacyId": "en-03-raven",
+      "direction": "en_to_zh",
+      "source": "Edgar Allan Poe, The Raven (1845)",
+      "sourceTextHash": "aeb096f5f6826f2b7eb93bd424d124aa95906ee3538710cfd4f7d961d7cb751d"
+    },
+    {
+      "legacyId": "en-04-hope",
+      "direction": "en_to_zh",
+      "source": "Emily Dickinson, Hope is the thing with feathers (1891)",
+      "sourceTextHash": "f63931910c14cbd8c78f667fef189970b928f5613af7dd6337cfac338266a994"
+    },
+    {
+      "legacyId": "en-05-sonnet18",
+      "direction": "en_to_zh",
+      "source": "William Shakespeare, Sonnet 18 (1609)",
+      "sourceTextHash": "eb094069434716f4b736fa172e76c2e85105a489ad255bed1ec949371f6fa127"
+    },
+    {
+      "legacyId": "en-06-pride",
+      "direction": "en_to_zh",
+      "source": "Jane Austen, Pride and Prejudice (1813)",
+      "sourceTextHash": "ff3583336f59ddbfb6b202e15e9ed7fa05f3b6da8e159cd237af89fc02e5932e"
+    },
+    {
+      "legacyId": "en-07-two-cities",
+      "direction": "en_to_zh",
+      "source": "Charles Dickens, A Tale of Two Cities (1859)",
+      "sourceTextHash": "a02e189601363e91d2d0a499c56cd5f039244bb8fd28e7b9a4f49a84e01b9dc3"
+    },
+    {
+      "legacyId": "en-08-moby",
+      "direction": "en_to_zh",
+      "source": "Herman Melville, Moby-Dick (1851)",
+      "sourceTextHash": "21ecdb7d912294282a553cdae2d69d106ad9c1222948f12684097733b6379a6f"
+    },
+    {
+      "legacyId": "en-09-alice",
+      "direction": "en_to_zh",
+      "source": "Lewis Carroll, Alice's Adventures in Wonderland (1865)",
+      "sourceTextHash": "b45fa75a869fcdc0931cec751a2e478f3db9113558211e3c9b0232d4d2535c05"
+    },
+    {
+      "legacyId": "en-10-walden",
+      "direction": "en_to_zh",
+      "source": "Henry David Thoreau, Walden (1854)",
+      "sourceTextHash": "00fa9c0182226420053db8bd4301dcf9f95ec6d28f103886e74d66f0c697722e"
+    },
+    {
+      "legacyId": "zh-01-jingyesi",
+      "direction": "zh_to_en",
+      "source": "李白《静夜思》",
+      "sourceTextHash": "f1f0f65237dec7f22ed56bdb3c6d1f5e69f728652ef2979e9de9bc8cddcded92"
+    },
+    {
+      "legacyId": "zh-02-chunxiao",
+      "direction": "zh_to_en",
+      "source": "孟浩然《春晓》",
+      "sourceTextHash": "14d30f9ba1aaf0dd1c215a6428d5eb91b3d0e4f99c35db51e44819d0838e9593"
+    },
+    {
+      "legacyId": "zh-03-dengguanquelou",
+      "direction": "zh_to_en",
+      "source": "王之涣《登鹳雀楼》",
+      "sourceTextHash": "f4e82803d970dae761f94c2c5c4ed5dd6e6d640f28e671b6bb3cf756cf5c9ec8"
+    },
+    {
+      "legacyId": "zh-04-jiangxue",
+      "direction": "zh_to_en",
+      "source": "柳宗元《江雪》",
+      "sourceTextHash": "4f213e64143d41ad75c4ce42876d6d3d683700cffcda5be21bd62ad384f178c8"
+    },
+    {
+      "legacyId": "zh-05-yinjiu",
+      "direction": "zh_to_en",
+      "source": "陶渊明《饮酒·其五》节选",
+      "sourceTextHash": "d53af368f0e5de858f07e02e483fc74cd4e6d2e25d5042e12eed9daf40f3481e"
+    },
+    {
+      "legacyId": "zh-06-taohuayuan",
+      "direction": "zh_to_en",
+      "source": "陶渊明《桃花源记》节选",
+      "sourceTextHash": "bcf972073681cc61cf17458759d3e08715a312d81f40e7f4f4dbb737b80febad"
+    },
+    {
+      "legacyId": "zh-07-yueyanglou",
+      "direction": "zh_to_en",
+      "source": "范仲淹《岳阳楼记》节选",
+      "sourceTextHash": "188f3c4799af423295506b4696225a6a3b7e357032255a27e06fa399ad2a36b4"
+    },
+    {
+      "legacyId": "zh-08-lanting",
+      "direction": "zh_to_en",
+      "source": "王羲之《兰亭集序》节选",
+      "sourceTextHash": "5b9689ae86ab1eb671123b24de93fc652e1f6a67f9d3fe1fffd4455b55d365f3"
+    },
+    {
+      "legacyId": "zh-09-lunyu",
+      "direction": "zh_to_en",
+      "source": "《论语·学而》",
+      "sourceTextHash": "60590f5166596357b18451971100f26b07229b5f1f8814510340d1b7a6b84a1b"
+    },
+    {
+      "legacyId": "zh-10-mengzi",
+      "direction": "zh_to_en",
+      "source": "《孟子·告子上》",
+      "sourceTextHash": "4769c246306812c47df3733de71c0003a8327174e1697fd5b1d417f3cfc3dabc"
+    }
+  ]
+}

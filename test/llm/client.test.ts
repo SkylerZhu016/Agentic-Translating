@@ -22,6 +22,7 @@ import {
   ClientError,
   ToolsNotSupportedError,
   AbortedError,
+  IncompleteOutputError,
   // Types
   type LLMStreamEvent,
   type ChatCompletionRequest,
@@ -150,6 +151,17 @@ describe('chatCompletion', () => {
         function: { name: 'call_agents' },
       });
     });
+
+    it('forwards an explicit completion token budget', async () => {
+      llm.setBehavior('test-model', { behavior: 'non_stream' });
+
+      await chatCompletion(endpoint, makeRequest({ maxTokens: 16_384 }));
+
+      const body = llm.getRequests()[0]?.body as {
+        max_tokens?: unknown
+      };
+      expect(body.max_tokens).toBe(16_384);
+    });
   });
 
   // =========================================================================
@@ -199,6 +211,70 @@ describe('chatCompletion', () => {
         | undefined;
       expect(doneEvent).toBeDefined();
       expect(fullText).toBe(doneEvent!.content);
+    });
+
+    it('rejects a stream that closes without a completion marker', async () => {
+      const http = await import('http');
+      const server = http.createServer((_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.write(`data: ${JSON.stringify({
+          choices: [{
+            index: 0,
+            delta: { content: 'unfinished sentence' },
+            finish_reason: null,
+          }],
+        })}\n\n`);
+        res.end();
+      });
+      await new Promise<void>((resolve) => server.listen(0, resolve));
+      const address = server.address() as { port: number };
+      try {
+        const result = await chatCompletion(
+          { baseUrl: `http://localhost:${address.port}`, apiKey: 'sk-test' },
+          makeRequest({ stream: true }),
+        );
+        await expect(
+          collectStreamEvents(result as AsyncIterable<LLMStreamEvent>),
+        ).rejects.toBeInstanceOf(IncompleteOutputError);
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
+
+    it('rejects finish_reason length instead of accepting truncated text', async () => {
+      const http = await import('http');
+      const server = http.createServer((_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.write(`data: ${JSON.stringify({
+          choices: [{
+            index: 0,
+            delta: { content: 'truncated' },
+            finish_reason: null,
+          }],
+        })}\n\n`);
+        res.write(`data: ${JSON.stringify({
+          choices: [{
+            index: 0,
+            delta: {},
+            finish_reason: 'length',
+          }],
+        })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      });
+      await new Promise<void>((resolve) => server.listen(0, resolve));
+      const address = server.address() as { port: number };
+      try {
+        const result = await chatCompletion(
+          { baseUrl: `http://localhost:${address.port}`, apiKey: 'sk-test' },
+          makeRequest({ stream: true }),
+        );
+        await expect(
+          collectStreamEvents(result as AsyncIterable<LLMStreamEvent>),
+        ).rejects.toBeInstanceOf(IncompleteOutputError);
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
     });
   });
 
@@ -647,8 +723,12 @@ describe('chatCompletion', () => {
         result as AsyncIterable<LLMStreamEvent>,
       );
 
-      // Abort after a short delay (during streaming)
-      await new Promise((r) => setTimeout(r, 30));
+      // Wait until the mock server has accepted the request so this test
+      // exercises a mid-stream abort even when the full suite is under load.
+      const requestDeadline = Date.now() + 1_000;
+      while (llm.getRequests().length === 0 && Date.now() < requestDeadline) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
       controller.abort();
 
       // The consumption should now throw AbortedError

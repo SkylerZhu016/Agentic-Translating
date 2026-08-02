@@ -32,3 +32,8 @@ export const POST = (
   req: NextRequest,
   ctx: { params: Promise<{ id: string }> },
 ) => prod().POST(req, ctx)
+
+export const GET = (
+  req: NextRequest,
+  ctx: { params: Promise<{ id: string }> },
+) => prod().GET(req, ctx)

@@ -58,13 +58,28 @@ This does not mean context is unlimited. It means the system no longer silently 
 
 Every built-in bundle and role variant has a stable ID and an incremental `promptVersion`. New seeds use their own seed version records. The system must not skip new built-in data just because old prompts already exist in the database.
 
+Prompt ownership is split by responsibility:
+
+```text
+src/lib/prompts/bidirectional/
+├─ common.ts       Shared quality, punctuation, and FSBP v2 boundary
+├─ archetypes.ts   Ten stable archetypes and catalog metadata
+├─ en-to-zh.ts     Ten Chinese roles and the Chinese orchestration chain
+├─ zh-to-en.ts     Ten English roles and the English orchestration chain
+└─ index.ts        Versions, defaults, and compatibility exports
+```
+
+Each translation role contains a mission, explained areas of focus, a separate example, a final check, and the final-annotation rule. Shared criteria cover semantic structure, unsupported additions, punctuation, and FSBP. Role criteria develop distinct evidence around fidelity, naturalness, voice, terminology, culture, long context, regulated text, literature, poetry, and dissent. The criteria guide attention without exhausting every valid translation consideration.
+
 Prompt upgrades must satisfy the following:
 
-1. Do not change the FSBP boundary
+1. Keep the prompt's FSBP version and boundary wording synchronized with the parser
 2. Do not parse task instructions into a fixed content schema
 3. Do not set five-character lines or rhyme as the global default for en-to-zh
 4. Do not allow Agents to call other Agents
 5. Do not let roles deliberately lower quality just to stand out
+
+Names, sentences, reference answers, and item-specific findings from locked evaluation texts must not enter production prompts. Lessons from testing are generalized, and examples use situations unrelated to the locked items.
 
 ## 6. Custom Language Pairs
 

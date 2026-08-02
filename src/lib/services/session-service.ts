@@ -15,6 +15,7 @@ import {
   assertTransition,
 } from '../guards'
 import type {
+  ModelBinding,
   ReviewMode,
   TranslationConstraints,
   TranslationDirection,
@@ -273,6 +274,30 @@ export function createSessionService(
           model: coordinator?.model ?? defaultWorker.model,
           contextWindow: null,
         })
+        const roleBinding = (
+          presetBinding: ModelBinding | undefined,
+          profileBinding: ModelBinding | undefined,
+        ): ModelBinding =>
+          presetBinding ??
+          (profileBinding?.endpointId && profileBinding.model
+            ? profileBinding
+            : mainAgent)
+        const reviewAgent = roleBinding(
+          presetRevision?.contract.reviewAgentBinding,
+          profile?.reviewAgent,
+        )
+        const filterAgent = roleBinding(
+          presetRevision?.contract.filterAgentBinding,
+          profile?.filterAgent,
+        )
+        const orchestrateAgent = roleBinding(
+          presetRevision?.contract.orchestrateAgentBinding,
+          profile?.orchestrateAgent,
+        )
+        const assembleAgent = roleBinding(
+          presetRevision?.contract.assembleAgentBinding,
+          profile?.assembleAgent,
+        )
         const editingAgent =
           presetRevision?.contract.editingAgentBinding ??
           (profile?.editingAgent.endpointId && profile.editingAgent.model
@@ -297,7 +322,15 @@ export function createSessionService(
             hasApiKey: endpoint.api_key.length > 0,
             contextWindow: endpoint.context_window ?? null,
           })),
-          modelBindings: { defaultWorker, mainAgent, editingAgent },
+          modelBindings: {
+            defaultWorker,
+            mainAgent,
+            reviewAgent,
+            filterAgent,
+            orchestrateAgent,
+            assembleAgent,
+            editingAgent,
+          },
           presetRevisionSnapshot: presetRevision,
           promptBundleRevisionId: input.promptBundleRevisionId ?? null,
           taskBrief: input.taskBrief ?? '',
@@ -312,6 +345,8 @@ export function createSessionService(
               presetRevision?.contract.reviewMode ??
               'main_editor',
             maxAgentCalls: presetRevision?.contract.maxAgentCalls ?? 5,
+            candidateAnnotationMode:
+              presetRevision?.contract.candidateAnnotationMode ?? 'body_only',
           },
         })
       }

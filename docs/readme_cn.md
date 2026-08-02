@@ -12,7 +12,7 @@
 - 10 个 Agent 原型，每个有 2 个方向变体：忠实、自然、声音、术语、文化、长文本、规范文本、文学、诗歌、异议。
 - 动态组队和固定预设两种模式并存。第一版形成前，系统至少保留两个不同原型的成功候选。
 - 两条成稿路径：主 Agent 直接编辑，或经典的"审查、筛选、编排、组装"四阶段流程。
-- FSBP 自由文本语义边界协议。文档中第一个独立的 `---` 作为分隔线，上方是正文，下方是注释。完整的原文始终存档，下游只继承正文部分。
+- FSBP 自由文本语义边界协议。文档中最后一个独立的 `---` 作为分隔线，上方是正文，下方是注释。完整的原文始终存档，下游只继承正文部分。
 - 工具分阶段暴露：`call_agents`、`write_draft`、`replace_text`、`submit_final`，每轮只注入当前需要的工具。
 - 版本化修改、Unicode 修订对照、证据引用、撤销与恢复。
 - 用户预设版本管理、历史恢复、安全导出，支持最多 100 个文件的批量队列。
@@ -61,7 +61,7 @@ Agent 可以自由表达：
 
 规则：
 
-- 只识别第一个独立成行、去除空白后等于 `---` 的分隔符。
+- 只识别最后一个独立成行、去除空白后等于 `---` 的分隔符。
 - 支持 LF 和 CRLF 换行符。
 - `raw` 内容永久保存并展示。
 - 下游只获取 `body` 部分。
@@ -94,18 +94,19 @@ docker compose up --build
 
 生产 Web 部署必须设置 `AGENTIC_SECRET_KEY` 环境变量。构建、备份与升级说明见 [docs/desktop-build.md](docs/desktop-build.md)。
 
-## 协议实验
+## FSBP 数据集
 
-先编辑 `experiments/configs/main.json` 中的模型名称，并通过环境变量提供 API Key：
+旧版试运行实验已经退役。新版数据集、选型记录、schema、评分规则和研究
+边界位于 [`FSBP_Test/`](../FSBP_Test/README.md)。具体文本在逐项审查确认前
+保持为空。
 
 ```bash
-npm run experiment:protocol -- --config experiments/configs/main.json
-npm run experiment:report -- --run <run-id>
+npm run dataset:validate
+npm run dataset:validate:locked
 ```
 
-实验使用固定的 20 个公共领域双向样本和 6 个误导性注释压力样本，对比 `strict-json`、`freeform-raw` 和 `fsbp-v1` 三种协议。执行器可以按照记录键断点续跑，不会将 API Key 写入结果文件。
-
-使用真实模型进行实验会产生 API 费用。仓库中不预置也不伪造实验结果。
+草稿校验允许选型尚未完成，但会严格验证已经存在的每条记录；锁定校验要求
+8 个开发样本和 24 个测试样本全部确认完成。
 
 ## 开发命令
 
@@ -117,8 +118,8 @@ npm run experiment:report -- --run <run-id>
 | `npm run build` | Next.js 生产构建 |
 | `npm run e2e` | 运行 Playwright 端到端测试 |
 | `npm run package:win` | 打包 Windows NSIS 安装版和便携版 |
-| `npm run experiment:protocol` | 运行协议消融实验 |
-| `npm run experiment:report` | 生成 CSV、Markdown 和 HTML 报告 |
+| `npm run dataset:validate` | 校验选型中的 FSBP 数据集 |
+| `npm run dataset:validate:locked` | 执行完整锁定数据集门禁 |
 
 ## 文档
 

@@ -64,4 +64,59 @@ test.describe('Card centering — mx-auto on grid containers', () => {
     expect(className, 'history container must have mx-auto').toContain('mx-auto')
     expect(className, 'history container must have max-w-5xl').toContain('max-w-5xl')
   })
+
+  test('default model role controls stay inside their card', async ({ page }) => {
+    await page.setViewportSize({ width: 1100, height: 900 })
+    await page.goto('/config')
+    await byTid(page, TID.endpoint.addButton).first().waitFor({ state: 'visible' })
+
+    const panel = page.locator('details').filter({ hasText: '默认模型分工' }).first()
+    await expect(panel).toBeVisible()
+    const panelBox = await panel.boundingBox()
+    expect(panelBox).not.toBeNull()
+
+    const controls = [
+      ...await panel.locator('select').all(),
+      ...await panel.getByRole('button', { name: '刷新', exact: true }).all(),
+      ...await panel.getByRole('button', { name: '手动', exact: true }).all(),
+      ...await panel.getByRole('button', { name: '测试', exact: true }).all(),
+      panel.getByRole('button', { name: '保存默认分工', exact: true }),
+    ]
+    expect(controls.length).toBeGreaterThanOrEqual(29)
+    for (const control of controls) {
+      const box = await control.boundingBox()
+      expect(box).not.toBeNull()
+      expect(box!.x).toBeGreaterThanOrEqual(panelBox!.x - 1)
+      expect(box!.x + box!.width).toBeLessThanOrEqual(
+        panelBox!.x + panelBox!.width + 1,
+      )
+    }
+
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    )
+    expect(overflow).toBeLessThanOrEqual(1)
+  })
+
+  test('model pickers wrap inside the card at a narrow desktop width', async ({ page }) => {
+    await page.setViewportSize({ width: 820, height: 900 })
+    await page.goto('/config')
+    await byTid(page, TID.endpoint.addButton).first().waitFor({ state: 'visible' })
+
+    const panel = page.locator('details').filter({ hasText: '默认模型分工' }).first()
+    const panelBox = await panel.boundingBox()
+    expect(panelBox).not.toBeNull()
+
+    for (const control of await panel.locator('select, button').all()) {
+      const box = await control.boundingBox()
+      if (!box) continue
+      expect(box.x).toBeGreaterThanOrEqual(panelBox!.x - 1)
+      expect(box.x + box.width).toBeLessThanOrEqual(panelBox!.x + panelBox!.width + 1)
+    }
+
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    )
+    expect(overflow).toBeLessThanOrEqual(1)
+  })
 })

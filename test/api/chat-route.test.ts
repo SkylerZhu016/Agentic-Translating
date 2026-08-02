@@ -20,7 +20,10 @@ import path from 'path'
 import { NextRequest } from 'next/server'
 import { createRepositories } from '@/src/lib/db/repositories'
 import { createSessionService } from '@/src/lib/services/session-service'
-import { createChatHandlers } from '@/src/lib/handlers/chat-handler'
+import {
+  buildRevisionReferenceMessage,
+  createChatHandlers,
+} from '@/src/lib/handlers/chat-handler'
 import { encodeSSE, parseSSEChunk } from '@/src/lib/contracts/sse'
 import { startMockLLM, type MockLLMInstance } from '../fixtures/mock-llm'
 
@@ -89,6 +92,26 @@ describe('Chat SSE Route', () => {
   let sessionId: string
 
   const DEF_SOURCE = { sourceText: 'Hello world', sourceLang: 'English', targetLang: 'Chinese' }
+
+  it('includes complete body-only workflow evidence in revision reference data', () => {
+    const message = buildRevisionReferenceMessage({
+      promptLanguage: 'en',
+      taskBrief: 'Preserve the rhetorical questions.',
+      sourceText: '焉能治之？',
+      decisionEvidence: {
+        review: 'Candidate changed a rhetorical question into a statement.',
+        filter: 'Confirmed: restore the repeated rhetorical form.',
+        orchestrate: 'Revise all affected clauses while preserving repetition.',
+      },
+    })
+
+    expect(message).toContain('Confirmed workflow evidence:')
+    expect(message).toContain('review:\nCandidate changed')
+    expect(message).toContain('filter:\nConfirmed: restore')
+    expect(message).toContain('orchestrate:\nRevise all affected')
+    expect(message).toContain('Close concrete defects confirmed by the selection')
+    expect(message).toContain('Source text:\n焉能治之？')
+  })
 
   beforeEach(async () => {
     // 1. Create in-memory DB + migrate
@@ -341,6 +364,79 @@ describe('Chat SSE Route', () => {
   // ===========================================================================
 
   describe('message turn (pure discussion)', () => {
+    it('reuses an unfinished identical user turn instead of duplicating it', async () => {
+      mockLLM.setBehavior('echo-model', { behavior: 'echo' })
+      const sid = await createAssembledSession()
+      repos.chatMessages.insert({
+        session_id: sid,
+        role: 'user',
+        content: '继续检查这一版',
+        tool_calls: null,
+        tool_results: null,
+        version_id: null,
+      })
+      const req = new NextRequest(`http://localhost/api/sessions/${sid}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: '继续检查这一版' }),
+      })
+
+      const resp = await handlers.POST(req, {
+        params: Promise.resolve({ id: sid }),
+      })
+      await readSSEEvents(resp)
+
+      const identicalUserTurns = repos.chatMessages
+        .listBySession(sid)
+        .filter((message) =>
+          message.role === 'user' && message.content === '继续检查这一版')
+      expect(identicalUserTurns).toHaveLength(1)
+    })
+
+    it('rejects a second chat turn while the first turn is still running', async () => {
+      mockLLM.setBehavior('echo-model', {
+        behavior: 'stream',
+        chunkDelayMs: 100,
+      })
+      const sid = await createAssembledSession()
+      const firstReq = new NextRequest(`http://localhost/api/sessions/${sid}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: '第一轮' }),
+      })
+      const firstResp = await handlers.POST(firstReq, {
+        params: Promise.resolve({ id: sid }),
+      })
+      const activeResp = await handlers.GET(
+        new NextRequest(`http://localhost/api/sessions/${sid}/chat`),
+        { params: Promise.resolve({ id: sid }) },
+      )
+      expect(await activeResp.json()).toMatchObject({ active: true })
+      const secondReq = new NextRequest(`http://localhost/api/sessions/${sid}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: '第二轮' }),
+      })
+      const secondResp = await handlers.POST(secondReq, {
+        params: Promise.resolve({ id: sid }),
+      })
+
+      expect(secondResp.status).toBe(409)
+      expect((await secondResp.json()).error).toBe('chat_already_running')
+      await readSSEEvents(firstResp)
+      const completeResp = await handlers.GET(
+        new NextRequest(`http://localhost/api/sessions/${sid}/chat`),
+        { params: Promise.resolve({ id: sid }) },
+      )
+      expect(await completeResp.json()).toEqual({
+        active: false,
+        startedAt: null,
+        lastHeartbeatAt: null,
+        lastProgressAt: null,
+        phase: null,
+      })
+    })
+
     it('includes the current user instruction in the LLM context', async () => {
       mockLLM.setBehavior('echo-model', { behavior: 'echo' })
       const sid = await createAssembledSession()
@@ -545,6 +641,94 @@ describe('Chat SSE Route', () => {
         const assistantMsg = messages.find((m) => m.role === 'assistant')
         expect(assistantMsg).toBeDefined()
         expect(assistantMsg!.version_id).toBe(editVersion!.id)
+      } finally {
+        await server.close()
+      }
+    })
+
+    it('persists only the repaired tool batch after an invalid old_string', async () => {
+      const http = await import('http')
+      let requestCount = 0
+
+      const server = await new Promise<{
+        url: string
+        close: () => Promise<void>
+      }>((resolve) => {
+        const srv = http.createServer((req, res) => {
+          const chunks: Buffer[] = []
+          req.on('data', (chunk: Buffer) => chunks.push(chunk))
+          req.on('end', () => {
+            requestCount += 1
+            const oldString = requestCount === 1 ? '不存在的片段' : '你好世界'
+            res.writeHead(200, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({
+              id: `chatcmpl-repair-${requestCount}`,
+              object: 'chat.completion',
+              created: Math.floor(Date.now() / 1000),
+              model: 'echo-model',
+              choices: [{
+                index: 0,
+                message: {
+                  role: 'assistant',
+                  content: '',
+                  tool_calls: [{
+                    id: `call_repair_${requestCount}`,
+                    type: 'function',
+                    function: {
+                      name: 'replace_text',
+                      arguments: JSON.stringify({
+                        old_string: oldString,
+                        new_string: '您好世界',
+                      }),
+                    },
+                  }],
+                },
+                finish_reason: 'tool_calls',
+              }],
+              usage: { prompt_tokens: 20, completion_tokens: 10, total_tokens: 30 },
+            }))
+          })
+        })
+
+        srv.listen(0, () => {
+          const address = srv.address() as { port: number }
+          resolve({
+            url: `http://localhost:${address.port}`,
+            close: () => new Promise<void>((done) => srv.close(() => done())),
+          })
+        })
+      })
+
+      const sid = await createAssembledSession()
+      const latest = repos.sessions.getById(sid)!
+      const snapshot = JSON.parse(latest.config_snapshot)
+      snapshot.endpoint.base_url = server.url
+      for (const endpoint of snapshot.endpoints ?? []) {
+        endpoint.base_url = server.url
+      }
+      setSnapshotConfig(db, sid, snapshot)
+
+      try {
+        const response = await handlers.POST(
+          new NextRequest(`http://localhost/api/sessions/${sid}/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message: '请修正称呼' }),
+          }),
+          { params: Promise.resolve({ id: sid }) },
+        )
+        const events = await readSSEEvents(response)
+        const completion = events.find((event) => event.event === 'message_complete')
+
+        expect((completion?.data as { error?: string }).error).toBeUndefined()
+        expect(requestCount).toBe(2)
+        expect(repos.finalVersions.getLatestBySession(sid)?.text).toBe('您好世界')
+        const assistant = repos.chatMessages
+          .listBySession(sid)
+          .find((message) => message.role === 'assistant')
+        expect(JSON.parse(assistant?.tool_calls ?? '[]')).toEqual([
+          { old_string: '你好世界', new_string: '您好世界' },
+        ])
       } finally {
         await server.close()
       }

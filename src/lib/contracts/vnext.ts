@@ -9,6 +9,7 @@ export type AgentCategory =
 
 export type ReviewMode = 'main_editor' | 'four_stage'
 export type TeamPolicy = 'fixed' | 'dynamic'
+export type CandidateAnnotationMode = 'body_only' | 'body_and_annotation'
 export type PoetryMode = 'auto' | 'on' | 'off'
 export type PoetryTargetForm =
   | 'preserve'
@@ -93,12 +94,18 @@ export interface WorkflowPresetContract {
   taskBriefTemplate: string
   teamPolicy: TeamPolicy
   reviewMode: ReviewMode
+  candidateAnnotationMode?: CandidateAnnotationMode
   agentVariantIds: string[]
   agentVariantSnapshots: AgentDirectionVariant[]
   defaultWorkerBinding: ModelBinding
   agentBindingOverrides: Record<string, ModelBinding>
   mainAgentBinding: ModelBinding
+  reviewAgentBinding?: ModelBinding
+  filterAgentBinding?: ModelBinding
+  orchestrateAgentBinding?: ModelBinding
+  assembleAgentBinding?: ModelBinding
   editingAgentBinding: ModelBinding
+  contextAnalysisBindings?: ModelBinding[]
   promptBundleVersion: number
   maxAgentCalls: number
   batchConcurrency: number
@@ -164,6 +171,10 @@ export interface ConfigSnapshotVNext {
   modelBindings: {
     defaultWorker: ModelBinding
     mainAgent: ModelBinding
+    reviewAgent?: ModelBinding
+    filterAgent?: ModelBinding
+    orchestrateAgent?: ModelBinding
+    assembleAgent?: ModelBinding
     editingAgent: ModelBinding
   }
   presetRevisionSnapshot: WorkflowPresetRevision | null
@@ -174,6 +185,7 @@ export interface ConfigSnapshotVNext {
     teamPolicy: TeamPolicy
     reviewMode: ReviewMode
     maxAgentCalls: number
+    candidateAnnotationMode?: CandidateAnnotationMode
   }
 }
 

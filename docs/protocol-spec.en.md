@@ -1,4 +1,4 @@
-# Free-text Semantic Boundary Protocol (FSBP v1)
+# Free-text Semantic Boundary Protocol (FSBP v2)
 
 ## 1. Motivation
 
@@ -21,7 +21,7 @@ interface SemanticAgentOutput {
 ```
 
 - `raw`: The complete original text returned by the model, preserved verbatim.
-- `body`: The text before the first valid boundary, passed to downstream consumers.
+- `body`: The text before the final valid boundary, passed to downstream consumers.
 - `annotation`: The text after the boundary, visible only to users, audits, and experimental analysis.
 
 ## 3. Syntax
@@ -35,10 +35,10 @@ A boundary is a standalone line that, after trimming leading and trailing whites
 Parsing algorithm:
 
 1. Normalize CRLF and bare CR to LF. This normalization is used only for parsing; it does not rewrite `raw`.
-2. Scan lines to find the first position where `line.trim() === '---'`.
+2. Scan backward to find the final position where `line.trim() === '---'`.
 3. If not found, the entire normalized text is treated as `body`, and `annotation = null`.
 4. If found, the content before it becomes `body`, and all content after it becomes `annotation`.
-5. Any subsequent `---` within the annotation carries no protocol meaning.
+5. Any earlier standalone `---` remains part of the body and carries no boundary meaning.
 6. The body may be empty, but an empty body does not count as a valid candidate and cannot satisfy the evidence threshold for `write_draft`.
 
 The following are not boundaries:
@@ -72,6 +72,15 @@ The system must maintain the following rules:
 
 Each stage (review, filter, orchestrate, assemble) saves `raw / body / annotation` under the same rules. The input to stage N consists of the full source text, the task requirements, the `body` of all successful candidates, and the `body` from stages 1 through N-1. The `body` from the assemble stage forms the first version of the text; annotations do not enter the version body.
 
+Free text does not allow a stage to arbitrarily change what its body means. To make body-only inheritance preserve the evidence required downstream, the four stages use a stable semantic contract:
+
+- `review.body` contains prioritized errors, risks, and useful treatments for direct use by filtering;
+- `filter.body` contains keep, reject, and repair decisions for orchestration;
+- `orchestrate.body` contains one complete working translation that remains open to revision;
+- `assemble.body` contains the final translation after source verification and target-language read-through.
+
+Process notes, self-evaluation, and user-facing supplementary explanation belong after the final standalone `---`. A stage remains free to organize the prose within its body, but it must not move all evidence needed by the next stage into the annotation. This semantic contract, together with boundary, inheritance, and archival rules, forms FSBP.
+
 ## 6. Security Boundaries
 
 - The source text and user task requirements are always passed as user data, never spliced into system instructions.
@@ -81,11 +90,11 @@ Each stage (review, filter, orchestrate, assemble) saves `raw / body / annotatio
 
 ## 7. Limitations
 
-- If the source text or translation itself happens to contain a line that reads `---`, that line will be mistaken for a boundary. In such cases, alternative delimiter notation can be used to express the intended content.
+- A standalone `---` inside the body remains body content when a later annotation boundary exists. Agents must place the actual annotation divider last. A body that itself ends with a standalone `---` and has no annotation remains ambiguous.
 - The semantic distinction between annotation and body is still determined by the generating Agent. The protocol provides only the boundary mechanism, not a guarantee of content quality.
 - Different models may ignore the boundary instruction. When no boundary is present, the full text can still be used as body, preventing format compliance from being misjudged as content failure.
 - The quality benefits of FSBP must be validated through ablation studies and human blind evaluation; they cannot be asserted by architectural design alone.
 
 ## 8. Versioning
 
-`fsbp-v1` defines stable experimental conditions for boundaries and inheritance rules. If the boundary definition, normalization rules, or inheritance rules change in the future, a new version name must be used and parsing compatibility with older sessions must be preserved.
+`fsbp-v2` uses the final valid boundary so earlier divider lines can remain in the body. `fsbp-v1` used the first valid boundary and existing experiment results should retain that version label. Any future change to boundary, normalization, or inheritance rules requires another version.

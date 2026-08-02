@@ -9,6 +9,8 @@ test-results
 .env
 .env.*
 *.log
-experiments/results
-experiments/reports
+FSBP_Test/private
+FSBP_Test/results
+FSBP_Test/cache
+FSBP_Test/**/*.local.*
 迭代文档

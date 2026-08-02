@@ -13,7 +13,7 @@
 // ---------------------------------------------------------------------------
 
 import { AGENT_MAX_DURATION_MS, AGENT_TIMEOUT_MS } from '../constants';
-import { parseSSEChunk } from '../contracts/sse';
+import { parseSSEChunk, takeCompleteSSEText } from '../contracts/sse';
 import { resolveChatCompletionsUrl } from './endpoint-url';
 
 // =============================================================================
@@ -103,6 +103,18 @@ export class AbortedError extends LLMError {
   }
 }
 
+/** Provider ended generation before a complete answer was produced. */
+export class IncompleteOutputError extends LLMError {
+  constructor(message?: string) {
+    super(
+      'incomplete_output',
+      message ?? 'LLM response ended before completion',
+      { retryable: true },
+    );
+    this.name = 'IncompleteOutputError';
+  }
+}
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -137,6 +149,8 @@ export interface ChatCompletionRequest {
   timeoutMs?: number;
   /** Absolute duration cap for the whole request. */
   maxDurationMs?: number;
+  /** Requested visible/reasoning completion budget for compatible providers. */
+  maxTokens?: number;
   /** Heartbeat for response activity, including reasoning chunks that are discarded. */
   onActivity?: () => void;
   signal?: AbortSignal;
@@ -410,6 +424,7 @@ async function nonStreamCompletion(
       messages: request.messages,
       ...(request.tools ? { tools: request.tools } : {}),
       ...(request.toolChoice ? { tool_choice: request.toolChoice } : {}),
+      ...(request.maxTokens ? { max_tokens: request.maxTokens } : {}),
       stream: false,
     }),
     signal,
@@ -430,6 +445,11 @@ async function nonStreamCompletion(
   }
 
   const choice = (body.choices as Array<Record<string, unknown>>)?.[0];
+  if (choice?.finish_reason === 'length') {
+    throw new IncompleteOutputError(
+      'LLM response was truncated because the completion token limit was reached',
+    );
+  }
   const message = choice?.message as Record<string, unknown> | undefined;
   const content = (message?.content as string) ?? '';
   // reasoning_content/thinking intentionally discarded — not included in response
@@ -478,6 +498,7 @@ async function* streamCompletion(
       messages: request.messages,
       ...(request.tools ? { tools: request.tools } : {}),
       ...(request.toolChoice ? { tool_choice: request.toolChoice } : {}),
+      ...(request.maxTokens ? { max_tokens: request.maxTokens } : {}),
       stream: true,
     }),
     signal,
@@ -501,6 +522,11 @@ async function* streamCompletion(
     }
 
     const choice = (body.choices as Array<Record<string, unknown>>)?.[0];
+    if (choice?.finish_reason === 'length') {
+      throw new IncompleteOutputError(
+        'LLM response was truncated because the completion token limit was reached',
+      );
+    }
     const message = choice?.message as Record<string, unknown> | undefined;
     const content = (message?.content as string) ?? '';
     // reasoning_content/thinking intentionally discarded — not accumulated
@@ -552,8 +578,9 @@ async function* streamCompletion(
 
   // Accumulated state
   let accumulatedContent = ''; // content-only text from deltas
-  let rawBuffer = ''; // raw buffer for SSE parsing
-  let processedEventCount = 0;
+  let pendingBuffer = ''; // only the unfinished SSE tail
+  let lastFinishReason: string | null = null;
+  let sawDoneSentinel = false;
   const toolCallAccumulator = new Map<
     number,
     { id: string; name: string; argumentsFragments: string[] }
@@ -562,23 +589,27 @@ async function* streamCompletion(
   try {
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
-      onActivity();
+      const chunk = done
+        ? decoder.decode()
+        : decoder.decode(value, { stream: true });
+      if (!done) onActivity();
+      if (chunk) pendingBuffer += chunk;
 
-      const chunk = decoder.decode(value, { stream: true });
-      rawBuffer += chunk;
+      const { completeText, remainder } =
+        takeCompleteSSEText(pendingBuffer);
+      pendingBuffer = remainder;
+      const events = completeText ? parseSSEChunk(completeText) : [];
 
-      // Parse SSE events from the accumulated text.
-      // parseSSEChunk handles partial chunks — we re-parse on each iteration
-      // and only process newly completed events.
-      const events = parseSSEChunk(rawBuffer);
-
-      // Process only new events
-      for (let i = processedEventCount; i < events.length; i++) {
-        const event = events[i];
+      for (const event of events) {
 
         // [DONE] sentinel
         if (event.data === '[DONE]') {
+          sawDoneSentinel = true;
+          if (lastFinishReason === 'length') {
+            throw new IncompleteOutputError(
+              'LLM response was truncated because the completion token limit was reached',
+            );
+          }
           // Assemble final toolCalls from accumulated fragments
           let finalToolCalls:
             | Array<{ id: string; name: string; arguments: string }>
@@ -607,6 +638,9 @@ async function* streamCompletion(
           const delta = JSON.parse(event.data);
           const choice = delta.choices?.[0];
           if (!choice) continue;
+          if (typeof choice.finish_reason === 'string') {
+            lastFinishReason = choice.finish_reason;
+          }
 
           const deltaObj = choice.delta;
           if (!deltaObj) continue;
@@ -662,11 +696,21 @@ async function* streamCompletion(
           // Skip malformed SSE data chunks
         }
       }
-
-      processedEventCount = events.length;
+      if (done) break;
     }
 
-    // If the stream ended without [DONE], yield a final done event
+    if (lastFinishReason === 'length') {
+      throw new IncompleteOutputError(
+        'LLM response was truncated because the completion token limit was reached',
+      );
+    }
+    if (!sawDoneSentinel && !lastFinishReason) {
+      throw new IncompleteOutputError(
+        'LLM stream closed without a completion marker',
+      );
+    }
+
+    // Some compatible providers omit [DONE] but send a terminal finish_reason.
     let finalToolCalls:
       | Array<{ id: string; name: string; arguments: string }>
       | undefined;

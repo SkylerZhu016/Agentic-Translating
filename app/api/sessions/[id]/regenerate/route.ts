@@ -4,17 +4,36 @@ import { NextResponse } from 'next/server'
 import { getDb } from '@/src/lib/db'
 import { migrate } from '@/src/lib/db/migrate'
 import { startVNextDraftRegeneration } from '@/src/lib/orchestration/vnext-runner'
+import { z } from 'zod'
+
+const bodySchema = z.object({
+  configMode: z.enum(['frozen', 'current']).default('frozen'),
+  candidateAnnotationMode: z
+    .enum(['body_only', 'body_and_annotation'])
+    .optional(),
+})
 
 export async function POST(
-  _request: Request,
+  request: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
   const { id } = await params
   const db = getDb()
   migrate(db)
   try {
+    const parsed = bodySchema.safeParse(
+      await request.json().catch(() => ({})),
+    )
+    if (!parsed.success) {
+      return NextResponse.json({ error: 'invalid_body' }, { status: 400 })
+    }
     return NextResponse.json(
-      startVNextDraftRegeneration(db, id),
+      startVNextDraftRegeneration(
+        db,
+        id,
+        parsed.data.candidateAnnotationMode,
+        parsed.data.configMode,
+      ),
       { status: 202 },
     )
   } catch (error) {

@@ -20,8 +20,15 @@ next-env.d.ts
 .env.local
 .env.*.local
 
+# FSBP experiment private/runtime artifacts
+FSBP_Test/private/
+FSBP_Test/results/
+FSBP_Test/cache/
+FSBP_Test/**/*.local.*
+
 # Private design notes
 初步设想.txt
+src/lib/prompts/temp.txt
 
 # Local-only iteration and release verification notes
 迭代文档/

@@ -4,7 +4,11 @@ import { z } from 'zod'
 import { getDb } from '@/src/lib/db'
 import { migrate } from '@/src/lib/db/migrate'
 import { createRepositories } from '@/src/lib/db/repositories'
-import { chatCompletion, isAsyncIterable } from '@/src/lib/llm/client'
+import {
+  chatCompletion,
+  isAsyncIterable,
+  LLMError,
+} from '@/src/lib/llm/client'
 
 const bodySchema = z.object({ model: z.string().min(1) })
 
@@ -49,10 +53,21 @@ export async function POST(
       response: result.content,
     })
   } catch (error) {
+    const diagnosticId = crypto.randomUUID()
     return Response.json(
       {
         error: error instanceof Error ? error.message : String(error),
-        diagnosticId: crypto.randomUUID(),
+        diagnosticId,
+        phase: 'chat_completions',
+        elapsedMs: Math.round(performance.now() - started),
+        model: body.data.model,
+        ...(error instanceof LLMError
+          ? {
+              code: error.code,
+              status: error.status ?? null,
+              retryable: error.retryable,
+            }
+          : {}),
       },
       { status: 502 },
     )

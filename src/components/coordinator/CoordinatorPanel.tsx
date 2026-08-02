@@ -23,11 +23,25 @@ import { StageStepper } from './StageStepper'
 import { StageOutputPanel } from './StageOutputPanel'
 import { Badge, Button, Modal, Spinner } from '@/src/components/ui'
 import { parseSemanticAgentOutput } from '@/src/lib/protocol/semantic-output'
+import type { CandidateAnnotationMode } from '@/src/lib/contracts/vnext'
 
 type StreamTextMap = Record<Stage, string>
 type NoteMap = Partial<Record<Stage, string | null>>
 
 const EMPTY_STREAM: StreamTextMap = { review: '', filter: '', orchestrate: '', assemble: '' }
+
+function readableWorkflowError(error: string) {
+  if (/504 Gateway Time-?out/i.test(error)) {
+    return '上游网关超时（HTTP 504）：模型在网关时限内没有返回可处理数据。已完成候选仍会保留；可以更换主 Agent 模型后，按当前配置继续统筹。'
+  }
+  if (/fetch failed/i.test(error)) {
+    return '无法连接上游模型服务。已完成候选仍会保留，可以稍后继续统筹。'
+  }
+  if (/<(?:!doctype|html|head|body)\b/i.test(error)) {
+    return '上游服务返回了网页错误，未产生有效模型结果。已完成候选仍会保留。'
+  }
+  return error
+}
 
 function AutomaticWorkflowProgress({
   data,
@@ -35,7 +49,11 @@ function AutomaticWorkflowProgress({
   actionError,
   onPause,
   onContinue,
+  onContinueCurrent,
+  regenerationAnnotationMode,
+  onRegenerationAnnotationModeChange,
   onRegenerate,
+  onRegenerateCurrent,
   onRestart,
 }: {
   data: NonNullable<ReturnType<typeof useSessionFull>['data']>
@@ -43,7 +61,13 @@ function AutomaticWorkflowProgress({
   actionError: string | null
   onPause: () => void
   onContinue: () => void
+  onContinueCurrent: () => void
+  regenerationAnnotationMode: CandidateAnnotationMode
+  onRegenerationAnnotationModeChange: (
+    mode: CandidateAnnotationMode,
+  ) => void
   onRegenerate: () => void
+  onRegenerateCurrent: () => void
   onRestart: () => void
 }) {
   const snapshot = JSON.parse(data.session.config_snapshot) as {
@@ -201,29 +225,73 @@ function AutomaticWorkflowProgress({
           </Button>
         )}
         {canContinue && (
-          <Button
-            size="sm"
-            disabled={action != null}
-            onClick={onContinue}
-          >
-            {action === 'continue'
-              ? <><Spinner size="sm" /> 恢复中</>
-              : continueFromCandidates
-                ? '从候选继续运行'
-                : '从检查点继续运行'}
-          </Button>
+          <>
+            <Button
+              size="sm"
+              disabled={action != null}
+              onClick={onContinue}
+            >
+              {action === 'continue'
+                ? <><Spinner size="sm" /> 恢复中</>
+                : continueFromCandidates
+                  ? '按冻结配置继续统筹'
+                  : '从检查点继续运行'}
+            </Button>
+            {continueFromCandidates && (
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={action != null}
+                onClick={onContinueCurrent}
+                title="保留原文、任务要求和全部候选，只使用配置页当前的主 Agent 端点与模型重新统筹"
+              >
+                {action === 'continue-current'
+                  ? <><Spinner size="sm" /> 恢复中</>
+                  : '按当前主 Agent 配置继续'}
+              </Button>
+            )}
+          </>
         )}
         {canRegenerate && (
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={action != null}
-            onClick={onRegenerate}
-          >
-            {action === 'regenerate'
-              ? <><Spinner size="sm" /> 重刷中</>
-              : '重刷证据化初稿'}
-          </Button>
+          <div className="flex flex-wrap items-center gap-2 rounded-sm border border-line bg-paper/55 px-2 py-1.5">
+            <label className="flex items-center gap-2 text-xs text-ink-3">
+              重刷时的候选上下文
+              <select
+                value={regenerationAnnotationMode}
+                disabled={action != null}
+                onChange={(event) =>
+                  onRegenerationAnnotationModeChange(
+                    event.target.value as CandidateAnnotationMode,
+                  )
+                }
+                className="h-8 rounded-sm border border-line-2 bg-paper-raise px-2 text-xs text-ink"
+              >
+                <option value="body_only">仅正文，隔离注释</option>
+                <option value="body_and_annotation">正文与译者注释</option>
+              </select>
+            </label>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={action != null}
+              onClick={onRegenerate}
+            >
+              {action === 'regenerate'
+                ? <><Spinner size="sm" /> 重刷中</>
+                : '按冻结配置重刷'}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={action != null}
+              onClick={onRegenerateCurrent}
+              title="复用现有候选，使用配置页当前的四阶段提示词包、端点与六角色模型分工重新成稿"
+            >
+              {action === 'regenerate-current'
+                ? <><Spinner size="sm" /> 重刷中</>
+                : '按当前配置重刷'}
+            </Button>
+          </div>
         )}
         <Button
           size="sm"
@@ -320,7 +388,7 @@ function AutomaticWorkflowProgress({
       </ol>
       {latestRun?.error && (
         <p className="rounded-sm border border-cinnabar/40 bg-cinnabar/5 px-3 py-2 text-xs text-cinnabar">
-          {latestRun.error}
+          {readableWorkflowError(latestRun.error)}
         </p>
       )}
     </div>
@@ -335,12 +403,36 @@ export function CoordinatorPanel() {
   const [notes, setNotes] = useState<NoteMap>({})
   const [completionNotice, setCompletionNotice] = useState<string | null>(null)
   const [workflowAction, setWorkflowAction] = useState<string | null>(null)
+  const [regenerationAnnotationMode, setRegenerationAnnotationMode] =
+    useState<CandidateAnnotationMode>('body_only')
   const [restartConfirmOpen, setRestartConfirmOpen] = useState(false)
   const [workflowActionError, setWorkflowActionError] =
     useState<string | null>(null)
 
+  useEffect(() => {
+    if (!data) return
+    try {
+      const snapshot = JSON.parse(data.session.config_snapshot) as {
+        orchestrationPolicy?: {
+          candidateAnnotationMode?: CandidateAnnotationMode
+        }
+      }
+      setRegenerationAnnotationMode(
+        snapshot.orchestrationPolicy?.candidateAnnotationMode ?? 'body_only',
+      )
+    } catch {
+      setRegenerationAnnotationMode('body_only')
+    }
+  }, [data?.session.id, data?.session.config_snapshot])
+
   const postWorkflowAction = useCallback(async (
-    action: 'pause' | 'continue' | 'regenerate' | 'restart',
+    action:
+      | 'pause'
+      | 'continue'
+      | 'continue-current'
+      | 'regenerate'
+      | 'regenerate-current'
+      | 'restart',
   ) => {
     if (!sessionId || workflowAction) return
     setWorkflowAction(action)
@@ -349,15 +441,27 @@ export function CoordinatorPanel() {
       const path =
         action === 'pause'
           ? 'control'
-          : action === 'continue'
+          : action === 'continue' || action === 'continue-current'
             ? 'run'
-            : action
+            : action === 'regenerate-current'
+              ? 'regenerate'
+              : action
       const response = await fetch(`/api/sessions/${sessionId}/${path}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         ...(action === 'pause'
           ? { body: JSON.stringify({ action: 'pause' }) }
-          : {}),
+          : action === 'continue-current'
+            ? { body: JSON.stringify({ configMode: 'current' }) }
+            : action === 'regenerate' || action === 'regenerate-current'
+              ? {
+                  body: JSON.stringify({
+                    candidateAnnotationMode: regenerationAnnotationMode,
+                    configMode:
+                      action === 'regenerate-current' ? 'current' : 'frozen',
+                  }),
+                }
+            : {}),
       })
       const payload = await response.json().catch(() => ({})) as {
         error?: string
@@ -377,7 +481,13 @@ export function CoordinatorPanel() {
     } finally {
       setWorkflowAction(null)
     }
-  }, [refresh, router, sessionId, workflowAction])
+  }, [
+    refresh,
+    regenerationAnnotationMode,
+    router,
+    sessionId,
+    workflowAction,
+  ])
 
   // 仅在「本次运行后达成全部完成」时滚动+提示（挂载即完成不打扰）
   const justRanRef = useRef(false)
@@ -440,7 +550,13 @@ export function CoordinatorPanel() {
           actionError={workflowActionError}
           onPause={() => void postWorkflowAction('pause')}
           onContinue={() => void postWorkflowAction('continue')}
+          onContinueCurrent={() => void postWorkflowAction('continue-current')}
+          regenerationAnnotationMode={regenerationAnnotationMode}
+          onRegenerationAnnotationModeChange={setRegenerationAnnotationMode}
           onRegenerate={() => void postWorkflowAction('regenerate')}
+          onRegenerateCurrent={() =>
+            void postWorkflowAction('regenerate-current')
+          }
           onRestart={() => setRestartConfirmOpen(true)}
         />
         <Modal

@@ -15,6 +15,35 @@ export interface SSEEvent {
   retry?: number
 }
 
+/**
+ * Split a transport buffer after its last complete SSE event boundary.
+ *
+ * The returned remainder contains only the unfinished tail. Callers should
+ * replace their previous buffer with that remainder instead of reparsing the
+ * full response on every network chunk.
+ */
+export function takeCompleteSSEText(buffer: string): {
+  completeText: string
+  remainder: string
+} {
+  const boundaryPattern = /\r?\n\r?\n/g
+  let lastBoundaryEnd = 0
+  let match: RegExpExecArray | null
+
+  while ((match = boundaryPattern.exec(buffer)) !== null) {
+    lastBoundaryEnd = match.index + match[0].length
+  }
+
+  if (lastBoundaryEnd === 0) {
+    return { completeText: '', remainder: buffer }
+  }
+
+  return {
+    completeText: buffer.slice(0, lastBoundaryEnd),
+    remainder: buffer.slice(lastBoundaryEnd),
+  }
+}
+
 // ---- Encode ----
 
 /**

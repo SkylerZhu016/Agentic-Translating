@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest'
-import { encodeSSE, parseSSEChunk } from '../../src/lib/contracts/sse'
+import {
+  encodeSSE,
+  parseSSEChunk,
+  takeCompleteSSEText,
+} from '../../src/lib/contracts/sse'
 
 describe('encodeSSE', () => {
   it('encodes event + data as SSE format', () => {
@@ -148,5 +152,49 @@ describe('parseSSEChunk', () => {
     const r2 = parseSSEChunk('event: y\ndata: 1\n\n')
     expect(r2).toHaveLength(1)
     expect(r2[0].event).toBe('y')
+  })
+})
+
+describe('takeCompleteSSEText', () => {
+  it('returns complete LF events and keeps only the partial tail', () => {
+    const input =
+      'data: {"one":1}\n\n' +
+      'data: {"two":2}\n\n' +
+      'data: {"partial"'
+    const result = takeCompleteSSEText(input)
+
+    expect(parseSSEChunk(result.completeText)).toHaveLength(2)
+    expect(result.remainder).toBe('data: {"partial"')
+  })
+
+  it('handles a CRLF boundary split across transport chunks', () => {
+    let pending = 'data: {"one":1}\r\n\r'
+    let result = takeCompleteSSEText(pending)
+    expect(result.completeText).toBe('')
+
+    pending = result.remainder + '\ndata: {"two":2}\r\n\r\n'
+    result = takeCompleteSSEText(pending)
+
+    expect(parseSSEChunk(result.completeText).map((event) => event.data)).toEqual([
+      '{"one":1}',
+      '{"two":2}',
+    ])
+    expect(result.remainder).toBe('')
+  })
+
+  it('keeps the parser buffer bounded across many reasoning events', () => {
+    let pending = ''
+    let parsedCount = 0
+
+    for (let index = 0; index < 20_000; index += 1) {
+      pending +=
+        `data: {"choices":[{"delta":{"reasoning_content":"${index}"}}]}\n\n`
+      const result = takeCompleteSSEText(pending)
+      pending = result.remainder
+      parsedCount += parseSSEChunk(result.completeText).length
+      expect(pending.length).toBe(0)
+    }
+
+    expect(parsedCount).toBe(20_000)
   })
 })

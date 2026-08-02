@@ -18,7 +18,6 @@
 import { describe, it, expect, afterEach, beforeEach, beforeAll } from 'vitest';
 import http from 'http';
 import { startMockLLM, type MockLLMInstance } from '../fixtures/mock-llm';
-import { CHAT_LOOP_MAX } from '../../src/lib/constants';
 import type { ChatTurnResult } from '../../src/lib/chat/tool-loop';
 
 // ---------------------------------------------------------------------------
@@ -687,11 +686,11 @@ describe('runChatTurn', () => {
   });
 
   // =========================================================================
-  // 7. Loop exhausted
+  // 7. Bounded correction
   // =========================================================================
 
-  describe('loop exhausted', () => {
-    it('returns chat_loop_exhausted after CHAT_LOOP_MAX consecutive failures', async () => {
+  describe('bounded edit correction', () => {
+    it('stops after one failed correction instead of spending the full tool loop', async () => {
       const server = await startRoundServer((_round, _body) => ({
         status: 200,
         body: {
@@ -724,8 +723,8 @@ describe('runChatTurn', () => {
         });
 
         const r = fail(result);
-        expect(r.code).toBe('chat_loop_exhausted');
-        expect(server.requestCount()).toBe(CHAT_LOOP_MAX);
+        expect(r.code).toBe('chat_edit_correction_failed');
+        expect(server.requestCount()).toBe(2);
       } finally {
         await server.close();
       }
@@ -920,7 +919,7 @@ describe('runChatTurn', () => {
           model: 'test-model',
           choices: [{
             index: 0,
-            message: { role: 'assistant', content: 'No changes needed.' },
+            message: { role: 'assistant', content: 'No changes needed.', tool_calls: [] },
             finish_reason: 'stop',
           }],
           usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
@@ -936,7 +935,8 @@ describe('runChatTurn', () => {
         });
 
         const r = okMsg(result);
-          expect(r.text).toContain('No changes');
+        expect(r.text).toContain('No changes');
+        expect(server.requestCount()).toBe(1);
       } finally {
         await server.close();
       }
@@ -968,6 +968,11 @@ describe('runChatTurn', () => {
             },
           };
         }
+
+        const messages = (_body.messages as Array<{ role: string; content?: string }>) ?? [];
+        expect(messages.some((message) =>
+          message.role === 'tool' && message.content?.includes('invalid JSON arguments')
+        )).toBe(true);
 
         return {
           status: 200,
@@ -1002,7 +1007,7 @@ describe('runChatTurn', () => {
         });
 
         const r = okEdit(result);
-          expect(r.newText).toBe('hi world');
+        expect(r.newText).toBe('hi world');
         expect(server.requestCount()).toBe(2);
       } finally {
         await server.close();

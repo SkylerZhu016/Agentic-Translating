@@ -235,8 +235,14 @@ export function createHandlers(db: Database.Database) {
 
     // ── 7. Build session context from snapshot ────────────────────
     const snapshot = service.snapshotConfig(session.config_snapshot)
+    const stageBinding = {
+      review: snapshot.modelBindings?.reviewAgent,
+      filter: snapshot.modelBindings?.filterAgent,
+      orchestrate: snapshot.modelBindings?.orchestrateAgent,
+      assemble: snapshot.modelBindings?.assembleAgent,
+    }[stage] ?? snapshot.modelBindings?.mainAgent
     const coordinatorEndpointId =
-      snapshot.modelBindings?.mainAgent.endpointId ??
+      stageBinding?.endpointId ??
       snapshot.coordinator?.endpoint_id
     const endpoint =
       snapshot.endpointSnapshots?.find(
@@ -277,7 +283,7 @@ export function createHandlers(db: Database.Database) {
       ),
     }
     const coordinatorModel =
-      snapshot.modelBindings?.mainAgent.model ||
+      stageBinding?.model ||
       snapshot.coordinator?.model ||
       'gpt-4o'
 

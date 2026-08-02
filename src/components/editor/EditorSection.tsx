@@ -56,6 +56,11 @@ interface DeltaData { text?: string }
 interface ToolCallData { name?: string; arguments?: { old_string?: unknown; new_string?: unknown } }
 interface ToolResultData { ok?: boolean; diff_summary?: string; version_no?: number }
 interface CompleteData { kind?: string; error?: string; message?: string }
+type ChatActivityPhase =
+  | 'waiting_for_model'
+  | 'thinking'
+  | 'generating'
+  | 'applying_edits'
 
 export function EditorSection() {
   const { data, sessionId, refresh } = useSessionFull()
@@ -63,6 +68,8 @@ export function EditorSection() {
   /** 本地流式叠加层：乐观用户消息 + 流式 AI 消息；服务端落库后清空 */
   const [live, setLive] = useState<ChatMessageView[]>([])
   const [streaming, setStreaming] = useState(false)
+  const [localChatStartedAt, setLocalChatStartedAt] = useState<number | null>(null)
+  const [localChatPhase, setLocalChatPhase] = useState<ChatActivityPhase>('waiting_for_model')
   const [highlight, setHighlight] = useState<{ start: number; end: number } | null>(null)
 
   const highlightTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -80,6 +87,14 @@ export function EditorSection() {
   )
   const currentText = currentVersion?.text ?? ''
   const currentVersionNo = currentVersion?.version_no ?? null
+  const remoteChatActive = data?.chatActivity?.active === true && !streaming
+  const chatBusy = streaming || remoteChatActive
+  const chatStartedAt = streaming
+    ? localChatStartedAt
+    : data?.chatActivity?.startedAt ?? null
+  const chatPhase = streaming
+    ? localChatPhase
+    : data?.chatActivity?.phase ?? 'waiting_for_model'
 
   const readonly = sessionState === 'coordinating'
   const canChat =
@@ -132,6 +147,8 @@ export function EditorSection() {
         { id: `local-ai-${Date.now()}`, role: 'assistant', content: '', streaming: true, toolCalls: [] },
       ])
       setStreaming(true)
+      setLocalChatStartedAt(Date.now())
+      setLocalChatPhase('waiting_for_model')
 
       try {
         const res = await fetch(`/api/sessions/${sessionId}/chat`, {
@@ -162,12 +179,20 @@ export function EditorSection() {
           } catch { /* 容错：忽略坏帧 */ }
 
           switch (event) {
+            case 'activity': {
+              if (data.phase === 'thinking') setLocalChatPhase('thinking')
+              break
+            }
             case 'delta': {
               const text = (data as DeltaData).text ?? ''
-              if (text) patchStreamingMessage((msg) => ({ ...msg, content: msg.content + text }))
+              if (text) {
+                setLocalChatPhase('generating')
+                patchStreamingMessage((msg) => ({ ...msg, content: msg.content + text }))
+              }
               break
             }
             case 'tool_call': {
+              setLocalChatPhase('applying_edits')
               const payload = data as ToolCallData
               const call: ToolCallView = {
                 id: `tc-${++toolSeq.current}`,
@@ -179,6 +204,7 @@ export function EditorSection() {
               break
             }
             case 'tool_result': {
+              setLocalChatPhase('applying_edits')
               const payload = data as ToolResultData
               if (payload.version_no != null) break // 落库确认帧：refresh 后整体呈现
               patchStreamingMessage((msg) => {
@@ -228,6 +254,8 @@ export function EditorSection() {
       } finally {
         patchStreamingMessage((msg) => ({ ...msg, streaming: false }))
         setStreaming(false)
+        setLocalChatStartedAt(null)
+        setLocalChatPhase('waiting_for_model')
         // 服务端为准重载（用户/AI 消息落库 + 可能的新版本），成功则撤下叠加层
         const full = await refresh()
         if (full) setLive([])
@@ -262,6 +290,38 @@ export function EditorSection() {
     [sendChat],
   )
 
+  const suggestRevision = useCallback(
+    async (message: string): Promise<string> => {
+      if (!sessionId) throw new Error('暂无会话')
+      const response = await fetch(
+        `/api/sessions/${sessionId}/revision-suggestions`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message }),
+        },
+      )
+      let body: {
+        feedback?: string
+        message?: string
+        error?: string
+      } = {}
+      try {
+        body = await response.json()
+      } catch {
+        // 非 JSON 错误体由下方统一处理。
+      }
+      if (!response.ok) {
+        throw new Error(
+          body.message ?? body.error ?? `生成修订建议失败（${response.status}）`,
+        )
+      }
+      if (!body.feedback?.trim()) throw new Error('模型没有返回可用建议')
+      return body.feedback
+    },
+    [sessionId],
+  )
+
   return (
     <div className="grid grid-cols-1 gap-5 lg:col-span-12 lg:grid-cols-12">
       {/* 最终译文 */}
@@ -290,7 +350,7 @@ export function EditorSection() {
               : '创建任务后，正式提交的译文将在此显示。'
           }
           readonly={readonly}
-          busy={streaming}
+          busy={chatBusy}
           highlight={highlight}
           onSubmitEdit={popoverSubmit}
         />
@@ -301,10 +361,14 @@ export function EditorSection() {
         <Card overline="Chat" title="对话修订" padded={false}>
           <ChatPanel
             messages={messages}
-            streaming={streaming}
+            streaming={chatBusy}
+            remoteStreaming={remoteChatActive}
+            activityStartedAt={chatStartedAt}
+            activityPhase={chatPhase}
             canChat={canChat}
             disabledHint={disabledHint}
             onSend={(msg) => void sendChat(msg)}
+            onSuggest={suggestRevision}
           />
         </Card>
 

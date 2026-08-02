@@ -71,7 +71,7 @@ test('pause after candidates, then resume without repeating Agent calls', async 
   await page.getByRole('button', { name: '暂停自动成稿' }).click()
 
   await expect(
-    page.getByRole('button', { name: '从候选继续运行' }),
+    page.getByRole('button', { name: '按冻结配置继续统筹' }),
   ).toBeVisible({ timeout: 60_000 })
   const sessionId = new URL(page.url()).searchParams.get('session')
   expect(sessionId).toBeTruthy()
@@ -83,7 +83,7 @@ test('pause after candidates, then resume without repeating Agent calls', async 
   const invocationCount = paused.invocations.length
   expect(invocationCount).toBeGreaterThanOrEqual(4)
 
-  await page.getByRole('button', { name: '从候选继续运行' }).click()
+  await page.getByRole('button', { name: '按冻结配置继续统筹' }).click()
   await expect(page.getByText('v1 · 主 Agent 成稿')).toBeVisible({
     timeout: 60_000,
   })

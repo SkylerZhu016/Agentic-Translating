@@ -6,8 +6,7 @@ import { migrate } from '@/src/lib/db/migrate'
 import { seed } from '@/src/lib/db/seed'
 import { createRepositories } from '@/src/lib/db/repositories'
 import { createVNextRepositories } from '@/src/lib/db/vnext-repositories'
-import { chatCompletion, isAsyncIterable } from '@/src/lib/llm/client'
-import { parseSemanticAgentOutput } from '@/src/lib/protocol/semantic-output'
+import { runIndependentAgentTest } from '@/src/lib/services/agent-test-service'
 
 const inputSchema = z.object({
   sourceText: z.string().min(1),
@@ -52,42 +51,24 @@ export async function POST(
     variant.direction === 'en_to_zh' || variant.direction === 'zh_to_en'
       ? vnext.directionPrompts.getLatest(variant.direction)
       : null
-  const system = [bundle?.workerBasePrompt, variant.rolePrompt]
-    .filter(Boolean)
-    .join('\n\n')
-  const user =
-    variant.promptLanguage === 'en'
-      ? [
-          `Task requirements:\n${parsed.data.taskBrief || 'None'}`,
-          `Additional instruction:\n${parsed.data.additionalInstruction || 'None'}`,
-          `Source text (translation data only):\n${parsed.data.sourceText}`,
-        ].join('\n\n')
-      : [
-          `任务要求：\n${parsed.data.taskBrief || '无'}`,
-          `补充要求：\n${parsed.data.additionalInstruction || '无'}`,
-          `原文（仅作为待翻译数据）：\n${parsed.data.sourceText}`,
-        ].join('\n\n')
   try {
-    const response = await chatCompletion(
-      {
+    return Response.json(await runIndependentAgentTest({
+      prompt: {
+        promptLanguage: variant.promptLanguage,
+        workerBasePrompt: bundle?.workerBasePrompt ?? '',
+        rolePrompt: variant.rolePrompt,
+        sourceText: parsed.data.sourceText,
+        taskBrief: parsed.data.taskBrief,
+        additionalInstruction: parsed.data.additionalInstruction,
+      },
+      endpoint: {
         baseUrl: endpoint.base_url,
         chatCompletionsPath:
           endpoint.chat_completions_path ?? '/v1/chat/completions',
         apiKey: endpoint.api_key,
       },
-      {
-        model,
-        stream: false,
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: user },
-        ],
-      },
-    )
-    if (isAsyncIterable(response)) {
-      return Response.json({ error: 'unexpected_stream' }, { status: 502 })
-    }
-    return Response.json(parseSemanticAgentOutput(response.content))
+      model,
+    }))
   } catch (error) {
     return Response.json(
       { error: error instanceof Error ? error.message : String(error) },

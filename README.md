@@ -12,7 +12,7 @@ The key difference from a general-purpose coding agent is not treating translati
 - 10 agent archetypes, each with 2 directional variants: fidelity, naturalness, voice, terminology, culture, long text, formal text, literary, poetry, and dissent.
 - Dynamic teaming and fixed presets coexist. The system keeps at least two successful candidates from different archetypes before forming the first version.
 - Two completion paths: direct editing by the main agent, or the classic four-stage process of review, filter, orchestrate, and assemble.
-- FSBP (Free-form Semantic Boundary Protocol). The first standalone `---` in a document acts as a divider. Content above is the body, content below is annotation. The full original is always archived. Downstream components only inherit the body.
+- FSBP (Free-form Semantic Boundary Protocol). The final standalone `---` in a document acts as a divider. Content above is the body, content below is annotation. The full original is always archived. Downstream components only inherit the body.
 - Tools are exposed in stages: `call_agents`, `write_draft`, `replace_text`, `submit_final`. Each round injects only the tools needed at that point.
 - Versioned edits, Unicode diff comparisons, evidence citations, undo and redo.
 - User preset revision management, history recovery, safe export, and a batch queue supporting up to 100 files.
@@ -61,7 +61,7 @@ Optional notes on trade-offs, ambiguities, or terminology
 
 Rules:
 
-- Only the first standalone separator that equals `---` after trimming whitespace is recognized.
+- Only the final standalone separator that equals `---` after trimming whitespace is recognized.
 - Supports both LF and CRLF line endings.
 - The `raw` content is saved and displayed permanently.
 - Downstream components only receive the `body`.
@@ -94,18 +94,21 @@ docker compose up --build
 
 Production web deployments must set the `AGENTIC_SECRET_KEY` environment variable. Build, backup, and upgrade instructions are in [docs/desktop-build.en.md](docs/desktop-build.en.md).
 
-## Protocol Experiments
+## FSBP Dataset
 
-First edit the model names in `experiments/configs/main.json` and provide the API key through environment variables:
+The previous pilot experiment has been retired. The replacement dataset,
+selection log, schemas, rubrics, and research boundaries live in
+[`FSBP_Test/`](FSBP_Test/README.md). Specific texts remain empty until they are
+reviewed and approved.
 
 ```bash
-npm run experiment:protocol -- --config experiments/configs/main.json
-npm run experiment:report -- --run <run-id>
+npm run dataset:validate
+npm run dataset:validate:locked
 ```
 
-The experiment uses a fixed set of 20 public-domain bidirectional samples and 6 misleading-annotation stress samples. It compares three protocols: `strict-json`, `freeform-raw`, and `fsbp-v1`. The executor supports checkpoint resume by record key and does not write API keys to result files.
-
-Running experiments with real models incurs API costs. The repository does not include pre-generated or fabricated experimental results.
+Draft validation accepts an incomplete selection while validating every present
+record. Locked validation requires the complete approved 8-item development set
+and 24-item test set.
 
 ## Development Commands
 
@@ -117,8 +120,8 @@ Running experiments with real models incurs API costs. The repository does not i
 | `npm run build` | Next.js production build |
 | `npm run e2e` | Run Playwright end-to-end tests |
 | `npm run package:win` | Package Windows NSIS installer and portable build |
-| `npm run experiment:protocol` | Run protocol ablation experiment |
-| `npm run experiment:report` | Generate CSV, Markdown, and HTML reports |
+| `npm run dataset:validate` | Validate the in-progress FSBP dataset |
+| `npm run dataset:validate:locked` | Enforce the complete locked dataset gate |
 
 ## Documentation
 
