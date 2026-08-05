@@ -108,6 +108,27 @@ npm run dataset:validate:locked
 草稿校验允许选型尚未完成，但会严格验证已经存在的每条记录；锁定校验要求
 8 个开发样本和 24 个测试样本全部确认完成。
 
+## CLI 测试驾驶舱
+
+`scripts/dev-harness.mts` 提供与 Web 工作台功能一致的纯命令行驱动（需要 Node.js 22+）：
+
+```bash
+node --experimental-strip-types scripts/dev-harness.mts --help
+```
+
+子命令：`create`、`run`、`translate`、`events`、`chat`、`suggest`、
+`state`、`list`、`rm`、`restore`。它直接复用项目自己的 SSE 解析器和纯函数，
+命令行与 HTTP 协议零漂移。特点：
+
+- 增量 SSE 输出带时间戳和阶段标签；`--trace` 在 `FSBP_Test/private/debug/` 下
+  落盘 JSONL 日志。
+- 失败时自动转储最近 50 条事件和会话状态并以非零码退出。
+- `suggest` 在当前正式版本上运行修订建议闭环（相互隔离的目标语读者、
+  双语核验者和仲裁者三镜头）。
+- 长批次实验支持基于 manifest 的断点续跑。
+
+浏览器仍用于布局与视觉回归；模型验证可以完全在命令行完成。
+
 ## 开发命令
 
 | 命令 | 说明 |
@@ -120,6 +141,7 @@ npm run dataset:validate:locked
 | `npm run package:win` | 打包 Windows NSIS 安装版和便携版 |
 | `npm run dataset:validate` | 校验选型中的 FSBP 数据集 |
 | `npm run dataset:validate:locked` | 执行完整锁定数据集门禁 |
+| `node --experimental-strip-types scripts/dev-harness.mts` | 运行 CLI 测试驾驶舱 |
 
 ## 文档
 
