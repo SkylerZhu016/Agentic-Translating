@@ -18,23 +18,27 @@ describe('revision suggestion lenses', () => {
   })
 
   it('keeps the target-language reader blind to the source and isolates annotations', async () => {
+    const streamOf = (content: string) =>
+      (async function* () {
+        yield { type: 'text' as const, content }
+        yield { type: 'done' as const, content }
+      })()
     vi.mocked(chatCompletion).mockImplementation(async (_endpoint, request) => {
       const system = request.messages[0]?.content ?? ''
+      if (system.includes('把两份隔离意见整理成')) {
+        return streamOf(
+          '这两处读着有点绕：“凌晨那些小小的钟点开始变大”和“劳苦的头脑”。请改得自然一些，同时保留原文疲惫不安的感觉。\n---\n内部仲裁注释',
+        )
+      }
       if (system.includes('独立的中文成品读者')) {
-        return {
-          content: '“凌晨那些小小的钟点开始变大”读起来生硬。\n---\n内部读者注释',
-        }
+        return streamOf(
+          '“凌晨那些小小的钟点开始变大”读起来生硬。\n---\n内部读者注释',
+        )
       }
       if (system.includes('双语核验者')) {
-        return {
-          content: '“劳苦的头脑”搭配不自然，需要保留 mind 的劳顿感。\n---\n内部核验注释',
-        }
-      }
-      if (system.includes('把两份隔离意见整理成')) {
-        return {
-          content:
-            '这两处读着有点绕：“凌晨那些小小的钟点开始变大”和“劳苦的头脑”。请改得自然一些，同时保留原文疲惫不安的感觉。\n---\n内部仲裁注释',
-        }
+        return streamOf(
+          '“劳苦的头脑”搭配不自然，需要保留 mind 的劳顿感。\n---\n内部核验注释',
+        )
       }
       throw new Error(`unexpected prompt: ${system}`)
     })
@@ -87,7 +91,7 @@ describe('revision suggestion lenses', () => {
     expect(
       calls.every(([, request]) =>
         request.model === 'DeepSeek V4 Flash: Go' &&
-        request.stream === false &&
+        request.stream === true &&
         request.maxTokens === 65_536,
       ),
     ).toBe(true)
@@ -96,13 +100,16 @@ describe('revision suggestion lenses', () => {
   it('uses English lenses for Chinese-to-English sessions', async () => {
     vi.mocked(chatCompletion).mockImplementation(async (_endpoint, request) => {
       const system = request.messages[0]?.content ?? ''
+      if (system.includes('Turn the two independent reports')) {
+        return { content: 'The final line feels too abstract; make the loneliness feel more aimless without rewriting the poem.' }
+      }
       if (system.includes('independent reader of finished English')) {
         return { content: 'The final clause feels abstract.' }
       }
       if (system.includes('bilingual verifier')) {
         return { content: 'The final clause weakens the source sense of 漫.' }
       }
-      return { content: 'The final line feels too abstract; make the loneliness feel more aimless without rewriting the poem.' }
+      throw new Error(`unexpected prompt: ${system}`)
     })
 
     const result = await generateRevisionSuggestion({
@@ -120,5 +127,87 @@ describe('revision suggestion lenses', () => {
     expect(
       vi.mocked(chatCompletion).mock.calls[0][1].messages[0].content,
     ).toContain('finished English')
+  })
+
+  it('v16 prompts protect deliberate strangeness and require verbatim prohibitions', async () => {
+    const streamOf = (content: string) =>
+      (async function* () {
+        yield { type: 'text' as const, content }
+        yield { type: 'done' as const, content }
+      })()
+    vi.mocked(chatCompletion).mockImplementation(async (_endpoint, request) => {
+      const system = request.messages[0]?.content ?? ''
+      if (system.includes('把两份隔离意见整理成')) return streamOf('这一轮先不要修改')
+      if (system.includes('独立的中文成品读者')) return streamOf('停止')
+      if (system.includes('双语核验者')) return streamOf('停止')
+      throw new Error(`unexpected prompt: ${system}`)
+    })
+    await generateRevisionSuggestion({
+      endpoint: { baseUrl: 'https://example.invalid', apiKey: 'test-key' },
+      model: 'DeepSeek V4 Flash: Go',
+      promptLanguage: 'zh',
+      sourceText: 'The small hours began to grow large.',
+      taskBrief: '保持叙事语气。',
+      currentTranslation: '凌晨那些小小的钟点开始变大。',
+      userRequest: '读起来有点拗口。',
+    })
+    const zhCalls = vi.mocked(chatCompletion).mock.calls
+    const zhReader = zhCalls.find(([, r]) =>
+      r.messages[0]?.content.includes('独立的中文成品读者'),
+    )?.[1].messages[0].content ?? ''
+    const zhBilingual = zhCalls.find(([, r]) =>
+      r.messages[0]?.content.includes('双语核验者'),
+    )?.[1].messages[0].content ?? ''
+    const zhArbiter = zhCalls.find(([, r]) =>
+      r.messages[0]?.content.includes('把两份隔离意见整理成'),
+    )?.[1].messages[0].content ?? ''
+    expect(zhReader).toContain('陌生化手法')
+    expect(zhReader).toContain('待核验')
+    expect(zhReader).toContain('疑似刻意表达')
+    expect(zhBilingual).toContain('禁止事项')
+    expect(zhBilingual).toContain('主语—谓语—宾语骨架')
+    expect(zhArbiter).toContain('禁止事项')
+    expect(zhArbiter).toContain('逐字保留')
+    expect(zhArbiter).toContain('这一轮先不要修改')
+
+    vi.mocked(chatCompletion).mockReset()
+    vi.mocked(chatCompletion).mockImplementation(async (_endpoint, request) => {
+      const system = request.messages[0]?.content ?? ''
+      if (system.includes('Turn the two independent reports')) {
+        return { content: 'Do not change this version in this round.' }
+      }
+      if (system.includes('independent reader of finished English')) {
+        return { content: 'stop' }
+      }
+      if (system.includes('bilingual verifier')) return { content: 'stop' }
+      throw new Error(`unexpected prompt: ${system}`)
+    })
+    await generateRevisionSuggestion({
+      endpoint: { baseUrl: 'https://example.invalid', apiKey: 'test-key' },
+      model: 'DeepSeek V4 Flash: Go',
+      promptLanguage: 'en',
+      sourceText: '人事音书漫寂寥。',
+      taskBrief: 'Preserve the poem\'s tone.',
+      currentTranslation: 'My affairs are left to loneliness.',
+      userRequest: 'The ending feels flat.',
+    })
+    const enCalls = vi.mocked(chatCompletion).mock.calls
+    const enReader = enCalls.find(([, r]) =>
+      r.messages[0]?.content.includes('independent reader of finished English'),
+    )?.[1].messages[0].content ?? ''
+    const enBilingual = enCalls.find(([, r]) =>
+      r.messages[0]?.content.includes('bilingual verifier'),
+    )?.[1].messages[0].content ?? ''
+    const enArbiter = enCalls.find(([, r]) =>
+      r.messages[0]?.content.includes('Turn the two independent reports'),
+    )?.[1].messages[0].content ?? ''
+    expect(enReader).toContain('unusual but flavorful')
+    expect(enReader).toContain('needs-verification')
+    expect(enBilingual).toContain('prohibitions')
+    expect(enBilingual).toContain('negative form')
+    expect(enBilingual).toContain('subject-verb-object skeleton')
+    expect(enArbiter).toContain('prohibitions')
+    expect(enArbiter).toContain('verbatim')
+    expect(enArbiter).toContain('do not')
   })
 })

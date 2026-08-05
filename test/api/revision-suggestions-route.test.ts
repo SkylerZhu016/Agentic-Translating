@@ -98,13 +98,16 @@ describe('POST /api/sessions/:id/revision-suggestions', () => {
     vi.mocked(chatCompletion).mockReset()
     vi.mocked(chatCompletion).mockImplementation(async (_endpoint, llmRequest) => {
       const system = llmRequest.messages[0]?.content ?? ''
+      if (system.includes('把两份隔离意见整理成')) {
+        return { content: '这句话读着有点绕，请只改最明显的一处。' }
+      }
       if (system.includes('独立的中文成品读者')) {
         return { content: '目标语阅读意见' }
       }
       if (system.includes('双语核验者')) {
         return { content: '双语核验意见' }
       }
-      return { content: '这句话读着有点绕，请只改最明显的一处。' }
+      throw new Error(`unexpected prompt: ${system}`)
     })
   })
 

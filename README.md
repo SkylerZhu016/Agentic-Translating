@@ -110,6 +110,29 @@ Draft validation accepts an incomplete selection while validating every present
 record. Locked validation requires the complete approved 8-item development set
 and 24-item test set.
 
+## CLI Test Harness
+
+`scripts/dev-harness.mts` provides a pure command-line driver with the same
+functionality as the web workbench (requires Node.js 22+):
+
+```bash
+node --experimental-strip-types scripts/dev-harness.mts --help
+```
+
+Subcommands: `create`, `run`, `translate`, `events`, `chat`, `suggest`,
+`state`, `list`, `rm`, `restore`. It reuses the project's own SSE parser and
+pure functions, so the CLI never drifts from the HTTP protocol. Highlights:
+
+- Incremental SSE output with timestamps and phase labels (`--trace` writes a
+  JSONL log under `FSBP_Test/private/debug/`).
+- Failures dump the last 50 events plus session state and exit non-zero.
+- `suggest` runs the guided-revision loop (isolated target-language reader,
+  bilingual verifier, and arbiter lenses) on the current final version.
+- Manifest-based breakpoint resume for long-running experiment batches.
+
+The browser remains the tool of choice for layout and visual regression; model
+verification can be done entirely from the CLI.
+
 ## Development Commands
 
 | Command | Description |
@@ -122,6 +145,7 @@ and 24-item test set.
 | `npm run package:win` | Package Windows NSIS installer and portable build |
 | `npm run dataset:validate` | Validate the in-progress FSBP dataset |
 | `npm run dataset:validate:locked` | Enforce the complete locked dataset gate |
+| `node --experimental-strip-types scripts/dev-harness.mts` | Run the CLI test harness |
 
 ## Documentation
 

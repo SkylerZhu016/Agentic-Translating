@@ -33,6 +33,9 @@ src/lib/prompts/temp.txt
 # Local-only iteration and release verification notes
 迭代文档/
 
+# Root-level temporary iteration files (dev/gate logs, probe scripts)
+/.tmp-*
+
 # OS
 Thumbs.db
 .DS_Store

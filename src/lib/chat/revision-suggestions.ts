@@ -31,16 +31,28 @@ async function completeText(
   input: RevisionSuggestionInput,
   messages: Array<{ role: string; content: string }>,
 ): Promise<string> {
+  // 必须使用流式：推理模型在首个可见 token 前可能静默数十秒，
+  // 非流式连接会被上游网关读超时切断（504），而推理仍继续计费。
+  // 流式期间思维链分片由客户端丢弃，但分片活动会保持连接存活。
   const response = await chatCompletion(input.endpoint, {
     model: input.model,
     messages,
-    stream: false,
+    stream: true,
     maxTokens: REVISION_SUGGESTION_MAX_TOKENS,
   })
-  if (isAsyncIterable(response)) {
-    throw new Error('Revision suggestion call unexpectedly returned a stream')
+  if (!isAsyncIterable(response)) {
+    // 部分上游会以非流式 JSON 应答流式请求（客户端自动降级）。
+    return semanticBody((response as ChatCompletionResponse).content).trim()
   }
-  return semanticBody((response as ChatCompletionResponse).content).trim()
+  let content = ''
+  for await (const event of response) {
+    if (event.type === 'text') {
+      content += event.content
+    } else if (event.type === 'done') {
+      content = event.content || content
+    }
+  }
+  return semanticBody(content).trim()
 }
 
 function targetReaderMessages(input: RevisionSuggestionInput) {
@@ -49,7 +61,7 @@ function targetReaderMessages(input: RevisionSuggestionInput) {
       {
         role: 'system',
         content:
-          '你是一名独立的中文成品读者。你看不到原文，也不负责直接改写。请根据用户的简单感受通读当前译文，最多指出三处最影响阅读的准确原句。关注搭配、指代、节奏、语气、画面连续性和明显翻译腔。每一处都要逐字引用当前译文，说明普通读者为什么会卡住，以及希望达到什么阅读效果。刻意陌生、反常或重复的表达可能来自原文；证据不足时标为需要回看，不要擅自判错。没有值得修改的问题时明确说停止。只输出简洁自然语言意见。',
+          '你是一名独立的中文成品读者。你看不到原文，也不负责改写，只报告阅读卡顿。请根据用户的简单感受通读当前译文，最多报告三处最影响阅读的卡顿点，并逐字引用当前译文中的准确原句。每一处必须标注类型：【真语义问题】——指代不清、搭配明显错误、句子无法还原意图；或【疑似刻意表达】——不常见但有味道、可能是原文的陌生化手法。疑似刻意表达一律只标为待核验，绝不给出改法建议；除非用户感受明确抱怨该处，否则它不进入任何修改候选。对【真语义问题】说明普通读者为什么会卡住和希望达到的阅读效果；对【疑似刻意表达】说明应保留什么效果。没有值得报告的卡顿时明确说停止。只输出简洁自然语言意见。',
       },
       {
         role: 'user',
@@ -63,7 +75,7 @@ function targetReaderMessages(input: RevisionSuggestionInput) {
     {
       role: 'system',
       content:
-        'You are an independent reader of finished English. You cannot see the source and you do not rewrite the translation. Read the current translation in light of the user\'s simple reaction. Identify at most three exact current sentences or phrases that most obstruct idiomatic reading, reference, rhythm, register, image continuity, or voice. Quote each span character-for-character, explain in ordinary reader language why it causes friction, and state the reading effect that should be restored. Mark deliberate strangeness or repetition as needing source verification when evidence is insufficient. If there is no worthwhile change, say to stop. Output concise natural-language feedback only.',
+        'You are an independent reader of finished English. You cannot see the source and you do not rewrite the translation; you only report reading friction. Read the current translation in light of the user\'s simple reaction. Report at most three spots that most obstruct reading, quoting each span character-for-character. Label every spot: 【real semantic problem】— unclear reference, plainly wrong collocation, a sentence whose intent cannot be recovered; or 【likely deliberate device】— unusual but flavorful, possibly the source\'s deliberate strangeness. For likely-deliberate spots, mark them needs-verification only and never suggest a fix, and do not include them as change candidates unless the user explicitly complains about that spot. For real semantic problems, explain in ordinary reader language why it causes friction and the reading effect that should be restored; for likely-deliberate spots, state what effect must survive. If there is nothing worth reporting, say to stop. Output concise natural-language feedback only.',
     },
     {
       role: 'user',
@@ -80,7 +92,7 @@ function bilingualMessages(input: RevisionSuggestionInput) {
       {
         role: 'system',
         content:
-          '你是一名与目标语读者隔离工作的双语核验者。请对照完整原文、任务要求和当前译文，最多定位三处会改变事实、施受关系、逻辑、专名、数量、结构、意象关系或声音功能的问题。逐字引用当前译文中的准确片段，说明原文真正需要保留的功能和修改边界。自然度本身也是有效问题，但不得把原文刻意的陌生、重复、含混或修辞抹平。不要直接给出整篇重译，也不要把偏好写成确定错误。没有可核验问题时明确说停止。只输出简洁自然语言意见。',
+          '你是一名与目标语读者隔离工作的双语核验者。第一步：先为原文每个分句写出主语—谓语—宾语骨架以及关键否定、数量、修饰归属，不参考译文。第二步：再逐句对照当前译文，任何施受、主语、否定、时态、数量或修饰归属的变化都必须标出。第三步：只把有原文直接证据的问题列入报告（最多三处），每个问题给出：a) 允许的修改边界（可以怎么写）；b) 禁止事项（不能怎么写，负面句式，例如“主语必须是 X，不能改成 Y”“不要新增动作、因果或抽象化”）。原文的异常搭配、悖论、重复、陌生化表达默认是刻意手法：除非能证明是误译，否则必须明确写“保留，不改”，绝不因“读着拗口”而建议改。不要直接给出整篇重译，也不要把偏好写成确定错误。没有可核验问题时明确说停止。只输出简洁自然语言意见。',
       },
       {
         role: 'user',
@@ -96,7 +108,7 @@ function bilingualMessages(input: RevisionSuggestionInput) {
     {
       role: 'system',
       content:
-        'You are a bilingual verifier working independently from the target-language reader. Compare the complete source, task brief, and current translation. Identify at most three exact current spans that change facts, agency, logic, established names, quantity, structure, image relations, or the source\'s rhetorical and tonal function. Quote each current span character-for-character, describe the source function that must survive, and bound the safe repair. Target-language friction is valid evidence, while deliberate strangeness, repetition, openness, and rhetoric must not be flattened. Do not rewrite the whole text and do not turn preference into a factual error. If there is no verifiable problem, say to stop. Output concise natural-language feedback only.',
+        'You are a bilingual verifier working independently from the target-language reader. Step 1: write out the subject-verb-object skeleton of every source clause, plus key negations, counts, and modification attachment, without consulting the translation. Step 2: check each target sentence against that skeleton; flag every shift in agency, subject, negation, tense, number, or attachment. Step 3: report at most three problems that have direct source evidence, and for each give: a) the permitted repair boundary (what may be written instead); and b) explicit prohibitions in negative form (e.g. "the subject must remain X, do not make it Y", "do not add motion, causation, or abstraction"). Treat the source\'s unusual collocations, paradoxes, repetitions, and deliberate strangeness as intentional by default: unless you can prove mistranslation, state explicitly "keep, do not change" and never recommend a change merely because the target reads stiffly. Do not rewrite the whole text and do not turn preference into a factual error. If there is no verifiable problem, say to stop. Output concise natural-language feedback only.',
     },
     {
       role: 'user',
@@ -119,7 +131,7 @@ function arbiterMessages(
       {
         role: 'system',
         content:
-          '你负责把两份隔离意见整理成一条普通用户能理解并直接发送给编辑 Agent 的短消息。逐条核对意见是否引用了当前译文中真实存在的准确片段。最多保留三处高影响问题；优先保留两份报告互补且有明确边界的问题。使用日常表达，例如“这句读着有点绕”“这里像是把谁做了什么说反了”。说明希望更通顺、文雅、清楚或更贴近原意，但不要替用户写专业术语，不要提供整篇答案。若两份报告都没有可靠问题，输出“这一轮先不要修改”。只输出最终短消息。',
+          '你负责把两份隔离意见整理成一条普通用户能理解并直接发送给编辑 Agent 的短消息。默认输出“这一轮先不要修改”；只有当双语核验者明确确认了问题（给出了修改边界和禁止事项）时，才把这些确认项整理成反馈。目标语读者报告中的疑似刻意表达一律不得列入反馈，除非双语核验者确认它们是误译。目标语读者报告中的卡顿若未被双语核验者确认为可核验问题，不得列入。双语核验者明确写“保留，不改”的原文表达，反馈中必须写入“不要改……”的负面指令。双语核验报告中的禁止事项必须逐字保留在反馈里，用“不要……”“不能……”的负面句式原样写出，不得用你自己的话转述或简化，以免方向变模糊。最多保留三处。使用日常表达，例如“这句读着有点绕”“这里像是把谁做了什么说反了”。说明希望更通顺、文雅、清楚或更贴近原意，但不要替用户写专业术语，不要提供整篇答案。只输出最终短消息。',
       },
       {
         role: 'user',
@@ -135,7 +147,7 @@ function arbiterMessages(
     {
       role: 'system',
       content:
-        'Turn the two independent reports into one short message that an ordinary user could understand and send directly to the editing agent. Verify that every quoted span exists exactly in the current translation. Keep at most three high-impact, bounded problems and prefer complementary findings. Use everyday language such as “this line feels stiff” or “this seems to say who did what the wrong way.” State the desired reading effect without specialist jargon and without supplying a complete replacement translation. If neither report identifies a reliable problem, output “Do not change this version in this round.” Output the final short message only.',
+        'Turn the two independent reports into one short message that an ordinary user could understand and send directly to the editing agent. Default output is "Do not change this version in this round"; include a change candidate only when the bilingual verifier explicitly confirmed it (with a repair boundary and prohibitions). Never include the target-language reader\'s likely-deliberate-device items unless the bilingual verifier confirmed them as mistranslations. Never include reader friction that the bilingual verifier did not confirm as a verifiable problem. When the bilingual verifier wrote "keep, do not change" for a source device, the feedback must carry an explicit negative instruction ("do not change…"). Preserve the bilingual verifier\'s prohibitions verbatim in the feedback, phrased as explicit negatives ("do not…", "must not…") — never paraphrase or soften them, since a vague restatement reverses direction. Keep at most three items. Use everyday language such as “this line feels stiff” or “this seems to say who did what the wrong way.” State the desired reading effect without specialist jargon and without supplying a complete replacement translation. Output the final short message only.',
     },
     {
       role: 'user',

@@ -234,6 +234,8 @@ function feedbackRounds(sample) {
 }
 
 function ordinaryFeedbackRounds(sample) {
+  const configured = runConfig.revisionRounds?.[sample.direction]
+  if (Array.isArray(configured) && configured.length) return configured
   if (sample.direction === 'en_to_zh') {
     return [
       '读起来有点拗口。只改最影响阅读的几处，别把原文特别的说法抹平。',
