@@ -20,8 +20,13 @@ const outputDir = path.resolve(
     'dev-conversation-v1',
   ),
 )
-const manifestPath = path.join(outputDir, 'manifest.json')
-const resultsPath = path.join(outputDir, 'results.jsonl')
+const onlySampleId = process.argv
+  .find((argument) => argument.startsWith('--only='))
+  ?.slice(7)
+// --only 并发模式：每个样本写独立分片文件，避免多进程互相覆盖；跑完后由合并脚本汇总
+const shardSuffix = onlySampleId ? `-${onlySampleId}` : ''
+const manifestPath = path.join(outputDir, `manifest${shardSuffix}.json`)
+const resultsPath = path.join(outputDir, `results${shardSuffix}.jsonl`)
 const defaultSelectedIds = [
   'test-en-zh-hopkins-pied-beauty',
   'test-en-zh-jerome-sea-trip',
@@ -30,9 +35,6 @@ const defaultSelectedIds = [
   'test-zh-en-wanganshi-reform-defense',
 ]
 const selectedIds = runConfig.selectedIds ?? defaultSelectedIds
-const onlySampleId = process.argv
-  .find((argument) => argument.startsWith('--only='))
-  ?.slice(7)
 const experimentSlug = runConfig.experimentSlug ?? 'round3-dev-conversation-v1'
 const expectedCount = runConfig.expectedCount ?? selectedIds.length
 if (selectedIds.length !== expectedCount || new Set(selectedIds).size !== selectedIds.length) {
@@ -79,21 +81,34 @@ async function readJsonl(filePath) {
 
 async function api(url, init) {
   const method = init?.method?.toUpperCase() ?? 'GET'
-  const attempts = method === 'GET' ? 5 : 1
+  const attempts = 5
+  let lastError
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    const response = await fetch(`${apiBase}${url}`, init)
-    const contentType = response.headers.get('content-type') ?? ''
-    const payload = contentType.includes('application/json')
-      ? await response.json().catch(() => null)
-      : await response.text().catch(() => '')
-    if (response.ok) return payload
-    if (method === 'GET' && response.status >= 500 && attempt < attempts) {
-      await new Promise((resolve) => setTimeout(resolve, attempt * 1_000))
-      continue
+    try {
+      const response = await fetch(`${apiBase}${url}`, init)
+      const contentType = response.headers.get('content-type') ?? ''
+      const payload = contentType.includes('application/json')
+        ? await response.json().catch(() => null)
+        : await response.text().catch(() => '')
+      if (response.ok) return payload
+      if (response.status >= 500 && attempt < attempts) {
+        lastError = new Error(`HTTP ${response.status} ${url}: ${String(payload).slice(0, 300)}`)
+        await new Promise((resolve) => setTimeout(resolve, attempt * 2_000))
+        continue
+      }
+      if (response.status < 500) {
+        throw new Error(`HTTP ${response.status} ${url}: ${String(payload).slice(0, 300)}`)
+      }
+      lastError = new Error(`HTTP ${response.status} ${url}: ${String(payload).slice(0, 300)}`)
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error))
+      if (attempt < attempts) {
+        await new Promise((resolve) => setTimeout(resolve, attempt * 2_000))
+        continue
+      }
     }
-    throw new Error(`${response.status} ${url}: ${JSON.stringify(payload ?? {})}`)
   }
-  throw new Error(`${method} ${url}: retry loop exhausted`)
+  throw lastError ?? new Error(`request failed: ${url}`)
 }
 
 async function findBaseRevision(sample) {
@@ -274,37 +289,49 @@ function sessionIdOf(detail) {
 }
 
 async function applyChatRound(sessionId, message) {
-  const response = await fetch(`${apiBase}/api/sessions/${sessionId}/chat`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ message }),
-  })
-  const text = await response.text()
-  if (!response.ok) {
-    throw new Error(`${response.status} chat: ${text.slice(0, 1000)}`)
+  let lastError
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    try {
+      const response = await fetch(`${apiBase}/api/sessions/${sessionId}/chat`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ message }),
+      })
+      const text = await response.text()
+      if (!response.ok) {
+        throw new Error(`${response.status} chat: ${text.slice(0, 1000)}`)
+      }
+      if (!/event:\s*done\b/.test(text)) {
+        throw new Error(`chat stream ended without done event: ${text.slice(-1000)}`)
+      }
+      const completionBlocks = [
+        ...text.matchAll(/event:\s*message_complete\s*\r?\ndata:\s*([^\r\n]+)/g),
+      ]
+      const completion = completionBlocks.at(-1)
+      if (!completion) {
+        throw new Error(`chat stream ended without message_complete: ${text.slice(-1000)}`)
+      }
+      const completionPayload = JSON.parse(completion[1])
+      if (completionPayload.error) {
+        throw new Error(
+          `chat model failed: ${completionPayload.error}: ` +
+          `${completionPayload.message ?? 'unknown error'}`,
+        )
+      }
+      const session = await api(`/api/sessions/${sessionId}`)
+      if (session.messages?.at(-1)?.role !== 'assistant') {
+        throw new Error('chat stream completed without a persisted assistant turn')
+      }
+      return session
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error))
+      if (attempt < 5) {
+        await new Promise((resolve) => setTimeout(resolve, attempt * 2_000))
+        continue
+      }
+    }
   }
-  if (!/event:\s*done\b/.test(text)) {
-    throw new Error(`chat stream ended without done event: ${text.slice(-1000)}`)
-  }
-  const completionBlocks = [
-    ...text.matchAll(/event:\s*message_complete\s*\r?\ndata:\s*([^\r\n]+)/g),
-  ]
-  const completion = completionBlocks.at(-1)
-  if (!completion) {
-    throw new Error(`chat stream ended without message_complete: ${text.slice(-1000)}`)
-  }
-  const completionPayload = JSON.parse(completion[1])
-  if (completionPayload.error) {
-    throw new Error(
-      `chat model failed: ${completionPayload.error}: ` +
-      `${completionPayload.message ?? 'unknown error'}`,
-    )
-  }
-  const session = await api(`/api/sessions/${sessionId}`)
-  if (session.messages?.at(-1)?.role !== 'assistant') {
-    throw new Error('chat stream completed without a persisted assistant turn')
-  }
-  return session
+  throw lastError ?? new Error(`chat round failed: ${sessionId}`)
 }
 
 function versionRecord(session, version, round, extra = {}) {

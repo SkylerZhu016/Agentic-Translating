@@ -33,6 +33,7 @@ import { createRepositories } from '../db/repositories'
 import { createVNextRepositories } from '../db/vnext-repositories'
 import { createWorkspaceModelProfilesRepo } from '../db/release-config-repositories'
 import { decryptSecret, encryptSecret } from '../security/secrets'
+import { RETRY_DELAYS_MS } from '../constants'
 
 const callAgentsArgsSchema = z.object({
   calls: z.array(z.object({
@@ -408,7 +409,8 @@ async function complete(
       { retryable: true },
     )
   }
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  const maxAttempts = RETRY_DELAYS_MS.length + 1
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     try {
       const response = await chatCompletion(
         {
@@ -416,10 +418,14 @@ async function complete(
           chatCompletionsPath: endpoint.chatCompletionsPath,
           apiKey: endpoint.apiKey,
         },
-        { ...request, stream: request.stream ?? true },
+        { ...request, maxTokens: request.maxTokens ?? 131_072, stream: request.stream ?? true },
       )
       if (!isAsyncIterable(response)) {
         assertVisibleOutputIntegrity(response.content)
+        if (!response.content?.trim() && attempt < maxAttempts - 1) {
+          await new Promise((resolve) => setTimeout(resolve, RETRY_DELAYS_MS[attempt]))
+          continue
+        }
         return response
       }
       let content = ''
@@ -431,13 +437,17 @@ async function complete(
           toolCalls = event.toolCalls
         }
       }
+      if (!content.trim() && attempt < maxAttempts - 1) {
+        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAYS_MS[attempt]))
+        continue
+      }
       assertVisibleOutputIntegrity(content)
       return { content, toolCalls }
     } catch (error) {
-      if (!(error instanceof LLMError) || !error.retryable || attempt === 1) {
+      if (!(error instanceof LLMError) || !error.retryable || attempt === maxAttempts - 1) {
         throw error
       }
-      await new Promise((resolve) => setTimeout(resolve, 1_000))
+      await new Promise((resolve) => setTimeout(resolve, RETRY_DELAYS_MS[attempt]))
     }
   }
   throw new Error('LLM completion retry loop exhausted')
@@ -866,7 +876,7 @@ async function runImageryPrepass(
     let lastActivityEventAt = 0
     try {
       let content = ''
-      for (let attempt = 1; attempt <= 2; attempt += 1) {
+      for (let attempt = 1; attempt <= RETRY_DELAYS_MS.length + 1; attempt += 1) {
         const response = await complete(endpoint, {
         model: binding.model,
         onActivity() {
@@ -892,11 +902,11 @@ async function runImageryPrepass(
         })
         content = response.content.trim()
         if (content) break
-        if (attempt === 1) {
+        if (attempt < RETRY_DELAYS_MS.length + 1) {
           emitEvent(db, runId, session.id, 'agent.retrying', {
             invocationId,
             reason: 'empty_context_analysis',
-            nextAttempt: 2,
+            nextAttempt: attempt + 1,
           })
         }
       }
@@ -980,17 +990,20 @@ Do not recommend or introduce a dash or semicolon when it is absent from the sou
   const rolePrompt = english
     ? `You are the Prosody and Rhyme Planner for a difficult Chinese-to-English poetry translation.
 Do not translate the complete poem. Produce a concise, executable planning document for independent translators: identify form, stanza and line structure, syntactic continuation across line breaks, rhyme positions, rhyme scheme, acceptable exact or near-rhyme policy, rhythm priorities, and likely trade-offs.
-Rhyme is a binding target only when the user brief or deterministic constraints explicitly request target-language rhyme. Otherwise write "no mandatory target rhyme," describe source sound only as evidence, and do not assign a rhyme scheme, rhyme positions, or required ending words. Never turn an observed source rhyme into an unstated user requirement.
+Target-language rhyme is expected by default for rhyming poetry: judge rhyme by English pronunciation (identical stressed vowel plus following consonants for perfect rhyme; near rhyme such as move/love is acceptable when meaning requires it). Propose a concrete rhyme scheme (e.g., AABB, ABAB, ABBA, AAAA, XAXA) and candidate rhyming words per line-end position, with at least two alternatives per position so translators keep freedom. If the source is unrhymed free verse or the user brief explicitly exempts rhyme, write "no target rhyme required" and describe source sound only as evidence; otherwise rhyme is a binding target. Rhyme is subordinate to meaning and is realized in a "sentences first, scheme second" order: settle each line for semantic accuracy and structural correspondence, letting line endings take their most faithful words without pre-committing to a scheme; then mark the sounds of the settled endings, find the rhyme pairs that already hold, and enumerate viable schemes (AAAA, AABB, ABAB, ABBA, AABA, AXBX, XAXA), preferring the one that changes the fewest settled endings at the least semantic cost; fill only the positions the scheme requires, with words that are simultaneously faithful; when a position cannot be filled without semantic damage, drop it (mark X, downgrading the scheme to partial or motif rhyme) rather than revising settled lines backward to force rhyme. Resolve unclear relations inside a line through grammar, voice, or prepositions rather than vague wording.
+Never turn an observed source rhyme into an unstated user requirement in the opposite direction: when the source rhymes, target rhyme is expected; when it does not, do not force one.
+Structural correspondence: each source line maps to one or two target clauses (typically two). Neatness comes from that correspondence, not from hitting a fixed clause count, and a single source line must never split into more than two clauses. Clauses may be displayed one per line, or two per line joined by punctuation, whichever keeps the mapping visible.
 Before fixing a target line count, inventory the indispensable meaning units in each source line and test whether the proposed form can carry them. A one-to-one line mapping is optional unless the user requires it. State explicitly when one dense source line needs multiple shorter target lines, while preserving stanza correspondence and source order.
-Do not prescribe one mandatory set of ending words. Preserve room for genuinely different candidate translations. Never add unsupported meaning merely to force rhyme. A line break is not automatically a full stop: preserve continuation and enjambment when the source continues.
+Do not prescribe one mandatory set of ending words; offer alternatives and preserve room for genuinely different candidate translations. Never add unsupported meaning merely to force rhyme. A line break is not automatically a full stop: preserve continuation and enjambment when the source continues.
 ${punctuationInstruction}
 Lyric singability, melody fitting, and syllable-to-note alignment are outside the current product scope.
 Write freely. Optional human notes may follow a standalone "---" line.`
     : `你是高难诗歌翻译的“诗体与韵律规划助手”。
 不要直接翻译全诗。请为多个独立译者形成简洁、可执行的规划：识别诗体、分节、诗行、跨行句法延续、韵位、韵式、普通话或平水韵规则、节奏优先级与可能的取舍。
-只有用户要求或确定性约束明确要求目标语押韵时，押韵才是必须完成的目标。其他情况下必须写明“目标译文不强制押韵”，源文声响只作为辅助证据，不得指定韵式、韵位或必用韵脚，也不得把观察到的源文押韵擅自升级成用户要求。
+押韵诗歌默认要求目标语押韵：按普通话实际发音判定（韵母相同即押韵，前后鼻音 an/ang、en/eng、in/ing、un/ong 可通押，声调不必相同；平水韵同部但普通话读音不相近的不算）。给出具体的建议韵式（如 AABB、ABAB、ABBA、AAAA、XAXA）并为每个行末韵位提供至少两个候选韵脚字，保留译者的选择空间。原文为无韵自由诗或用户明确不要求押韵时，写明“目标译文不强制押韵”，源文声响只作辅助证据；否则押韵是必须完成的目标。押韵优先级低于语义，落实采用“先定句、后定韵”的顺序：先按语义准确与结构对应确定各句表达，行末字取语义最准确的词，不预先锁死韵式；再标出已定行末字的发音，找出已成立的韵对，从已成立韵对出发枚举可行韵式（AAAA、AABB、ABAB、ABBA、AABA、AXBX、XAXA），优先选择改动行末字最少、语义损伤最小的韵式；只在韵式要求的韵位补韵，补韵词必须同时达意；某韵位无法无损补韵时放弃该韵位（标 X，韵式降级为部分韵或母题韵），不反向修改已定句子凑韵。行内语义不清时用语法、语态、介词明确主宾关系，不用模糊说法掩盖。
+结构对应：每个源诗行对应一到两个目标分句（通常两个）。整齐来自对应关系而非分句数量，单个源诗行绝不能拆成三个或更多分句。分句可以每行一个独立展示，也可以两个一行用标点连接，以对应关系清晰为准。
 确定目标行数前，先核对每个源诗行中不可丢失的语义单位，再判断目标形式能否容纳。用户没有要求逐行一一对应时，不要机械维持相同行数；一个信息密集的长诗行需要拆成多个短诗行时，应明确说明，同时保持分节对应和原有次序。
-不要预先锁死唯一一组韵脚字，应保留多个候选译法的真实差异；不得为了押韵添加原文没有的含义。换行不自动等于句号：原文仍然延续时，应保留逗号、开放行或跨行延续。
+不要预先锁死唯一一组韵脚字，应为每个韵位提供多个候选，保留多个候选译法的真实差异；不得为了押韵添加原文没有的含义。换行不自动等于句号：原文仍然延续时，应保留逗号、开放行或跨行延续。
 ${punctuationInstruction}
 歌词可唱性、旋律适配和音符级音节对齐不在当前产品范围内。
 自由输出；可在独立一行“---”之后添加仅供用户查看的注释。`

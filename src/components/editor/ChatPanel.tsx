@@ -33,7 +33,16 @@ export interface ChatPanelProps {
 // ── 工具调用徽章 ──────────────────────────────────────────────
 
 function ToolCallBadge({ call }: { call: ToolCallView }) {
-  const label = `替换「${truncate(call.oldString, 20)}」→「${truncate(call.newString, 20)}」`
+  const isReplace = !call.toolName || call.toolName === 'replace_text'
+  const label = isReplace
+    ? `替换「${truncate(call.oldString, 20)}」→「${truncate(call.newString, 20)}」`
+    : call.toolName === 'file_read'
+      ? `读取文件 ${truncate(call.oldString, 40)}`
+      : call.toolName === 'file_edit'
+        ? `编辑文件 ${truncate(call.oldString, 40)}`
+        : call.toolName === 'run_command'
+          ? `执行命令 ${truncate(call.oldString, 40)}`
+          : `${call.toolName} ${truncate(call.oldString, 40)}`
 
   const tone =
     call.status === 'ok'
@@ -47,6 +56,7 @@ function ToolCallBadge({ call }: { call: ToolCallView }) {
       <span
         data-testid={TID.edit.toolCallBadge}
         data-status={call.status}
+        data-tool={isReplace ? 'replace_text' : call.toolName}
         className={`inline-flex max-w-full items-center gap-1.5 rounded-xs border px-2 py-1 font-serif text-[0.75rem] leading-4 ${tone}`}
       >
         {call.status === 'pending' && <Spinner size="sm" className="shrink-0" />}
@@ -62,11 +72,11 @@ function ToolCallBadge({ call }: { call: ToolCallView }) {
         )}
         <span className="min-w-0 break-all">{label}</span>
       </span>
-      {call.status === 'failed' && (
+      {call.status === 'failed' && isReplace && (
         <p className="mt-1 text-[0.6875rem] leading-4 text-cinnabar">替换未生效：未找到唯一匹配，文本保持不变</p>
       )}
       {call.status === 'ok' && call.diffSummary && (
-        <p className="mt-1 text-[0.6875rem] leading-4 text-ink-3">{call.diffSummary}</p>
+        <p className="mt-1 text-[0.6875rem] leading-4 text-ink-3">{truncate(call.diffSummary, 160)}</p>
       )}
     </div>
   )

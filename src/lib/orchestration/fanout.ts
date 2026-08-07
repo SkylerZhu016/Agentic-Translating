@@ -83,6 +83,8 @@ export interface FanOutOptions {
   concurrencyCounter?: ConcurrencyCounter;
   /** Session ID for writing draft txt artifacts */
   sessionId?: string;
+  /** Retry back-off delays; defaults to RETRY_DELAYS_MS (tests inject short delays) */
+  retryDelaysMs?: readonly number[];
 }
 
 /** Retryable error: has a `retryable` property that is true */
@@ -166,8 +168,9 @@ async function runOneAgent(
   signal: AbortSignal,
   counter?: ConcurrencyCounter,
   sessionId?: string,
+  retryDelaysMs: readonly number[] = RETRY_DELAYS_MS,
 ): Promise<AgentResult> {
-  const maxRetries = RETRY_DELAYS_MS.length;
+  const maxRetries = retryDelaysMs.length;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     // Check if already aborted before making the call
@@ -231,10 +234,21 @@ async function runOneAgent(
         writeRunArtifact(sessionId, `draft-${agent.agentKey}`, accumulatedContent);
       }
 
+      // Empty visible output is a retryable failure: reasoning models can
+      // spend the whole budget on reasoning_content and return no body.
+      if (!accumulatedContent.trim() && attempt < maxRetries) {
+        const delayMs = retryDelaysMs[attempt];
+        await sleep(delayMs);
+        continue;
+      }
+
       const result: AgentResult = {
         agentKey: agent.agentKey,
-        status: 'complete',
+        status: accumulatedContent.trim() ? 'complete' : 'error',
         content: accumulatedContent,
+        ...(accumulatedContent.trim()
+          ? {}
+          : { error: 'Agent returned an empty body before the FSBP boundary' }),
       };
       callbacks.onAgentComplete?.(agent.agentKey, result);
       return result;
@@ -250,7 +264,7 @@ async function runOneAgent(
 
       // Check if retryable and we have retries left
       if (isRetryableError(error) && attempt < maxRetries) {
-        const delayMs = RETRY_DELAYS_MS[attempt];
+        const delayMs = retryDelaysMs[attempt];
         await sleep(delayMs);
         continue; // retry
       }
@@ -348,6 +362,7 @@ export async function runFanOut(
         signal,
         opts.concurrencyCounter,
         opts.sessionId,
+        opts.retryDelaysMs,
       );
       return result;
     } catch {

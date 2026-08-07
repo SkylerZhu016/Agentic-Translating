@@ -201,7 +201,7 @@ try {
       orchestrate: 'Kimi K2.6: Go',
       assemble: 'DeepSeek V4 Pro: Go',
     },
-    stageMaxTokens: gateRevision >= 4 ? 65_536 : 16_384,
+    stageMaxTokens: 131_072,
     stageIdleTimeoutMs: gateRevision >= 4 ? 20 * 60_000 : null,
     stageMaxDurationMs: gateRevision >= 4 ? 90 * 60_000 : null,
     sampleIds: selectedIds,

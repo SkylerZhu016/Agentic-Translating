@@ -649,6 +649,11 @@ export function createHandlers(db: Database.Database) {
 
       cancel() {
         isAborted = true
+        if (heartbeatTimer) {
+          clearInterval(heartbeatTimer)
+          heartbeatTimer = null
+        }
+        endChatActivity(sessionId)
       },
     })
 

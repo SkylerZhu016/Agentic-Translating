@@ -196,6 +196,7 @@ export function EditorSection() {
               const payload = data as ToolCallData
               const call: ToolCallView = {
                 id: `tc-${++toolSeq.current}`,
+                toolName: typeof payload.name === 'string' ? payload.name : undefined,
                 oldString: typeof payload.arguments?.old_string === 'string' ? payload.arguments.old_string : '',
                 newString: typeof payload.arguments?.new_string === 'string' ? payload.arguments.new_string : '',
                 status: 'pending',

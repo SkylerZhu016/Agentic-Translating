@@ -865,29 +865,54 @@ describe('runChatTurn', () => {
   // =========================================================================
 
   describe('unknown tool call name', () => {
-    it('ignores tool_calls with unknown names, treats as message if no valid tools', async () => {
-      const server = await startRoundServer((_round, _body) => ({
-        status: 200,
-        body: {
-          id: 'chatcmpl-unknown',
-          object: 'chat.completion',
-          created: Math.floor(Date.now() / 1000),
-          model: 'test-model',
-          choices: [{
-            index: 0,
-            message: {
-              role: 'assistant',
-              content: 'I want to use a different tool.',
-              tool_calls: [{
-                id: 'call_other', type: 'function',
-                function: { name: 'some_other_tool', arguments: JSON.stringify({ key: 'value' }) },
+    it('backfills unknown tool results and continues the loop until a message arrives', async () => {
+      let secondRequestTools: unknown = null
+      const server = await startRoundServer((round, body) => {
+        if (round === 1) {
+          return {
+            status: 200,
+            body: {
+              id: 'chatcmpl-unknown',
+              object: 'chat.completion',
+              created: Math.floor(Date.now() / 1000),
+              model: 'test-model',
+              choices: [{
+                index: 0,
+                message: {
+                  role: 'assistant',
+                  content: 'I want to use a different tool.',
+                  tool_calls: [{
+                    id: 'call_other', type: 'function',
+                    function: { name: 'some_other_tool', arguments: JSON.stringify({ key: 'value' }) },
+                  }],
+                },
+                finish_reason: 'tool_calls',
               }],
+              usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
             },
-            finish_reason: 'tool_calls',
-          }],
-          usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
-        },
-      }));
+          };
+        }
+        // Round 2: model replies with a plain message after seeing the tool result
+        secondRequestTools = (body.messages as Array<{ role: string }>).filter((m) => m.role === 'tool');
+        return {
+          status: 200,
+          body: {
+            id: 'chatcmpl-msg',
+            object: 'chat.completion',
+            created: Math.floor(Date.now() / 1000),
+            model: 'test-model',
+            choices: [{
+              index: 0,
+              message: {
+                role: 'assistant',
+                content: 'OK, no such tool. Here is my answer.',
+              },
+              finish_reason: 'stop',
+            }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          },
+        };
+      });
 
       try {
         const result = await runChatTurn({
@@ -898,7 +923,18 @@ describe('runChatTurn', () => {
         });
 
         const r = okMsg(result);
-        } finally {
+        expect(r.text).toContain('Here is my answer');
+        // Unknown tool got a stable backfill so the model could continue
+        expect(secondRequestTools).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              role: 'tool',
+              tool_call_id: 'call_other',
+              content: 'Unknown tool — ignored.',
+            }),
+          ]),
+        );
+      } finally {
         await server.close();
       }
     });

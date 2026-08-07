@@ -52,6 +52,7 @@ export async function runIndependentAgentTest(input: {
     },
     {
       model: input.model,
+      maxTokens: 131_072,
       stream: false,
       messages: [
         { role: 'system', content: messages.system },

@@ -26,7 +26,7 @@ export const BUILTIN_AGENT_VARIANTS: AgentDirectionVariant[] = [
   ...ZH_TO_EN_VARIANTS,
 ].map((variant, index) => ({
   ...variant,
-  promptVersion: 9,
+  promptVersion: 17,
   enabled: true,
   endpointOverrideId: null,
   modelOverride: null,

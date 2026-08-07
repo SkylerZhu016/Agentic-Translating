@@ -9,6 +9,8 @@ export type { ChatMessage, FinalVersion, SessionState }
 /** 工具调用渲染状态（tool_call → tool_result 配对） */
 export interface ToolCallView {
   id: string
+  /** replace_text 用 old/new 摘要；编程工具（file_read/file_edit/run_command）显示工具名+参数 */
+  toolName?: string
   oldString: string
   newString: string
   status: 'pending' | 'ok' | 'failed'

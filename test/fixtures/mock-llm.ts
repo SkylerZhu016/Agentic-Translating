@@ -22,6 +22,7 @@ import http from 'http';
 
 export type MockBehavior =
   | 'stream'
+  | 'empty'
   | 'non_stream'
   | 'error'
   | 'malformed_json'
@@ -386,6 +387,28 @@ export async function startMockLLM(
             }
 
             // 结束 chunk
+            const finalChunk = buildStreamChunk(
+              responseId,
+              created,
+              model,
+              {},
+              'stop',
+            );
+            res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+            res.write('data: [DONE]\n\n');
+            res.end();
+            break;
+          }
+
+          // ---------------------------------------------------------------
+          // empty — 空流（推理模型只出 reasoning、正文为空），用于重试测试
+          // ---------------------------------------------------------------
+          case 'empty': {
+            res.writeHead(200, {
+              'Content-Type': 'text/event-stream',
+              'Cache-Control': 'no-cache',
+              Connection: 'keep-alive',
+            });
             const finalChunk = buildStreamChunk(
               responseId,
               created,

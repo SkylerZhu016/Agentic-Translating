@@ -21,8 +21,8 @@ export const MAX_CONCURRENCY = 8
 /** Hard upper bound for concurrency (never exceeded even if configured higher) */
 export const HARD_CONCURRENCY_CAP = 16
 
-/** Retry back-off delays for retryable errors (timeout/5xx/429) */
-export const RETRY_DELAYS_MS = [1000, 3000] as const
+/** Retry back-off delays for retryable errors (timeout/5xx/429/empty output) */
+export const RETRY_DELAYS_MS = [1000, 3000, 8000] as const
 
 /** Token budget for stage context (C3) */
 export const STAGE_CONTEXT_TOKEN_BUDGET = 6000

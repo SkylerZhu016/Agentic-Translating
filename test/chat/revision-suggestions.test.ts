@@ -92,7 +92,7 @@ describe('revision suggestion lenses', () => {
       calls.every(([, request]) =>
         request.model === 'DeepSeek V4 Flash: Go' &&
         request.stream === true &&
-        request.maxTokens === 65_536,
+        request.maxTokens === 131_072,
       ),
     ).toBe(true)
   })

@@ -5,7 +5,7 @@ import {
 } from '../llm/client'
 import { semanticBody } from '../protocol/semantic-output'
 
-export const REVISION_SUGGESTION_MAX_TOKENS = 65_536
+export const REVISION_SUGGESTION_MAX_TOKENS = 131_072
 
 export interface RevisionSuggestionInput {
   endpoint: {

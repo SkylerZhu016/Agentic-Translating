@@ -33,7 +33,7 @@ describe('operational constants', () => {
   })
 
   it('RETRY_DELAYS_MS = [1000, 3000]', () => {
-    expect(RETRY_DELAYS_MS).toEqual([1000, 3000])
+    expect(RETRY_DELAYS_MS).toEqual([1000, 3000, 8000])
   })
 
   it('STAGE_CONTEXT_TOKEN_BUDGET = 6000', () => {

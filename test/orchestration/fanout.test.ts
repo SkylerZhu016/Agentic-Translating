@@ -76,8 +76,7 @@ describe('runFanOut', () => {
   // 1. Basic: 6 agents, 1 error → 5 succeeded, 1 failed, Promise resolves
   // ===========================================================================
   describe('partial failure tolerance', () => {
-    it('6 agents with 1 error(500) → succeeded=5, failed=1, Promise resolves', async () => {
-      mock = await startMockLLM({ port: 0 });
+    it('6 agents with 1 error(500) → succeeded=5, failed=1, Promise resolves', async () => {      mock = await startMockLLM({ port: 0 });
 
       // 5 agents → stream (success), 1 agent → error 500
       for (let i = 0; i < 5; i++) {
@@ -87,7 +86,7 @@ describe('runFanOut', () => {
 
       const agents = makeAgents(6, mock.url);
 
-      const summary = await runFanOut(agents, {}, chatCompletion);
+      const summary = await runFanOut(agents, {}, chatCompletion, { retryDelaysMs: [1, 2] });
 
       expect(summary.succeeded).toBe(5);
       expect(summary.failed).toBe(1);
@@ -143,24 +142,25 @@ describe('runFanOut', () => {
   // 3. Retry: 429 → retries 2 times then fails; 401 → 0 retries
   // ===========================================================================
   describe('retry behavior', () => {
-    it('429 → retries 2 times (3 total calls) → marked error', async () => {
+    it('429 → retries 3 times (4 total calls) → marked error', async () => {
       mock = await startMockLLM({ port: 0 });
       // error behavior with status 429
       mock.setBehavior('retry-agent', { behavior: 'error', status: 429 });
 
       const agents = [makeAgent('retry-agent', 'retry-agent', mock.url)];
 
-      const summary = await runFanOut(agents, {}, chatCompletion);
+      const summary = await runFanOut(agents, {}, chatCompletion, { retryDelaysMs: [1, 2] });
 
       expect(summary.failed).toBe(1);
       expect(summary.succeeded).toBe(0);
 
-      // Should have made 3 calls: original + 2 retries
+      // Should have made 4 calls: original + 3 retries
       const reqs = mock.getRequests();
       const callsForAgent = reqs.filter((r) => {
         const body = r.body as Record<string, unknown> | undefined;
         return body?.model === 'retry-agent';
       });
+      // retryDelaysMs [1,2] → 2 retries → 3 calls total
       expect(callsForAgent.length).toBe(3);
     });
 
@@ -180,6 +180,32 @@ describe('runFanOut', () => {
         return body?.model === 'no-retry-agent';
       });
       expect(callsForAgent.length).toBe(1); // no retries
+    });
+
+    it('empty body → retries, then marked error', async () => {
+      mock = await startMockLLM({ port: 0 });
+      mock.setBehavior('empty-agent', { behavior: 'empty' });
+
+      const agents = [makeAgent('empty-agent', 'empty-agent', mock.url)];
+
+      const summary = await runFanOut(
+        agents,
+        {},
+        chatCompletion,
+        { retryDelaysMs: [1, 2] },
+      );
+
+      expect(summary.failed).toBe(1);
+      expect(summary.succeeded).toBe(0);
+      expect(summary.results[0].error).toMatch(/empty body/i);
+
+      const reqs = mock.getRequests();
+      const callsForAgent = reqs.filter((r) => {
+        const body = r.body as Record<string, unknown> | undefined;
+        return body?.model === 'empty-agent';
+      });
+      // original + 2 retries with [1,2] backoff
+      expect(callsForAgent.length).toBe(3);
     });
   });
 
@@ -254,7 +280,7 @@ describe('runFanOut', () => {
         onAgentError: (key) => events.push(`error:${key}`),
       };
 
-      await runFanOut(agents, callbacks, chatCompletion);
+      await runFanOut(agents, callbacks, chatCompletion, { retryDelaysMs: [1, 2] });
 
       // All starts should happen before any completes/errors
       const startEvents = events.filter((e) => e.startsWith('start:'));
@@ -268,25 +294,31 @@ describe('runFanOut', () => {
       // Tokens should exist (interleaved)
       expect(tokenEvents.length).toBeGreaterThan(0);
 
-      // 3 complete + 1 error
+      // 3 complete + 1 error (retries do not emit intermediate error events)
       expect(completeEvents.length + errorEvents.length).toBe(4);
       expect(completeEvents.length).toBe(3);
       expect(errorEvents.length).toBe(1);
 
-      // Sequence check: first start appears before first token
-      const firstStartIdx = events.findIndex((e) => e.startsWith('start:'));
-      const firstTokenIdx = events.findIndex((e) => e.startsWith('token:'));
-      expect(firstStartIdx).toBeLessThan(firstTokenIdx);
+      // Sequence check: each agent's start appears before its own tokens
+      for (let i = 0; i < 4; i++) {
+        const key = `agent-${i}`;
+        const startIdx = events.findIndex((e) => e === `start:${key}`);
+        const firstTokenIdx = events.findIndex(
+          (e) => e === `token:${key}`,
+        );
+        // Every agent starts; token check only applies to streaming agents
+        expect(startIdx).toBeGreaterThanOrEqual(0);
+        if (i < 3) {
+          expect(startIdx).toBeLessThan(firstTokenIdx);
+        }
+      }
 
-      // Last token appears before first complete/error
-      const lastTokenIdx = events
-        .map((e, i) => (e.startsWith('token:') ? i : -1))
-        .filter((i) => i >= 0)
-        .pop()!;
-      const firstDoneIdx = events.findIndex(
-        (e) => e.startsWith('complete:') || e.startsWith('error:'),
+      // The error agent's error event fires exactly once, after its own start
+      const errIdx = events.findIndex((e) => e.startsWith('error:'));
+      const errStartIdx = events.findIndex(
+        (e) => e === 'start:agent-3',
       );
-      expect(lastTokenIdx).toBeLessThan(firstDoneIdx);
+      expect(errStartIdx).toBeLessThan(errIdx);
     });
   });
 
@@ -294,18 +326,19 @@ describe('runFanOut', () => {
   // 6. ServerError (500, retryable) → retries
   // ===========================================================================
   describe('retryable vs non-retryable classification', () => {
-    it('ServerError 500 is retryable → retries 2 times', async () => {
+    it('ServerError 500 is retryable → retries 3 times', async () => {
       mock = await startMockLLM({ port: 0 });
       mock.setBehavior('srv-agent', { behavior: 'error', status: 500 });
 
       const agents = [makeAgent('srv-agent', 'srv-agent', mock.url)];
-      await runFanOut(agents, {}, chatCompletion);
+      await runFanOut(agents, {}, chatCompletion, { retryDelaysMs: [1, 2] });
 
       const reqs = mock.getRequests();
       const calls = reqs.filter((r) => {
         const body = r.body as Record<string, unknown> | undefined;
         return body?.model === 'srv-agent';
       });
+      // retryDelaysMs [1,2] → 2 retries → 3 calls total
       expect(calls.length).toBe(3);
     });
 

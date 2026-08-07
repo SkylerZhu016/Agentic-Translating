@@ -176,7 +176,7 @@ try {
       orchestrate: 'Kimi K2.6: Go',
       assemble: 'GLM 5.2: Go',
     },
-    stageMaxTokens: 65_536,
+    stageMaxTokens: 131_072,
     runs: {},
   }
 }

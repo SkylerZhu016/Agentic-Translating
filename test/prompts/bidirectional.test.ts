@@ -68,7 +68,7 @@ describe('bidirectional built-in catalog', () => {
 
   it('gives each translating role detailed focus, examples, checks, and final annotation rules', () => {
     for (const variant of BUILTIN_AGENT_VARIANTS) {
-      expect(variant.promptVersion).toBe(9)
+      expect(variant.promptVersion).toBe(17)
 
       if (variant.archetypeId === 'cultural-context') {
         expect(variant.rolePrompt.length).toBeGreaterThan(600)
@@ -145,7 +145,7 @@ describe('bidirectional built-in catalog', () => {
         /最后一条独立|final standalone/,
       )
       expect(bundle.assemblePrompt).toMatch(/最后一条独立|final standalone/)
-      expect(bundle.version).toBe(13)
+      expect(bundle.version).toBe(21)
       expect(bundle.editingPrompt).toMatch(/Requirement and audit closure|要求与审查闭环/)
       expect(bundle.workerBasePrompt).toMatch(
         /explicit requirement|用户明确提出的要求/,

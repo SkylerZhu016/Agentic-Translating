@@ -36,6 +36,14 @@ src/lib/prompts/temp.txt
 # Root-level temporary iteration files (dev/gate logs, probe scripts)
 /.tmp-*
 
+# Packaging artifacts (beyond dist-electron)
+release/
+out/
+*.exe
+*.msi
+*.AppImage
+*.dmg
+
 # OS
 Thumbs.db
 .DS_Store

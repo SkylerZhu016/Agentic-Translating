@@ -15,7 +15,8 @@
 import { chatCompletion, isAsyncIterable, ToolsNotSupportedError } from '../llm/client';
 import type { ChatCompletionRequest, ChatCompletionResponse, LLMStreamEvent } from '../llm/client';
 import { applyExactReplacementBatch, type Edit } from '../editing/replace';
-import { REPLACE_TEXT_TOOL } from './tools';
+import { CHAT_TOOLS } from './tools';
+import { executeProgrammaticTool } from './program-tools';
 import { CHAT_LOOP_MAX } from '../constants';
 
 const MAX_EDIT_CORRECTION_ATTEMPTS = 1;
@@ -45,6 +46,8 @@ export interface RunChatTurnParams {
   messages: Array<{ role: string; content: string; name?: string; tool_call_id?: string }>;
   /** The current full text being edited */
   currentText: string;
+  /** Tools exposed to the model (default: CHAT_TOOLS — replace_text + programming tools) */
+  tools?: ChatCompletionRequest['tools'];
   callbacks?: ChatCallbacks;
   /** Whether to use streaming (default: true) */
   stream?: boolean;
@@ -251,6 +254,7 @@ async function callWithTools(
   endpoint: { baseUrl: string; apiKey: string; chatCompletionsPath?: string },
   model: string,
   messages: Array<{ role: string; content: string; name?: string; tool_call_id?: string }>,
+  tools: ChatCompletionRequest['tools'],
   onDelta?: (text: string) => void,
   onActivity?: () => void,
   stream: boolean = true,
@@ -258,7 +262,8 @@ async function callWithTools(
   const request: ChatCompletionRequest = {
     model,
     messages,
-    tools: [REPLACE_TEXT_TOOL],
+    tools,
+    maxTokens: 131_072,
     stream,
     onActivity,
   };
@@ -281,6 +286,7 @@ async function callJsonFence(
   const request: ChatCompletionRequest = {
     model,
     messages,
+    maxTokens: 131_072,
     stream: false, // Non-streaming for easier JSON parsing
     onActivity,
   };
@@ -317,10 +323,12 @@ export async function runChatTurn(
     endpoint,
     model,
     messages: inputMessages,
-    currentText,
     callbacks,
     stream = true,
+    tools = CHAT_TOOLS,
   } = params;
+
+  let currentText = params.currentText;
 
   const onDelta = callbacks?.onDelta;
   const onActivity = callbacks?.onActivity;
@@ -367,6 +375,7 @@ export async function runChatTurn(
           endpoint,
           model,
           messages,
+          tools,
           onDelta,
           onActivity,
           stream,
@@ -475,6 +484,84 @@ export async function runChatTurn(
     if (!toolCalls || toolCalls.length === 0) {
       // No tool calls — pure discussion message
       return { ok: true, kind: 'message', text: content };
+    }
+
+    // ---------------------------------------------------------------
+    // Step 3a: Programming tools (file_read / file_edit / run_command)
+    // ---------------------------------------------------------------
+    // When the model mixes programming tools with replace_text in one batch,
+    // every call is executed and its result backfilled, then the loop
+    // continues so the model sees the outcomes (replace_text edits update
+    // currentText for subsequent iterations). Pure replace_text batches
+    // keep the legacy path below (apply → return on success).
+    const programCalls = toolCalls.filter((tc) => tc.name !== 'replace_text');
+    if (programCalls.length > 0) {
+      messages.push({
+        role: 'assistant',
+        content: content || null,
+        tool_calls: toolCalls.map((tc) => ({
+          id: tc.id,
+          type: 'function' as const,
+          function: { name: tc.name, arguments: tc.arguments },
+        })),
+      } as unknown as { role: string; content: string });
+
+      for (const tc of toolCalls) {
+        const args = parseToolArgs(tc.arguments) ?? {};
+        if (tc.name === 'replace_text') {
+          // Execute translation edits so the mixed batch stays consistent;
+          // results are backfilled, the loop continues afterwards.
+          const oldString = typeof args.old_string === 'string' ? args.old_string : '';
+          const newString = typeof args.new_string === 'string' ? args.new_string : '';
+          if (!oldString) {
+            messages.push({
+              role: 'tool',
+              tool_call_id: tc.id,
+              content: 'Error: invalid arguments for replace_text.',
+            });
+            continue;
+          }
+          const batch = applyExactReplacementBatch(currentText, [
+            { old_string: oldString, new_string: newString },
+          ]);
+          if (batch.ok) {
+            currentText = batch.newText;
+            if (onToolCall) onToolCall('replace_text', args);
+            if (onToolResult) {
+              onToolResult(true, {
+                newText: batch.newText,
+                diffSummary: `Replaced "${oldString}" → "${newString}"`,
+              });
+            }
+            messages.push({
+              role: 'tool',
+              tool_call_id: tc.id,
+              content: `Applied edit: "${oldString}" → "${newString}"`,
+            });
+          } else {
+            if (onToolResult) onToolResult(false);
+            messages.push({
+              role: 'tool',
+              tool_call_id: tc.id,
+              content: `Edit failed: ${batch.reason}`,
+            });
+          }
+        } else {
+          if (onToolCall) onToolCall(tc.name, args);
+          const toolResult = await executeProgrammaticTool(tc.name, args);
+          if (onToolResult) {
+            onToolResult(toolResult.ok, toolResult.ok
+              ? { newText: currentText, diffSummary: toolResult.content.slice(0, 200) }
+              : undefined);
+          }
+          messages.push({
+            role: 'tool',
+            tool_call_id: tc.id,
+            content: toolResult.content,
+          });
+        }
+      }
+      continue;
     }
 
     // Extract replace_text edits from tool calls
