@@ -32,12 +32,28 @@ if (
     `${expectedCount} terminal records are required; received ${results.length}`,
   )
 }
+const expectedIds = manifest.sampleIds ?? []
+const resultIds = results.map((item) => item.sampleId)
+if (
+  new Set(resultIds).size !== resultIds.length ||
+  expectedIds.some((id) => !resultIds.includes(id)) ||
+  resultIds.some((id) => !expectedIds.includes(id))
+) {
+  throw new Error('results must contain each manifest sample exactly once')
+}
+const completeResults = results.filter((item) => item.status === 'complete')
+const failedResults = results.filter((item) => item.status === 'failed')
 
 const mapping = {
   reviewId: `${manifest.experimentId}-blind-${new Date().toISOString()}`,
   createdAt: new Date().toISOString(),
   saltSha256: sha256(salt),
   pairs: [],
+  systemFailures: failedResults.map((result) => ({
+    sampleId: result.sampleId,
+    countedWinner: result.directBaselineModel ?? result.directBaselineLabel ?? 'direct',
+    error: result.error ?? 'workflow failed without a recorded error',
+  })),
 }
 const sections = [
   `# ${manifest.blindReviewTitle ?? '第三轮匿名 A/B 评审'}`,
@@ -49,15 +65,26 @@ const sections = [
   '',
 ]
 
-for (const [index, result] of results.entries()) {
-  const fsbpLabel = `fsbp-v${result.promptBundleVersion}-chat-v3`
+if (failedResults.length > 0) {
+  sections.push(
+    `系统失败：${failedResults.length} 项。失败项不放入质量盲审，也不伪造候选文本；汇总时预先计为直译获胜。`,
+    '',
+  )
+}
+
+for (const [index, result] of completeResults.entries()) {
+  const revisionCount = Number(
+    result.revisionCount ?? Math.max(0, (result.versions?.length ?? 1) - 1),
+  )
+  const fsbpLabel = `fsbp-v${result.promptBundleVersion}-chat-r${revisionCount}`
+  const directLabel = result.directBaselineModel
+    ? `direct:${result.directBaselineModel}`
+    : result.directBaselineLabel ?? manifest.directBaselineLabel ?? 'direct:unknown'
   const fsbpFirst = Number.parseInt(
     sha256(`${salt}:${result.sampleId}`).slice(0, 2),
     16,
   ) % 2 === 0
-  const fsbpText = result.status === 'complete'
-    ? result.finalText
-    : '[工作流失败，未产生成品。系统级计分中该项判为直译获胜。]'
+  const fsbpText = result.finalText
   const versionA = fsbpFirst ? fsbpText : result.directText
   const versionB = fsbpFirst ? result.directText : fsbpText
   const itemNo = index + 1
@@ -88,20 +115,16 @@ for (const [index, result] of results.entries()) {
   mapping.pairs.push({
     itemNo,
     sampleId: result.sampleId,
-    A: fsbpFirst ? fsbpLabel : 'gpt-direct-reviewed',
-    B: fsbpFirst ? 'gpt-direct-reviewed' : fsbpLabel,
+    A: fsbpFirst ? fsbpLabel : directLabel,
+    B: fsbpFirst ? directLabel : fsbpLabel,
     sourceTextSha256: sha256(result.sourceText),
     translationASha256: sha256(versionA),
     translationBSha256: sha256(versionB),
     fsbpSessionId: result.sessionId,
     fsbpFinalVersionId: result.versions.at(-1)?.versionId ?? null,
-    workflowStatus: result.status,
+    directBaselineSourceLabel: result.directBaselineSourceLabel ?? null,
+    workflowStatus: 'complete',
   })
-}
-
-for (const pair of mapping.pairs) {
-  if (pair.A === 'gpt-direct-reviewed') pair.A = manifest.directBaselineLabel ?? 'gpt-direct-reviewed'
-  if (pair.B === 'gpt-direct-reviewed') pair.B = manifest.directBaselineLabel ?? 'gpt-direct-reviewed'
 }
 
 sections.push(
@@ -148,4 +171,7 @@ await writeFile(
   'utf8',
 )
 
-console.log(`Blind review prepared: ${mapping.pairs.length} pairs`)
+console.log(
+  `Blind review prepared: ${mapping.pairs.length} pairs; ` +
+  `${mapping.systemFailures.length} system failures counted separately`,
+)

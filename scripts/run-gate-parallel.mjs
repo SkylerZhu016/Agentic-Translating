@@ -55,20 +55,18 @@ function launch() {
     console.log('--- all done ---')
     if (failures.length) {
       console.log(`FAILED samples: ${failures.join(', ')}`)
-      process.exitCode = 1
-    } else {
-      console.log('all samples complete; merging shards...')
-      const merge = spawn(
-        process.execPath,
-        ['scripts/merge-gate-shards.mjs', `--config=${path.resolve(configArgument.slice(9))}`],
-        { stdio: 'inherit' },
-      )
-      merge.on('exit', (code) => {
-        if (code === 0) console.log('merged into manifest.json + results.jsonl')
-        else console.log('merge failed')
-        process.exitCode = code ?? 1
-      })
     }
+    console.log('merging every terminal shard, including recorded failures...')
+    const merge = spawn(
+      process.execPath,
+      ['scripts/merge-gate-shards.mjs', `--config=${path.resolve(configArgument.slice(9))}`],
+      { stdio: 'inherit' },
+    )
+    merge.on('exit', (code) => {
+      if (code === 0) console.log('merged into manifest.json + results.jsonl')
+      else console.log('merge failed')
+      process.exitCode = failures.length === 0 && code === 0 ? 0 : 1
+    })
   }
 }
 

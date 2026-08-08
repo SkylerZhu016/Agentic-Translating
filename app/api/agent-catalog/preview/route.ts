@@ -57,6 +57,7 @@ export async function POST(request: Request) {
         chatCompletionsPath:
           endpoint.chat_completions_path ?? '/v1/chat/completions',
         apiKey: endpoint.api_key,
+        contextWindow: endpoint.context_window ?? null,
       },
       model: parsed.data.model,
     }))

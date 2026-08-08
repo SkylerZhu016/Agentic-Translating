@@ -3,16 +3,18 @@
 // ---------------------------------------------------------------------------
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { executeProgrammaticTool } from '../../src/lib/chat/program-tools'
 
 let workDir: string
+let outsideDir: string
 let prevCwd: string
 
 beforeAll(() => {
   workDir = mkdtempSync(path.join(tmpdir(), 'prog-tools-'))
+  outsideDir = mkdtempSync(path.join(tmpdir(), 'prog-tools-outside-'))
   prevCwd = process.cwd()
   process.chdir(workDir)
 })
@@ -23,6 +25,7 @@ afterAll(() => {
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
       rmSync(workDir, { recursive: true, force: true })
+      rmSync(outsideDir, { recursive: true, force: true })
       break
     } catch {
       // eslint-disable-next-line no-undef
@@ -69,6 +72,16 @@ describe('file_read', () => {
   it('reports missing files', async () => {
     const r = await executeProgrammaticTool('file_read', { path: 'nope.txt' })
     expect(r.ok).toBe(false)
+  })
+
+  it('rejects a junction or symlink whose real target escapes the project root', async () => {
+    writeFileSync(path.join(outsideDir, 'secret.txt'), 'outside secret', 'utf8')
+    symlinkSync(outsideDir, path.join(workDir, 'linked-outside'), 'junction')
+    const r = await executeProgrammaticTool('file_read', {
+      path: 'linked-outside/secret.txt',
+    })
+    expect(r.ok).toBe(false)
+    expect(r.content).toContain('escapes')
   })
 })
 
@@ -148,11 +161,21 @@ describe('run_command', () => {
 
   it('kills commands that exceed the timeout', async () => {
     const r = await executeProgrammaticTool('run_command', {
-      command: 'ping -n 60 127.0.0.1',
+      command: 'ping -n 8 127.0.0.1',
       timeout_ms: 1000,
     })
     expect(r.ok).toBe(false)
     expect(r.content).toContain('timed out')
+  })
+
+  it('keeps collected command output bounded', async () => {
+    writeSample('emit-many.cjs', `process.stdout.write('x'.repeat(100000))`)
+    const r = await executeProgrammaticTool('run_command', {
+      command: 'node emit-many.cjs',
+    })
+    expect(r.ok).toBe(true)
+    expect(r.content).toContain('output truncated')
+    expect(r.content.length).toBeLessThan(50_000)
   })
 })
 

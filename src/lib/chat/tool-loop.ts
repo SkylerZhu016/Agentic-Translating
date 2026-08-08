@@ -18,6 +18,7 @@ import { applyExactReplacementBatch, type Edit } from '../editing/replace';
 import { CHAT_TOOLS } from './tools';
 import { executeProgrammaticTool } from './program-tools';
 import { CHAT_LOOP_MAX } from '../constants';
+import { resolveCompletionTokenBudget } from '../guards/tokens';
 
 const MAX_EDIT_CORRECTION_ATTEMPTS = 1;
 
@@ -46,11 +47,15 @@ export interface RunChatTurnParams {
   messages: Array<{ role: string; content: string; name?: string; tool_call_id?: string }>;
   /** The current full text being edited */
   currentText: string;
-  /** Tools exposed to the model (default: CHAT_TOOLS — replace_text + programming tools) */
+  /** Tools exposed to the model (default: safe product CHAT_TOOLS — replace_text only) */
   tools?: ChatCompletionRequest['tools'];
   callbacks?: ChatCallbacks;
   /** Whether to use streaming (default: true) */
   stream?: boolean;
+  /** Configured provider context window, when known. */
+  contextWindow?: number | null;
+  /** Optional explicit completion budget. Defaults to 65,536 tokens. */
+  maxTokens?: number;
 }
 
 /** Result of a chat turn */
@@ -258,12 +263,13 @@ async function callWithTools(
   onDelta?: (text: string) => void,
   onActivity?: () => void,
   stream: boolean = true,
+  maxTokens?: number,
 ): Promise<CollectedStreamResult> {
   const request: ChatCompletionRequest = {
     model,
     messages,
     tools,
-    maxTokens: 131_072,
+    maxTokens,
     stream,
     onActivity,
   };
@@ -282,11 +288,12 @@ async function callJsonFence(
   messages: Array<{ role: string; content: string; name?: string; tool_call_id?: string }>,
   onDelta?: (text: string) => void,
   onActivity?: () => void,
+  maxTokens?: number,
 ): Promise<CollectedStreamResult> {
   const request: ChatCompletionRequest = {
     model,
     messages,
-    maxTokens: 131_072,
+    maxTokens,
     stream: false, // Non-streaming for easier JSON parsing
     onActivity,
   };
@@ -325,8 +332,16 @@ export async function runChatTurn(
     messages: inputMessages,
     callbacks,
     stream = true,
+    contextWindow = null,
+    maxTokens: requestedMaxTokens,
     tools = CHAT_TOOLS,
   } = params;
+  const maxTokens = resolveCompletionTokenBudget(
+    inputMessages.map((message) => message.content).join('\n') +
+      (tools ? JSON.stringify(tools) : ''),
+    contextWindow,
+    requestedMaxTokens,
+  );
 
   let currentText = params.currentText;
 
@@ -368,7 +383,14 @@ export async function runChatTurn(
           onProtocolFallback();
         }
 
-        collected = await callJsonFence(endpoint, model, messages, onDelta, onActivity);
+        collected = await callJsonFence(
+          endpoint,
+          model,
+          messages,
+          onDelta,
+          onActivity,
+          maxTokens,
+        );
       } else {
         // Native tools protocol
         collected = await callWithTools(
@@ -379,6 +401,7 @@ export async function runChatTurn(
           onDelta,
           onActivity,
           stream,
+          maxTokens,
         );
       }
     } catch (error: unknown) {
@@ -496,6 +519,15 @@ export async function runChatTurn(
     // keep the legacy path below (apply → return on success).
     const programCalls = toolCalls.filter((tc) => tc.name !== 'replace_text');
     if (programCalls.length > 0) {
+      if (toolCalls.some((tc) => tc.name === 'replace_text')) {
+        return {
+          ok: false,
+          code: 'mixed_tool_batch_not_supported',
+          message:
+            'Text edits and programming tools cannot run in the same model response. ' +
+            'No edit or programming side effect was applied.',
+        };
+      }
       messages.push({
         role: 'assistant',
         content: content || null,
@@ -508,58 +540,18 @@ export async function runChatTurn(
 
       for (const tc of toolCalls) {
         const args = parseToolArgs(tc.arguments) ?? {};
-        if (tc.name === 'replace_text') {
-          // Execute translation edits so the mixed batch stays consistent;
-          // results are backfilled, the loop continues afterwards.
-          const oldString = typeof args.old_string === 'string' ? args.old_string : '';
-          const newString = typeof args.new_string === 'string' ? args.new_string : '';
-          if (!oldString) {
-            messages.push({
-              role: 'tool',
-              tool_call_id: tc.id,
-              content: 'Error: invalid arguments for replace_text.',
-            });
-            continue;
-          }
-          const batch = applyExactReplacementBatch(currentText, [
-            { old_string: oldString, new_string: newString },
-          ]);
-          if (batch.ok) {
-            currentText = batch.newText;
-            if (onToolCall) onToolCall('replace_text', args);
-            if (onToolResult) {
-              onToolResult(true, {
-                newText: batch.newText,
-                diffSummary: `Replaced "${oldString}" → "${newString}"`,
-              });
-            }
-            messages.push({
-              role: 'tool',
-              tool_call_id: tc.id,
-              content: `Applied edit: "${oldString}" → "${newString}"`,
-            });
-          } else {
-            if (onToolResult) onToolResult(false);
-            messages.push({
-              role: 'tool',
-              tool_call_id: tc.id,
-              content: `Edit failed: ${batch.reason}`,
-            });
-          }
-        } else {
-          if (onToolCall) onToolCall(tc.name, args);
-          const toolResult = await executeProgrammaticTool(tc.name, args);
-          if (onToolResult) {
-            onToolResult(toolResult.ok, toolResult.ok
-              ? { newText: currentText, diffSummary: toolResult.content.slice(0, 200) }
-              : undefined);
-          }
-          messages.push({
-            role: 'tool',
-            tool_call_id: tc.id,
-            content: toolResult.content,
-          });
+        if (onToolCall) onToolCall(tc.name, args);
+        const toolResult = await executeProgrammaticTool(tc.name, args);
+        if (onToolResult) {
+          onToolResult(toolResult.ok, toolResult.ok
+            ? { newText: currentText, diffSummary: toolResult.content.slice(0, 200) }
+            : undefined);
         }
+        messages.push({
+          role: 'tool',
+          tool_call_id: tc.id,
+          content: toolResult.content,
+        });
       }
       continue;
     }

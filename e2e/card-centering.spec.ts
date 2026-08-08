@@ -107,11 +107,14 @@ test.describe('Card centering — mx-auto on grid containers', () => {
     const panelBox = await panel.boundingBox()
     expect(panelBox).not.toBeNull()
 
-    for (const control of await panel.locator('select, button').all()) {
+    const controls = await panel.locator('select, button').all()
+    expect(controls.length).toBeGreaterThanOrEqual(29)
+    for (const control of controls) {
+      await expect(control).toBeVisible()
       const box = await control.boundingBox()
-      if (!box) continue
-      expect(box.x).toBeGreaterThanOrEqual(panelBox!.x - 1)
-      expect(box.x + box.width).toBeLessThanOrEqual(panelBox!.x + panelBox!.width + 1)
+      expect(box).not.toBeNull()
+      expect(box!.x).toBeGreaterThanOrEqual(panelBox!.x - 1)
+      expect(box!.x + box!.width).toBeLessThanOrEqual(panelBox!.x + panelBox!.width + 1)
     }
 
     const overflow = await page.evaluate(

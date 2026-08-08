@@ -457,6 +457,28 @@ describe('Chat SSE Route', () => {
       expect(assistant?.content).toBe(instruction)
     })
 
+    it('exposes only replace_text to the production translation chat model', async () => {
+      mockLLM.setBehavior('echo-model', { behavior: 'echo' })
+      const sid = await createAssembledSession()
+      const req = new NextRequest(`http://localhost/api/sessions/${sid}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: '请检查当前译文' }),
+      })
+
+      const resp = await handlers.POST(req, {
+        params: Promise.resolve({ id: sid }),
+      })
+      await readSSEEvents(resp)
+
+      const request = mockLLM.getRequests().at(-1)?.body as {
+        tools?: Array<{ function?: { name?: string } }>
+      }
+      expect(request.tools?.map((tool) => tool.function?.name)).toEqual([
+        'replace_text',
+      ])
+    })
+
     it('returns SSE stream with expected events for a message turn', async () => {
       // Configure mock LLM to return a fixed content
       mockLLM.setBehavior('echo-model', { behavior: 'json_content', jsonContent: '好的，我来帮您。' })

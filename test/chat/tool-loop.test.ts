@@ -945,6 +945,53 @@ describe('runChatTurn', () => {
   // =========================================================================
 
   describe('edge cases', () => {
+    it('rejects mixed programming and translation tools before applying side effects', async () => {
+      const server = await startRoundServer(() => ({
+        status: 200,
+        body: {
+          id: 'chatcmpl-mixed-tools',
+          object: 'chat.completion',
+          created: Math.floor(Date.now() / 1000),
+          model: 'test-model',
+          choices: [{
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: 'mixed batch',
+              tool_calls: [
+                {
+                  id: 'call_read', type: 'function',
+                  function: { name: 'file_read', arguments: JSON.stringify({ path: 'missing.txt' }) },
+                },
+                {
+                  id: 'call_edit', type: 'function',
+                  function: { name: 'replace_text', arguments: JSON.stringify({ old_string: 'hello', new_string: 'hi' }) },
+                },
+              ],
+            },
+            finish_reason: 'tool_calls',
+          }],
+          usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+        },
+      }));
+
+      try {
+        const result = await runChatTurn({
+          endpoint: { baseUrl: server.url, apiKey: 'sk-test' },
+          model: 'test-model',
+          messages: makeMessages(),
+          currentText: 'hello world',
+        });
+        expect(result).toMatchObject({
+          ok: false,
+          code: 'mixed_tool_batch_not_supported',
+        });
+        expect(server.requestCount()).toBe(1);
+      } finally {
+        await server.close();
+      }
+    });
+
     it('empty tool_calls array → kind:message', async () => {
       const server = await startRoundServer((_round, _body) => ({
         status: 200,

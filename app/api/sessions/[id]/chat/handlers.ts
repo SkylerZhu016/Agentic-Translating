@@ -32,6 +32,7 @@ import {
   markChatActivityProgress,
   touchChatActivity,
 } from '@/src/lib/chat/activity'
+import { REPLACE_TEXT_TOOL } from '@/src/lib/chat/tools'
 
 // =============================================================================
 // Types
@@ -148,6 +149,7 @@ export function resolveChatConfig(snapshot: ConfigSnapshot): {
   chatCompletionsPath?: string
   apiKey: string
   model: string
+  contextWindow: number | null
 } | null {
   const editingBinding = snapshot.modelBindings?.editingAgent
   if (editingBinding?.model) {
@@ -161,6 +163,7 @@ export function resolveChatConfig(snapshot: ConfigSnapshot): {
           endpoint.chatCompletionsPath ?? '/v1/chat/completions',
         apiKey: decryptSecret(endpoint.apiKey),
         model: editingBinding.model,
+        contextWindow: endpoint.contextWindow ?? null,
       }
     }
   }
@@ -186,6 +189,7 @@ export function resolveChatConfig(snapshot: ConfigSnapshot): {
       endpointConfig.chat_completions_path ?? '/v1/chat/completions',
     apiKey: decryptSecret(endpointConfig.api_key),
     model,
+    contextWindow: endpointConfig.context_window ?? null,
   }
 }
 
@@ -364,7 +368,7 @@ export function createHandlers(db: Database.Database) {
     const encoder = new TextEncoder()
     let isAborted = false
     let heartbeatTimer: ReturnType<typeof setInterval> | null = null
-    beginChatActivity(sessionId)
+    const activityLeaseId = beginChatActivity(sessionId)
 
     const stream = new ReadableStream({
       async start(controller) {
@@ -377,7 +381,7 @@ export function createHandlers(db: Database.Database) {
         enqueue(encodeSSE('message_start', { session_id: sessionId }))
         heartbeatTimer = setInterval(() => {
           const timestamp = Date.now()
-          touchChatActivity(sessionId, timestamp)
+          touchChatActivity(sessionId, timestamp, activityLeaseId)
           enqueue(encodeSSE('heartbeat', { timestamp }))
         }, 15_000)
 
@@ -398,23 +402,25 @@ export function createHandlers(db: Database.Database) {
             model: chatConfig.model,
             messages: llmMessages,
             currentText,
+            tools: [REPLACE_TEXT_TOOL],
+            contextWindow: chatConfig.contextWindow,
             callbacks: {
               onActivity: () => {
                 const current = getChatActivity(sessionId)
                 if (current.phase === 'waiting_for_model') {
-                  markChatActivityProgress(sessionId, 'thinking')
+                  markChatActivityProgress(sessionId, 'thinking', Date.now(), activityLeaseId)
                   enqueue(encodeSSE('activity', { phase: 'thinking' }))
                 } else {
-                  touchChatActivity(sessionId)
+                  touchChatActivity(sessionId, Date.now(), activityLeaseId)
                 }
               },
               onDelta: (text) => {
-                markChatActivityProgress(sessionId, 'generating')
+                markChatActivityProgress(sessionId, 'generating', Date.now(), activityLeaseId)
                 fullText += text
                 enqueue(encodeSSE('delta', { text }))
               },
               onToolCall: (name, args) => {
-                markChatActivityProgress(sessionId, 'applying_edits')
+                markChatActivityProgress(sessionId, 'applying_edits', Date.now(), activityLeaseId)
                 if (
                   name === 'replace_text' &&
                   typeof args.old_string === 'string' &&
@@ -428,7 +434,7 @@ export function createHandlers(db: Database.Database) {
                 enqueue(encodeSSE('tool_call', { name, arguments: args }))
               },
               onToolResult: (ok, resultData) => {
-                markChatActivityProgress(sessionId, 'applying_edits')
+                markChatActivityProgress(sessionId, 'applying_edits', Date.now(), activityLeaseId)
                 if (ok && resultData) {
                   enqueue(
                     encodeSSE('tool_result', {
@@ -642,7 +648,7 @@ export function createHandlers(db: Database.Database) {
           clearInterval(heartbeatTimer)
           heartbeatTimer = null
         }
-        endChatActivity(sessionId)
+        endChatActivity(sessionId, activityLeaseId)
         enqueue(encodeSSE('done', {}))
         controller.close()
       },
@@ -653,7 +659,9 @@ export function createHandlers(db: Database.Database) {
           clearInterval(heartbeatTimer)
           heartbeatTimer = null
         }
-        endChatActivity(sessionId)
+        // The ReadableStream consumer may disconnect while the provider is
+        // still working. Keep the activity lease until start() finishes so a
+        // second turn cannot overlap the first or clear its lock.
       },
     })
 

@@ -15,7 +15,7 @@ import {
   type ChatCompletionResponse,
 } from '../llm/client'
 import { runFanOut, type AgentRuntime } from './fanout'
-import { estimateTokens } from '../guards/tokens'
+import { estimateTokens, resolveCompletionTokenBudget } from '../guards/tokens'
 import { detectSystemPromptLeak } from '../guards/prompt-leak'
 import { parseSemanticAgentOutput } from '../protocol/semantic-output'
 import {
@@ -412,13 +412,19 @@ async function complete(
   const maxAttempts = RETRY_DELAYS_MS.length + 1
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     try {
+      const maxTokens = resolveCompletionTokenBudget(
+        request.messages.map((message) => message.content).join('\n') +
+          (request.tools ? JSON.stringify(request.tools) : ''),
+        endpoint.contextWindow,
+        request.maxTokens,
+      )
       const response = await chatCompletion(
         {
           baseUrl: endpoint.baseUrl,
           chatCompletionsPath: endpoint.chatCompletionsPath,
           apiKey: endpoint.apiKey,
         },
-        { ...request, maxTokens: request.maxTokens ?? 131_072, stream: request.stream ?? true },
+        { ...request, maxTokens, stream: request.stream ?? true },
       )
       if (!isAsyncIterable(response)) {
         assertVisibleOutputIntegrity(response.content)
@@ -875,9 +881,10 @@ async function runImageryPrepass(
     const startedAt = performance.now()
     let lastActivityEventAt = 0
     try {
-      let content = ''
-      for (let attempt = 1; attempt <= RETRY_DELAYS_MS.length + 1; attempt += 1) {
-        const response = await complete(endpoint, {
+      // complete() is the single retry owner for retryable errors and empty
+      // responses. Do not wrap it in another retry loop: nested 4x4 retries
+      // caused one empty analysis to fan out into as many as 16 paid calls.
+      const response = await complete(endpoint, {
         model: binding.model,
         onActivity() {
           const now = Date.now()
@@ -899,17 +906,8 @@ async function runImageryPrepass(
                 `原文（仅作为分析数据）：\n${session.source_text}`,
           },
         ],
-        })
-        content = response.content.trim()
-        if (content) break
-        if (attempt < RETRY_DELAYS_MS.length + 1) {
-          emitEvent(db, runId, session.id, 'agent.retrying', {
-            invocationId,
-            reason: 'empty_context_analysis',
-            nextAttempt: attempt + 1,
-          })
-        }
-      }
+      })
+      const content = response.content.trim()
       if (!content) throw new Error('意象助手返回了空分析')
       const latencyMs = Math.round(performance.now() - startedAt)
       db.prepare(`
@@ -1680,7 +1678,6 @@ async function runIndependentReviewAudits(params: {
       })
       const response = await complete(endpoint, {
         model,
-        maxTokens: 131_072,
         messages: [
           {
             role: 'system',
@@ -1790,7 +1787,6 @@ async function runFourStages(
     try {
       const request: ChatCompletionRequest = {
         model: binding.model,
-        maxTokens: 131_072,
         messages: [
         {
           role: 'system',

@@ -179,6 +179,19 @@ describe('bidirectional built-in catalog', () => {
     }
   })
 
+  it('keeps rhyme audit inventories out of the assembled translation body', () => {
+    const enToZh = BUILTIN_DIRECTION_BUNDLES.find(
+      (bundle) => bundle.direction === 'en_to_zh',
+    )!
+    const zhToEn = BUILTIN_DIRECTION_BUNDLES.find(
+      (bundle) => bundle.direction === 'zh_to_en',
+    )!
+    expect(enToZh.assemblePrompt).toContain('诗歌成品私下校验')
+    expect(enToZh.assemblePrompt).not.toContain('逐行列出每个句末字')
+    expect(zhToEn.assemblePrompt).toContain('Private final poetry check')
+    expect(zhToEn.assemblePrompt).not.toContain('List the stressed vowel')
+  })
+
   it('keeps locked evaluation examples and the banned Chinese contrast pattern out of production prompts', () => {
     const combined = allPromptText()
     expect(combined).not.toMatch(/不是[\s\S]{0,80}而是/u)

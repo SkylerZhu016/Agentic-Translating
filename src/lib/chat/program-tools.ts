@@ -11,8 +11,8 @@
 // is truncated; commands are killed after the timeout.
 // ---------------------------------------------------------------------------
 
-import { spawn } from 'node:child_process';
-import { readFile, writeFile } from 'node:fs/promises';
+import { spawn, spawnSync } from 'node:child_process';
+import { readFile, realpath, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 const MAX_READ_LINES = 2_000;
@@ -27,10 +27,15 @@ export interface ProgramToolResult {
   content: string;
 }
 
-/** Resolve a user-supplied path against the project root and confine it there. */
-function resolveWorkspacePath(rawPath: string): string {
-  const root = process.cwd();
-  const resolved = path.isAbsolute(rawPath) ? path.normalize(rawPath) : path.resolve(root, rawPath);
+/** Resolve an existing path and confine its real target to the project root. */
+async function resolveWorkspacePath(rawPath: string): Promise<string> {
+  const root = await realpath(process.cwd());
+  const lexical = path.isAbsolute(rawPath) ? path.normalize(rawPath) : path.resolve(root, rawPath);
+  const lexicalRel = path.relative(root, lexical);
+  if (lexicalRel.startsWith('..') || path.isAbsolute(lexicalRel)) {
+    throw new Error(`path escapes the project root: ${rawPath}`);
+  }
+  const resolved = await realpath(lexical);
   const rel = path.relative(root, resolved);
   if (rel.startsWith('..') || path.isAbsolute(rel)) {
     throw new Error(`path escapes the project root: ${rawPath}`);
@@ -56,10 +61,33 @@ function truncateOutput(text: string, budget: number = MAX_OUTPUT_CHARS): string
   );
 }
 
+function createBoundedOutputCollector(budget: number = MAX_OUTPUT_CHARS) {
+  const headBudget = Math.floor(budget / 2)
+  const tailBudget = budget - headBudget
+  let head = ''
+  let tail = ''
+  let total = 0
+  return {
+    append(value: string) {
+      total += value.length
+      if (head.length < headBudget) {
+        const needed = headBudget - head.length
+        head += value.slice(0, needed)
+        value = value.slice(needed)
+      }
+      if (value) tail = (tail + value).slice(-tailBudget)
+    },
+    render() {
+      if (total <= budget) return head + tail
+      return `${head}\n\n…[output truncated, ${total - budget} characters omitted]…\n\n${tail}`
+    },
+  }
+}
+
 /** Read a workspace file with 1-based line ranges, echoing numbered lines. */
 async function executeFileRead(args: Record<string, unknown>): Promise<ProgramToolResult> {
   try {
-    const filePath = resolveWorkspacePath(String(args.path ?? ''));
+    const filePath = await resolveWorkspacePath(String(args.path ?? ''));
     const text = await readFile(filePath, 'utf8');
     if (text.length > 5 * 1024 * 1024) {
       return { ok: false, content: `Error: file too large to read (${text.length} bytes > 5MB cap).` };
@@ -95,7 +123,7 @@ async function executeFileRead(args: Record<string, unknown>): Promise<ProgramTo
 /** Exact unique-string replacement on a workspace file (Claude Code Edit style). */
 async function executeFileEdit(args: Record<string, unknown>): Promise<ProgramToolResult> {
   try {
-    const filePath = resolveWorkspacePath(String(args.path ?? ''));
+    const filePath = await resolveWorkspacePath(String(args.path ?? ''));
     const oldString = String(args.old_string ?? '');
     const newString = String(args.new_string ?? '');
     const replaceAll = args.replace_all === true;
@@ -151,7 +179,7 @@ async function executeRunCommand(args: Record<string, unknown>): Promise<Program
   }
   let cwd: string;
   try {
-    cwd = args.cwd ? resolveWorkspacePath(String(args.cwd)) : process.cwd();
+    cwd = args.cwd ? await resolveWorkspacePath(String(args.cwd)) : await realpath(process.cwd());
   } catch (error: unknown) {
     return { ok: false, content: `Error: ${(error as Error).message}` };
   }
@@ -163,19 +191,34 @@ async function executeRunCommand(args: Record<string, unknown>): Promise<Program
   const shellArgs = process.platform === 'win32' ? ['/d', '/s', '/c', command] : ['-c', command];
 
   return await new Promise<ProgramToolResult>((resolve) => {
-    const child = spawn(shell, shellArgs, { cwd, windowsHide: true });
-    let stdout = '';
-    let stderr = '';
+    const child = spawn(shell, shellArgs, {
+      cwd,
+      windowsHide: true,
+      detached: process.platform !== 'win32',
+    });
+    const output = createBoundedOutputCollector();
     let settled = false;
+    let forcedResult: ProgramToolResult | null = null;
+    let closeFallback: ReturnType<typeof setTimeout> | null = null;
 
     const finish = (result: ProgramToolResult) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (closeFallback) clearTimeout(closeFallback);
+      resolve(result);
+    };
+
+    const killProcessTree = () => {
       if (child.pid && !child.killed) {
         try {
           if (process.platform === 'win32') {
-            spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true });
+            // Wait for taskkill before resolving. A detached taskkill can race
+            // with PID reuse and terminate a later, unrelated process.
+            spawnSync('taskkill', ['/pid', String(child.pid), '/t', '/f'], {
+              windowsHide: true,
+              stdio: 'ignore',
+            });
           } else {
             process.kill(-child.pid, 'SIGKILL');
           }
@@ -183,28 +226,42 @@ async function executeRunCommand(args: Record<string, unknown>): Promise<Program
           /* already dead */
         }
       }
-      resolve(result);
     };
 
     const timer = setTimeout(() => {
       const partial = truncateOutput(
-        `[Command timed out after ${timeoutMs}ms]\n${stdout}${stderr}`.trim(),
+        `[Command timed out after ${timeoutMs}ms]\n${output.render()}`.trim(),
       );
-      finish({ ok: false, content: partial });
+      forcedResult = { ok: false, content: partial };
+      killProcessTree();
+      // Resolve from the close event so stdio/process handles are drained. If
+      // a platform shell refuses to close, detach our pipes after a bounded
+      // grace period instead of keeping the application alive indefinitely.
+      closeFallback = setTimeout(() => {
+        child.stdout.destroy();
+        child.stderr.destroy();
+        child.kill();
+        finish(forcedResult!);
+      }, 3_000);
     }, timeoutMs);
 
     child.stdout.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString('utf8');
+      output.append(chunk.toString('utf8'));
     });
     child.stderr.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString('utf8');
+      output.append(chunk.toString('utf8'));
     });
     child.on('error', (error: Error) => {
-      finish({ ok: false, content: `Error launching command: ${error.message}` });
+      forcedResult = { ok: false, content: `Error launching command: ${error.message}` };
+      killProcessTree();
+      finish(forcedResult);
     });
     child.on('close', (code) => {
-      const combined = `${stdout}${stderr}`.trim();
-      const truncated = truncateOutput(combined);
+      if (forcedResult) {
+        finish(forcedResult);
+        return;
+      }
+      const truncated = output.render().trim();
       if (code === 0) {
         finish({ ok: true, content: truncated || '(no output)' });
       } else {

@@ -66,12 +66,14 @@ replacement work in `FSBP_Test/` separates three questions:
 3. end-to-end quality for direct translation, multi-agent raw, and multi-agent
    FSBP.
 
-The planned dataset contains 8 development samples and 24 locked test samples,
-balanced by direction and four high-difficulty text categories. Annotation
-stress cases must come from genuine errors in normal model calls and require
-human confirmation; misleading annotations may not be fabricated. No texts
-have been approved yet, so this report currently makes no experimental quality
-claim.
+The dataset now contains 8 development samples and 16 structurally locked test
+samples (24 items in total), balanced by direction and four high-difficulty text
+categories. Annotation stress cases must come from genuine errors in normal
+model calls and require human confirmation; misleading annotations may not be
+fabricated. Because some of these texts were subsequently reused during prompt
+and workflow iteration, existing results are development evidence rather than
+an unseen-set generalization claim. A formal quality claim requires a newly
+frozen holdout that no participant has reviewed or used for tuning.
 
 ## 7. Threats and Limitations
 

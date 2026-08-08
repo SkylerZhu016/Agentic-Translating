@@ -1,5 +1,6 @@
 import { chatCompletion, isAsyncIterable } from '../llm/client'
 import { parseSemanticAgentOutput } from '../protocol/semantic-output'
+import { resolveCompletionTokenBudget } from '../guards/tokens'
 
 export interface AgentTestPrompt {
   promptLanguage: 'zh' | 'en'
@@ -14,6 +15,7 @@ export interface AgentTestEndpoint {
   baseUrl: string
   chatCompletionsPath: string
   apiKey: string
+  contextWindow?: number | null
 }
 
 export function buildAgentTestMessages(input: AgentTestPrompt) {
@@ -44,6 +46,10 @@ export async function runIndependentAgentTest(input: {
   model: string
 }) {
   const messages = buildAgentTestMessages(input.prompt)
+  const requestMessages = [
+    { role: 'system', content: messages.system },
+    { role: 'user', content: messages.user },
+  ]
   const response = await chatCompletion(
     {
       baseUrl: input.endpoint.baseUrl,
@@ -52,12 +58,12 @@ export async function runIndependentAgentTest(input: {
     },
     {
       model: input.model,
-      maxTokens: 131_072,
+      maxTokens: resolveCompletionTokenBudget(
+        requestMessages.map((message) => message.content).join('\n'),
+        input.endpoint.contextWindow,
+      ),
       stream: false,
-      messages: [
-        { role: 'system', content: messages.system },
-        { role: 'user', content: messages.user },
-      ],
+      messages: requestMessages,
     },
   )
   if (isAsyncIterable(response)) {

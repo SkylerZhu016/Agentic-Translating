@@ -81,7 +81,10 @@ async function readJsonl(filePath) {
 
 async function api(url, init) {
   const method = init?.method?.toUpperCase() ?? 'GET'
-  const attempts = 5
+  // GET is observational and safe to retry. Mutating requests are deliberately
+  // single-shot unless their endpoint has an explicit idempotency contract.
+  // A lost POST response must be reconciled from persisted state, never replayed.
+  const attempts = method === 'GET' ? 5 : 1
   let lastError
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
@@ -97,11 +100,16 @@ async function api(url, init) {
         continue
       }
       if (response.status < 500) {
-        throw new Error(`HTTP ${response.status} ${url}: ${String(payload).slice(0, 300)}`)
+        const error = new Error(
+          `HTTP ${response.status} ${url}: ${String(payload).slice(0, 300)}`,
+        )
+        error.retryable = false
+        throw error
       }
       lastError = new Error(`HTTP ${response.status} ${url}: ${String(payload).slice(0, 300)}`)
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error))
+      if (lastError.retryable === false) throw lastError
       if (attempt < attempts) {
         await new Promise((resolve) => setTimeout(resolve, attempt * 2_000))
         continue
@@ -289,49 +297,57 @@ function sessionIdOf(detail) {
 }
 
 async function applyChatRound(sessionId, message) {
-  let lastError
-  for (let attempt = 1; attempt <= 5; attempt += 1) {
-    try {
-      const response = await fetch(`${apiBase}/api/sessions/${sessionId}/chat`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ message }),
-      })
-      const text = await response.text()
-      if (!response.ok) {
-        throw new Error(`${response.status} chat: ${text.slice(0, 1000)}`)
-      }
-      if (!/event:\s*done\b/.test(text)) {
-        throw new Error(`chat stream ended without done event: ${text.slice(-1000)}`)
-      }
-      const completionBlocks = [
-        ...text.matchAll(/event:\s*message_complete\s*\r?\ndata:\s*([^\r\n]+)/g),
-      ]
-      const completion = completionBlocks.at(-1)
-      if (!completion) {
-        throw new Error(`chat stream ended without message_complete: ${text.slice(-1000)}`)
-      }
-      const completionPayload = JSON.parse(completion[1])
-      if (completionPayload.error) {
-        throw new Error(
-          `chat model failed: ${completionPayload.error}: ` +
-          `${completionPayload.message ?? 'unknown error'}`,
-        )
-      }
-      const session = await api(`/api/sessions/${sessionId}`)
-      if (session.messages?.at(-1)?.role !== 'assistant') {
-        throw new Error('chat stream completed without a persisted assistant turn')
-      }
-      return session
-    } catch (error) {
-      lastError = error instanceof Error ? error : new Error(String(error))
-      if (attempt < 5) {
-        await new Promise((resolve) => setTimeout(resolve, attempt * 2_000))
-        continue
-      }
+  const before = await api(`/api/sessions/${sessionId}`)
+  const messageCursor = before.messages?.length ?? 0
+  try {
+    const response = await fetch(`${apiBase}/api/sessions/${sessionId}/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ message }),
+    })
+    const text = await response.text()
+    if (!response.ok) {
+      throw new Error(`${response.status} chat: ${text.slice(0, 1000)}`)
     }
+    if (!/event:\s*done\b/.test(text)) {
+      throw new Error(`chat stream ended without done event: ${text.slice(-1000)}`)
+    }
+    const completionBlocks = [
+      ...text.matchAll(/event:\s*message_complete\s*\r?\ndata:\s*([^\r\n]+)/g),
+    ]
+    const completion = completionBlocks.at(-1)
+    if (!completion) {
+      throw new Error(`chat stream ended without message_complete: ${text.slice(-1000)}`)
+    }
+    const completionPayload = JSON.parse(completion[1])
+    if (completionPayload.error) {
+      throw new Error(
+        `chat model failed: ${completionPayload.error}: ` +
+        `${completionPayload.message ?? 'unknown error'}`,
+      )
+    }
+    const session = await api(`/api/sessions/${sessionId}`)
+    if (session.messages?.at(-1)?.role !== 'assistant') {
+      throw new Error('chat stream completed without a persisted assistant turn')
+    }
+    return session
+  } catch (error) {
+    // The response may be lost after the server has committed the turn. Re-read
+    // the audit log and accept only an exact new user/assistant pair. Otherwise
+    // stop: automatically replaying the POST can duplicate edits and billing.
+    const recovered = await api(`/api/sessions/${sessionId}`)
+    const added = (recovered.messages ?? []).slice(messageCursor)
+    const userIndex = added.findIndex(
+      (item) => item.role === 'user' && item.content === message,
+    )
+    if (userIndex >= 0 && added[userIndex + 1]?.role === 'assistant') {
+      return recovered
+    }
+    const original = error instanceof Error ? error.message : String(error)
+    throw new Error(
+      `${original}; chat POST was not replayed because its commit status is uncertain`,
+    )
   }
-  throw lastError ?? new Error(`chat round failed: ${sessionId}`)
 }
 
 function versionRecord(session, version, round, extra = {}) {
@@ -404,6 +420,28 @@ const selected = selectedIds.map((id) => {
   }
   return { sample, baseline }
 })
+const baselineSourceLabelOf = (baseline) =>
+  String(baseline.model ?? baseline.generatorType ?? 'unknown')
+const baselineModelAliases = runConfig.baselineModelAliases ?? {}
+const baselineModelOf = (baseline) => {
+  const sourceLabel = baselineSourceLabelOf(baseline)
+  return String(baselineModelAliases[sourceLabel] ?? sourceLabel)
+}
+const directBaselineModels = [...new Set(
+  selected.map(({ baseline }) => baselineModelOf(baseline)),
+)]
+const directBaselineSourceLabels = [...new Set(
+  selected.map(({ baseline }) => baselineSourceLabelOf(baseline)),
+)]
+if (
+  runConfig.expectedBaselineModel &&
+  directBaselineModels.some((model) => model !== runConfig.expectedBaselineModel)
+) {
+  throw new Error(
+    `direct baseline provenance mismatch: expected ${runConfig.expectedBaselineModel}; ` +
+    `received ${directBaselineModels.join(', ')}`,
+  )
+}
 
 let manifest
 try {
@@ -413,6 +451,9 @@ try {
   }
   if ((manifest.revisionStrategy ?? 'legacy_audit') !== revisionStrategy) {
     throw new Error('Existing manifest uses a different revision strategy')
+  }
+  if (manifest.promptBundleVersion !== promptBundleVersion) {
+    throw new Error('Existing manifest uses a different prompt bundle version')
   }
 } catch (error) {
   if (error?.code !== 'ENOENT') throw error
@@ -432,11 +473,27 @@ try {
       selected.map(({ sample }) => [sample.id, sha256(sample.sourceText)]),
     ),
     directBaselineLabel,
+    directBaselineModels,
+    directBaselineSourceLabels,
     expectedCount,
     blindReviewTitle: runConfig.blindReviewTitle,
     blindReviewIntroduction: runConfig.blindReviewIntroduction,
     runs: {},
   }
+  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
+}
+
+// Older manifests did not record per-sample baseline provenance. Enrich them in
+// place without changing any prior translation, mapping, verdict, or run data.
+if (JSON.stringify(manifest.directBaselineModels) !== JSON.stringify(directBaselineModels)) {
+  manifest.directBaselineModels = directBaselineModels
+  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
+}
+if (
+  JSON.stringify(manifest.directBaselineSourceLabels) !==
+  JSON.stringify(directBaselineSourceLabels)
+) {
+  manifest.directBaselineSourceLabels = directBaselineSourceLabels
   await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
 }
 
@@ -573,8 +630,11 @@ for (const { sample, baseline } of selected) {
     taskBrief: sample.taskBrief,
     directText: baseline.body,
     directBaselineLabel,
+    directBaselineModel: baselineModelOf(baseline),
+    directBaselineSourceLabel: baselineSourceLabelOf(baseline),
     directTextSha256: sha256(baseline.body),
     versions,
+    revisionCount: Math.max(0, versions.length - 1),
     finalText: versions.at(-1).text,
     finalTextSha256: versions.at(-1).textSha256,
     completedAt: new Date().toISOString(),
@@ -620,8 +680,11 @@ for (const { sample, baseline } of selected) {
       taskBrief: sample.taskBrief,
       directText: baseline.body,
       directBaselineLabel,
+      directBaselineModel: baselineModelOf(baseline),
+      directBaselineSourceLabel: baselineSourceLabelOf(baseline),
       directTextSha256: sha256(baseline.body),
       versions: recoveredVersions,
+      revisionCount: Math.max(0, recoveredVersions.length - 1),
       finalText: recoveredVersions.at(-1)?.text ?? null,
       finalTextSha256: recoveredVersions.at(-1)?.textSha256 ?? null,
       error: error instanceof Error ? error.message : String(error),
@@ -641,3 +704,15 @@ for (const { sample, baseline } of selected) {
 process.stdout.write(
   `${experimentSlug}: ${results.length}/${expectedCount} saved.\n`,
 )
+
+const terminalIds = onlySampleId ? [onlySampleId] : selectedIds
+const terminalById = new Map(results.map((result) => [result.sampleId, result]))
+const incompleteIds = terminalIds.filter(
+  (id) => terminalById.get(id)?.status !== 'complete',
+)
+if (incompleteIds.length > 0) {
+  process.stderr.write(
+    `${experimentSlug}: incomplete or failed samples: ${incompleteIds.join(', ')}\n`,
+  )
+  process.exitCode = 1
+}

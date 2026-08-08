@@ -84,6 +84,13 @@ function parsePositiveInt(raw: string, flagName: string): number {
   return value
 }
 
+function parseUuid(raw: string, flagName: string): string {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(raw)) {
+    fail(`${flagName} must be a UUID (got: ${raw})`, 1, false)
+  }
+  return raw
+}
+
 // ---------------------------------------------------------------------------
 // Global options, timestamps, output
 // ---------------------------------------------------------------------------
@@ -92,7 +99,7 @@ const t0 = performance.now()
 
 const opts = {
   command: '',
-  base: 'http://127.0.0.1:3001',
+  base: process.env.AGENTIC_BASE_URL ?? 'http://127.0.0.1:3001',
   trace: false,
   timeoutMs: 600_000,
   watchdogMs: 300_000,
@@ -623,8 +630,11 @@ async function cmdCreate(args: ParsedArgs): Promise<CommandOutcome> {
   if (direction === 'custom' && (!sourceLang || !targetLang)) {
     fail('--sourceLang and --targetLang are required when --direction=custom', 1, false)
   }
+  const requestId = args.flags.has('request-id')
+    ? parseUuid(args.flags.get('request-id') as string, '--request-id')
+    : randomUUID()
   const body: JsonObject = {
-    clientRequestId: randomUUID(),
+    clientRequestId: requestId,
     sourceText,
     direction,
   }
@@ -785,9 +795,10 @@ async function cmdTranslate(args: ParsedArgs): Promise<CommandOutcome> {
   )
   flushTokens()
   line(`translate stream closed after ${count} events`)
-  const fanoutFailed = fanout !== null ? Number((fanout as JsonObject).failed ?? 0) : 0
   if (sawError !== null) fail(`translate failed: ${sawError}`, 1)
   if (!sawDone) fail('translate stream closed without done event', 1)
+  if (fanout === null) fail('translate stream closed without fanout_complete event', 1)
+  const fanoutFailed = Number(fanout.failed ?? 0)
   if (fanoutFailed !== 0) fail(`fanout_complete reported failed=${fanoutFailed}`, 1)
   return { code: 0, result: { done: true, fanout, events: count } }
 }
@@ -963,6 +974,7 @@ async function cmdChat(args: ParsedArgs): Promise<CommandOutcome> {
   line(`chat stream closed after ${count} events (${deltaChars} delta chars)`)
   if (sawError !== null) fail(`chat failed: ${sawError}`, 1)
   if (!sawDone) fail('chat stream closed without done event', 1)
+  if (completionKind === null) fail('chat stream closed without message_complete event', 1)
   return {
     code: 0,
     result: {
@@ -1174,7 +1186,7 @@ Usage:
   node --experimental-strip-types scripts/dev-harness.mts <command> [flags]
 
 Global flags:
-  --base=URL        API base (default http://127.0.0.1:3001)
+  --base=URL        API base (default AGENTIC_BASE_URL, then http://127.0.0.1:3001)
   --timeout=MS      per-HTTP-request timeout via AbortController (default 600000);
                     does NOT cap overall SSE consumption (streams may run 2-10 min)
   --watchdog=MS     warn when the run/events stream is silent this long
@@ -1185,8 +1197,8 @@ Global flags:
 
 Commands:
   create     --text=@path|literal --direction=en_to_zh|zh_to_en|custom
-             [--taskBrief=] [--sourceLang= --targetLang=]
-             Create a session (idempotent clientRequestId). Prints id + snapshot version.
+             [--taskBrief=] [--sourceLang= --targetLang=] [--request-id=UUID]
+             Create a session. Reuse --request-id to make retries idempotent.
   run        --session=ID [--configMode=frozen|current]
              POST /run (empty body) then consume GET /events incrementally.
              Exit: 0=session.completed, 1=run.interrupted/anomaly, 3=run.paused.

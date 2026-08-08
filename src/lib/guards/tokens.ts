@@ -1,4 +1,7 @@
-import { SOURCE_TOKEN_LIMIT } from '../constants'
+import {
+  DEFAULT_COMPLETION_TOKEN_BUDGET,
+  SOURCE_TOKEN_LIMIT,
+} from '../constants'
 
 // ─── Custom Errors ──────────────────────────────────────────────
 
@@ -72,6 +75,29 @@ export function estimateTokens(text: string): number {
   }
 
   return cjkCount + Math.ceil(otherCount / 4)
+}
+
+/**
+ * Select a provider-compatible output budget without silently trimming input.
+ * Unknown endpoints retain the 64K reasoning budget. Configured context
+ * windows clamp output to the remaining capacity after a small safety margin.
+ */
+export function resolveCompletionTokenBudget(
+  input: string,
+  contextWindow: number | null | undefined,
+  requested: number = DEFAULT_COMPLETION_TOKEN_BUDGET,
+): number {
+  const target = Math.max(1_024, requested)
+  if (!contextWindow) return target
+  const estimatedInput = estimateTokens(input)
+  const available = contextWindow - estimatedInput - 512
+  if (available < 1_024) {
+    throw new Error(
+      `上下文估算为 ${estimatedInput} tokens，端点上限 ${contextWindow}，` +
+      '不足以保留最小 1024-token 输出空间；未裁剪任何正文。',
+    )
+  }
+  return Math.min(target, available)
 }
 
 // ─── Guards ─────────────────────────────────────────────────────

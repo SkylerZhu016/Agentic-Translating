@@ -404,7 +404,8 @@ ${QUALITY_DISCIPLINE_EN}
 
 ${DASH_POLICY_EN}
 
-${RHYME_CHECK_EN}
+# Private final poetry check
+When the task requires rhyme, privately check the pronunciation of every line ending, the rhyme pairs already present, and the scheme actually realized. Repair only issues that can be fixed without semantic damage. Do not put the sound inventory, scheme analysis, or editorial checklist in the translation body. Only the final translation belongs in the body; place any indispensable human-facing note after the final standalone "---".
 
 ${POETRY_LINEATION_EN}
 

@@ -5,11 +5,11 @@
 // The description must emphasise that old_string MUST be a verbatim unique
 // fragment of the current text so the engine can locate it via cascading match.
 //
-// FILE_READ_TOOL / FILE_EDIT_TOOL / RUN_COMMAND_TOOL: programming tools for the
-// dialogue agent (editing code files / inspecting the workspace / running
-// commands). Modeled after Claude Code (old_string/new_string exact replace)
-// and OpenAI Codex (timeout-bounded command execution). Only the chat agent
-// receives them; pipeline agents (worker/review/orchestrate) never do.
+// FILE_READ_TOOL / FILE_EDIT_TOOL / RUN_COMMAND_TOOL are retained as an
+// explicitly opt-in development tool set. They are never exposed by the
+// translation chat route: translation conversations only receive
+// REPLACE_TEXT_TOOL so source text and user feedback cannot trigger host file
+// or shell side effects.
 // ---------------------------------------------------------------------------
 
 import type { ChatCompletionRequest } from '../llm/client';
@@ -143,11 +143,14 @@ export const RUN_COMMAND_TOOL: NonNullable<ChatCompletionRequest['tools']>[numbe
   },
 };
 
-/** Aggregate tool list for the dialogue agent (replace_text + programming tools). */
+/** Safe default for product translation conversations. */
 export const CHAT_TOOLS: NonNullable<ChatCompletionRequest['tools']> = [
   REPLACE_TEXT_TOOL,
+];
+
+/** Development-only tools. Callers must add their own approval and sandbox. */
+export const PROGRAMMING_TOOLS: NonNullable<ChatCompletionRequest['tools']> = [
   FILE_READ_TOOL,
   FILE_EDIT_TOOL,
   RUN_COMMAND_TOOL,
 ];
-

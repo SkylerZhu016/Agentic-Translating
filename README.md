@@ -108,30 +108,34 @@ npm run dataset:validate:locked
 
 Draft validation accepts an incomplete selection while validating every present
 record. Locked validation requires the complete approved 8-item development set
-and 24-item test set.
+and 16-item test set (24 items in total).
 
 ## CLI Test Harness
 
-`scripts/dev-harness.mts` provides a pure command-line driver with the same
-functionality as the web workbench (requires Node.js 22+):
+`scripts/dev-harness.mts` provides a pure command-line driver for the workbench's
+core session, HTTP, SSE, and revision operations (requires Node.js 22+). Start
+the app first and pass its actual port explicitly:
 
 ```bash
-node --experimental-strip-types scripts/dev-harness.mts --help
+npm run harness -- --help
+npm run harness -- list --base=http://127.0.0.1:3000
 ```
 
 Subcommands: `create`, `run`, `translate`, `events`, `chat`, `suggest`,
-`state`, `list`, `rm`, `restore`. It reuses the project's own SSE parser and
-pure functions, so the CLI never drifts from the HTTP protocol. Highlights:
+`state`, `list`, `rm`, `restore`. It reuses the project's SSE parser and has
+dedicated protocol-terminal tests. Highlights:
 
 - Incremental SSE output with timestamps and phase labels (`--trace` writes a
   JSONL log under `FSBP_Test/private/debug/`).
 - Failures dump the last 50 events plus session state and exit non-zero.
-- `suggest` runs the guided-revision loop (isolated target-language reader,
-  bilingual verifier, and arbiter lenses) on the current final version.
-- Manifest-based breakpoint resume for long-running experiment batches.
+- `suggest` obtains a read-only revision proposal from isolated target-language
+  reader, bilingual verifier, and arbiter lenses. Use `chat` to apply a revision.
+- `create --request-id=<UUID>` supports idempotent retries; `run` and `events`
+  reconnect to the server-owned run and persisted event stream.
 
-The browser remains the tool of choice for layout and visual regression; model
-verification can be done entirely from the CLI.
+The harness intentionally does not reproduce configuration forms or batch-file
+selection. The browser remains the tool of choice for layout and visual
+regression; core model-flow verification can run entirely from the CLI.
 
 ## Development Commands
 
@@ -145,7 +149,9 @@ verification can be done entirely from the CLI.
 | `npm run package:win` | Package Windows NSIS installer and portable build |
 | `npm run dataset:validate` | Validate the in-progress FSBP dataset |
 | `npm run dataset:validate:locked` | Enforce the complete locked dataset gate |
-| `node --experimental-strip-types scripts/dev-harness.mts` | Run the CLI test harness |
+| `npm run harness -- --help` | Run the CLI test harness |
+| `npm run test:cli` | Test CLI terminal and idempotency semantics |
+| `npm run experiment:verdict:validate -- --verdict=<path>` | Recompute and validate a gate verdict |
 
 ## Documentation
 

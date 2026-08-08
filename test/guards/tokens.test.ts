@@ -5,6 +5,7 @@ import {
   assertSourceNonEmpty,
   SourceTooLongError,
   SourceRequiredError,
+  resolveCompletionTokenBudget,
 } from '../../src/lib/guards/tokens'
 
 // Inline mock for SOURCE_TOKEN_LIMIT since task 3 constants may not exist
@@ -49,6 +50,23 @@ describe('estimateTokens', () => {
   it('should estimate whitespace-heavy text correctly', () => {
     // "     " = 5 spaces → ceil(5/4) = 2
     expect(estimateTokens('     ')).toBe(2)
+  })
+})
+
+describe('resolveCompletionTokenBudget', () => {
+  it('keeps the 64K reasoning budget when the context window is unknown', () => {
+    expect(resolveCompletionTokenBudget('short input', null)).toBe(65_536)
+  })
+
+  it('clamps output to configured remaining context capacity', () => {
+    const input = '测'.repeat(10_000)
+    expect(resolveCompletionTokenBudget(input, 32_000)).toBe(21_488)
+  })
+
+  it('fails explicitly instead of silently trimming input', () => {
+    expect(() =>
+      resolveCompletionTokenBudget('测'.repeat(15_800), 16_000),
+    ).toThrow(/不足以保留/)
   })
 })
 

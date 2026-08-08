@@ -17,15 +17,20 @@
 ## 2. 防止测试集泄漏
 
 - 8 个 `dev` 样本用于提炼通用错误类型和调整提示词；
-- 16 个 `test` 样本已锁定，不再用于修改生成提示词；
+- 16 个 `test` 样本保持内容与哈希锁定，但其中部分已经参与后续提示词和工作流
+  迭代，因此当前全部按开发/诊断证据管理，不能再称为 untouched holdout；
 - 测试集人工批注、`reviewerChecklist` 和既有直译问题不进入任何生成上下文；
 - 正式运行前冻结 Agent prompt version、prompt bundle version、模型、参数和代码提交；
 - 若运行后再修改提示词，必须建立新实验版本，不能覆盖旧结果。
 
-本轮冻结的内置提示词目标版本：
+最初实验计划冻结的内置提示词版本为：
 
 - Agent direction variant：v6；
 - Direction prompt bundle：v4。
+
+该冻结方案已经退役。当前产品版本为 Agent direction variant v17、Direction
+prompt bundle v21；旧实验不得被重新标成当前产品结果。下一次正式未见门禁必须
+在配置与 manifest 中冻结当前实际版本、代码提交、数据集哈希和基线模型来源。
 
 ## 3. 质量条件
 
