@@ -33,8 +33,8 @@ npm run package:win
 
 当前 Windows x64 产物位于 `dist-electron/`：
 
-- `Agentic Translating-0.1.0-setup-x64.exe`
-- `Agentic Translating-0.1.0-portable-x64.exe`
+- `Agentic Translating-0.1.1-setup-x64.exe`
+- `Agentic Translating-0.1.1-portable-x64.exe`
 
 桌面运行时从 `resources/app` 启动 standalone 服务，并通过只读的 `app.asar/node_modules` 解析服务器依赖。`better-sqlite3` 仍由 electron-builder 放入 `app.asar.unpacked`。构建机需要 Node.js 22 或更高版本，以及可用的 Windows C++ 构建工具链，以便在预编译包缺失时从源码重建。
 

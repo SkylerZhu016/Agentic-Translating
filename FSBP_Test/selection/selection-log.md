@@ -1,6 +1,8 @@
 # Text Selection Log
 
-本文件只登记选型过程，不代表候选已经进入数据集。
+本文件登记选型过程与历史状态；正式是否进入数据集以
+`dataset-manifest.json` 和 `datasets/*.jsonl` 为准。当前仓库中的 8 个开发样本和
+16 个测试样本已经锁定，后续修改必须建立新的数据集版本。
 
 ## 排除项
 
@@ -17,10 +19,10 @@
 | 批次 | 目标数量 | 状态 | 说明 |
 |---|---:|---|---|
 | 开发集 | 8 | formalized | 第一轮问题标注完成，已收入 `quality-dev.jsonl` |
-| 诗歌测试集 | 4 | review_pending | 全文、原始分行、直译与预审风险均已生成 |
-| 文学叙事测试集 | 4 | review_pending | 完整叙述或描写单元、直译与预审风险均已生成 |
-| 文化/论辩测试集 | 4 | review_pending | 完整论证单元、直译与预审风险均已生成 |
-| 非文学测试集 | 4 | review_pending | 科学、计算与古代技术文本、直译与预审风险均已生成 |
+| 诗歌测试集 | 4 | locked | 已完成逐项审阅并写入 `datasets/quality-test.jsonl` |
+| 文学叙事测试集 | 4 | locked | 已完成逐项审阅并写入 `datasets/quality-test.jsonl` |
+| 文化/论辩测试集 | 4 | locked | 已完成逐项审阅并写入 `datasets/quality-test.jsonl` |
+| 非文学测试集 | 4 | locked | 已完成逐项审阅并写入 `datasets/quality-test.jsonl` |
 
 ## 槽位清单
 
@@ -86,8 +88,8 @@
 - 结构化原文：`test-candidates-round-01.jsonl`
 - 本地集中审阅稿：`../private/review/test-round-01.md`
 - 本地结构化直译：`../private/review/test-round-01.jsonl`
-- 状态：16 项已通过结构、长度、方向和类别校验；等待用户逐项审阅，尚未写入
-  `datasets/quality-test.jsonl`。
+- 状态：16 项已通过结构、长度、方向和类别校验，完成逐项审阅并写入
+  `datasets/quality-test.jsonl`；正式锁定状态见 `dataset-manifest.json`。
 
 ## 确认检查
 

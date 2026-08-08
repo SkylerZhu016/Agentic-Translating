@@ -30,10 +30,20 @@ Dependency list:
 
 The npm `diff` package originally considered for use is actually licensed under BSD-3-Clause, so the implementation phase switched to `fast-array-diff`, which uses the MIT license. This change only affects the underlying diff algorithm dependency and does not alter the interface or data protocol.
 
-## 3. Failure Isolation
+## 3. Ping Shui Yun Data
+
+The poetry checker uses the public-domain 106-rhyme-character table of *Ping Shui Yun* hosted by Wikisource. Both simplified and traditional renderings are kept:
+
+- Source: [Ping Shui Yun](https://zh.wikisource.org/wiki/%E5%B9%B3%E6%B0%B4%E9%9F%BB)
+- Local use: look up which traditional rhyme category a Chinese line-final character may belong to;
+- Limitation: polyphonic characters, historical sound changes, near-rhyme borrowing, and variant forms still require human review.
+
+The table never rewrites or rejects a translation automatically. It is auxiliary evidence, not an authoritative classical-rhyme adjudicator.
+
+## 4. Failure Isolation
 
 A Diff computation failure must not prevent version saving. The system degrades to a block-level before/after view, while Patches, reasons, and evidence are still written to the database normally.
 
-## 4. Future Code Reuse
+## 5. Future Code Reuse
 
 If any third-party MIT code is directly reused in the future, the original license notice, copyright notice, and clear source attribution must be retained in the repository. In this development cycle, no code from lessAI has been directly reused.

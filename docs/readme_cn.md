@@ -97,8 +97,9 @@ docker compose up --build
 ## FSBP 数据集
 
 旧版试运行实验已经退役。新版数据集、选型记录、schema、评分规则和研究
-边界位于 [`FSBP_Test/`](../FSBP_Test/README.md)。具体文本在逐项审查确认前
-保持为空。
+边界位于 [`FSBP_Test/`](../FSBP_Test/README.md)，对应的英文说明见
+[`FSBP_Test/README.en.md`](../FSBP_Test/README.en.md)。当前 8 个开发样本和
+16 个测试样本已经完成审阅并锁定。
 
 ```bash
 npm run dataset:validate

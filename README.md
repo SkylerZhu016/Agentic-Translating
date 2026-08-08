@@ -98,8 +98,8 @@ Production web deployments must set the `AGENTIC_SECRET_KEY` environment variabl
 
 The previous pilot experiment has been retired. The replacement dataset,
 selection log, schemas, rubrics, and research boundaries live in
-[`FSBP_Test/`](FSBP_Test/README.md). Specific texts remain empty until they are
-reviewed and approved.
+[`FSBP_Test/`](FSBP_Test/README.en.md). The current 8-item development set and
+16-item test set are versioned and locked after review.
 
 ```bash
 npm run dataset:validate

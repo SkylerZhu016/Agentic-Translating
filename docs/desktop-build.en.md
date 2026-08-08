@@ -33,8 +33,8 @@ npm run package:win
 
 Current Windows x64 artifacts live under `dist-electron/`:
 
-- `Agentic Translating-0.1.0-setup-x64.exe`
-- `Agentic Translating-0.1.0-portable-x64.exe`
+- `Agentic Translating-0.1.1-setup-x64.exe`
+- `Agentic Translating-0.1.1-portable-x64.exe`
 
 At runtime, the desktop app starts the standalone server from `resources/app` and resolves server dependencies through read-only `app.asar/node_modules`. `better-sqlite3` is placed in `app.asar.unpacked` by electron-builder. The build machine requires Node.js 22 or later and a working Windows C++ build toolchain, so that prebuilt packages can be rebuilt from source when missing.
 

@@ -81,7 +81,19 @@ Prompt upgrades must satisfy the following:
 
 Names, sentences, reference answers, and item-specific findings from locked evaluation texts must not enter production prompts. Lessons from testing are generalized, and examples use situations unrelated to the locked items.
 
-## 6. Custom Language Pairs
+## 6. Independent Text Testing
+
+The Agent library can test a saved built-in or custom agent on an independent source text. The custom-agent dialog can also run an unsaved role prompt before saving it:
+
+- Enter source text, task requirements, and an optional role-specific instruction.
+- Select an explicit endpoint and model, or follow the default translation binding.
+- The test creates no session, agent record, or experiment result.
+- The result is displayed with the FSBP body and annotation separated.
+- A single-agent test checks whether that role fulfills its own mission. It does not select a universal prompt or replace multi-agent orchestration.
+
+During development, independent models may compare short prompts with detailed criteria on development samples. Locked test samples must not be used for this tuning.
+
+## 7. Custom Language Pairs
 
 Advanced users can provide custom direction prompt bundles, but they will not automatically receive the 20 built-in variants from the Chinese-English directions. A custom direction requires at least two compatible custom Agents, and must explicitly provide the main Agent, worker, four-stage, and editor prompts.
 
