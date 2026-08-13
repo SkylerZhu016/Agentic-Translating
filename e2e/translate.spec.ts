@@ -219,8 +219,7 @@ test.describe('AC18 — single card retry', () => {
     await page.goto('/')
     await page.locator('details').first().click()
     await page
-      .locator('details select')
-      .first()
+      .getByRole('combobox', { name: '当前预设', exact: true })
       .selectOption(preset.preset.id)
     await byTid(page, TID.translate.sourceInput).fill(SOURCE_TEXT)
     await byTid(page, TID.translate.translateButton).click()

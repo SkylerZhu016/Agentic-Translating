@@ -9,6 +9,7 @@ import {
   createSessionService,
   InvalidCustomDirectionError,
   NoAgentsConfiguredError,
+  SessionIdempotencyConflictError,
 } from '@/src/lib/services/session-service'
 import {
   SourceRequiredError,
@@ -16,6 +17,7 @@ import {
 import { sessionCreateSchema } from '@/src/lib/contracts/schemas'
 import { toPublicSessionDto } from '@/src/lib/security/public-dto'
 import { createVNextRepositories } from '@/src/lib/db/vnext-repositories'
+import { ProjectRepositoryError } from '@/src/lib/db/project-repositories'
 
 export function createHandlers(db: Database.Database) {
   const repos = createRepositories(db)
@@ -63,7 +65,30 @@ export function createHandlers(db: Database.Database) {
         const session = service.createSession(input)
         try {
           if (direction !== 'custom') {
-            createVNextRepositories(db).workspaceDrafts.clear(direction)
+            const vnext = createVNextRepositories(db)
+            const automaticallyIncludedAgentVariantIds = vnext.agents
+              .listVariants(direction, false)
+              .filter(
+                (variant) => variant.archetypeId === 'cultural-context',
+              )
+              .map((variant) => variant.id)
+            vnext.workspaceDrafts.clearIfMatches(
+              {
+                direction,
+                sourceText: parsed.data.sourceText,
+                taskBrief: parsed.data.taskBrief,
+                selectedProjectId: parsed.data.projectId ?? null,
+                selectedPresetRevisionId:
+                  parsed.data.presetRevisionId ?? null,
+                allowedAgentVariantIds:
+                  parsed.data.allowedAgentVariantIds ?? [],
+                reviewMode: parsed.data.reviewMode,
+                promptBundleRevisionId:
+                  parsed.data.promptBundleRevisionId ?? null,
+                constraints: parsed.data.constraints,
+              },
+              automaticallyIncludedAgentVariantIds,
+            )
           }
         } catch {
           // Legacy test databases do not contain vNext draft tables.
@@ -86,6 +111,37 @@ export function createHandlers(db: Database.Database) {
           return NextResponse.json(
             { error: err.code, message: err.message },
             { status: 400 },
+          )
+        }
+        if (err instanceof SessionIdempotencyConflictError) {
+          return NextResponse.json(
+            { error: err.code, message: err.message },
+            { status: 409 },
+          )
+        }
+        if (err instanceof ProjectRepositoryError) {
+          const status =
+            err.code === 'project_not_found' || err.code === 'snapshot_not_found'
+              ? 404
+              : err.code === 'project_archived' ||
+                  err.code === 'context_already_frozen' ||
+                  err.code === 'idempotency_conflict' ||
+                  err.code === 'stale_project_version' ||
+                  err.code === 'stale_resource_revision' ||
+                  err.code === 'revision_not_suggested' ||
+                  err.code === 'suggestion_not_pending' ||
+                  err.code === 'suggestion_already_materialized' ||
+                  err.code === 'snapshot_membership_mismatch'
+                ? 409
+                : err.code === 'invalid_stored_json' ||
+                    err.code === 'snapshot_integrity_error'
+                  ? 500
+                : 400
+          return NextResponse.json(
+            status === 500
+              ? { error: err.code }
+              : { error: err.code, message: err.message },
+            { status },
           )
         }
         // Re-throw unexpected errors

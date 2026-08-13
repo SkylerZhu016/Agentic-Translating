@@ -32,7 +32,7 @@ export interface PromptTemplateRow {
 export interface TranslatorAgentRow {
   id: number
   name: string
-  endpoint_id: number
+  endpoint_id: number | null
   model: string
   prompt_override: string | null
   sort_order: number
@@ -519,8 +519,9 @@ export function createPresetsRepo(db: Database.Database) {
       const txn = db.transaction(() => {
         deleteAllTranslatorAgentsStmt.run()
         for (const a of full.agents) {
-          // translator_agents.endpoint_id is NOT NULL — skip agents referencing orphaned endpoints
-          if (a.endpoint_id != null && orphan.has(a.endpoint_id)) continue
+          // Keep unbound/orphaned entries in the preset for later rebinding,
+          // but do not activate them as translation workers.
+          if (a.endpoint_id == null || orphan.has(a.endpoint_id)) continue
           insertTranslatorAgentStmt.run({ name: a.name, endpoint_id: a.endpoint_id, model: a.model, prompt_override: a.prompt_override, sort_order: a.sort_order } as any)
         }
         const coord = full.coordinator

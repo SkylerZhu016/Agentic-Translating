@@ -153,6 +153,11 @@ export interface ChatCompletionRequest {
   maxTokens?: number;
   /** Heartbeat for response activity, including reasoning chunks that are discarded. */
   onActivity?: () => void;
+  /**
+   * Called immediately before the single compatibility retry that omits
+   * stream_options. Exceptions are isolated from the provider request.
+   */
+  onCompatibilityRetry?: (error: ClientError) => void;
   signal?: AbortSignal;
 }
 
@@ -184,6 +189,8 @@ export type LLMStreamEvent =
   | {
       type: 'done';
       content: string;
+      /** Whether a stream request used SSE or a provider JSON fallback. */
+      transport?: 'sse' | 'json_fallback';
       toolCalls?: Array<{
         id: string;
         name: string;
@@ -225,6 +232,7 @@ type AbortReason = 'idle_timeout' | 'max_duration' | 'external' | null;
 interface RequestGuard {
   signal: AbortSignal;
   reason: () => AbortReason;
+  abort: (reason: Exclude<AbortReason, null>) => void;
   touch: () => void;
   cleanup: () => void;
 }
@@ -262,6 +270,7 @@ function createRequestGuard(
   return {
     signal: controller.signal,
     reason: () => abortReason,
+    abort,
     touch,
     cleanup: () => {
       if (idleTimer) clearTimeout(idleTimer);
@@ -305,6 +314,130 @@ async function readResponseText(
       // Already released.
     }
   }
+}
+
+type CompletionUsage = NonNullable<ChatCompletionResponse['usage']>;
+
+function parseCompletionUsage(value: unknown): CompletionUsage | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const usage = value as Record<string, unknown>;
+  const promptTokens = usage.prompt_tokens;
+  const completionTokens = usage.completion_tokens;
+  const totalTokens = usage.total_tokens;
+  if (
+    typeof promptTokens !== 'number' ||
+    !Number.isFinite(promptTokens) ||
+    typeof completionTokens !== 'number' ||
+    !Number.isFinite(completionTokens) ||
+    typeof totalTokens !== 'number' ||
+    !Number.isFinite(totalTokens)
+  ) {
+    return undefined;
+  }
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: totalTokens,
+  };
+}
+
+function isUnsupportedStreamOptionsResponse(
+  response: Response,
+  bodyText: string,
+): boolean {
+  if (response.status !== 400 && response.status !== 422) return false;
+
+  const detail = bodyText.toLowerCase().replace(/\s+/g, ' ');
+  const namesStreamOptions =
+    detail.includes('stream_options') ||
+    detail.includes('stream options') ||
+    detail.includes('include_usage');
+  if (!namesStreamOptions) return false;
+
+  return [
+    'not supported',
+    'unsupported',
+    'unknown',
+    'unrecognized',
+    'unrecognised',
+    'unexpected',
+    'not permitted',
+    'not allowed',
+    'extra_forbidden',
+    'extra inputs',
+    'additional properties',
+    'invalid parameter',
+  ].some((marker) => detail.includes(marker));
+}
+
+function createCompatibilityRetryError(
+  response: Response,
+  bodyText: string,
+): ClientError {
+  let message = `LLM request failed with status ${response.status}`;
+  try {
+    const body = JSON.parse(bodyText) as OpenAIErrorBody;
+    message = body.error?.message ?? message;
+  } catch {
+    if (bodyText) message = bodyText;
+  }
+  return new ClientError(message, response.status);
+}
+
+interface StreamFetchResult {
+  response: Response;
+  /** Present when a rejected response had to be inspected for compatibility. */
+  bodyText?: string;
+}
+
+async function fetchStreamResponse(
+  endpoint: { baseUrl: string; apiKey: string; chatCompletionsPath?: string },
+  request: ChatCompletionRequest,
+  signal: AbortSignal,
+  onActivity: () => void,
+): Promise<StreamFetchResult> {
+  const fetchOnce = async (includeUsage: boolean): Promise<Response> => {
+    const response = await fetch(resolveChatCompletionsUrl(endpoint), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${endpoint.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: request.model,
+        messages: request.messages,
+        ...(request.tools ? { tools: request.tools } : {}),
+        ...(request.toolChoice ? { tool_choice: request.toolChoice } : {}),
+        ...(request.maxTokens ? { max_tokens: request.maxTokens } : {}),
+        stream: true,
+        ...(includeUsage
+          ? { stream_options: { include_usage: true } }
+          : {}),
+      }),
+      signal,
+    });
+    onActivity();
+    return response;
+  };
+
+  const response = await fetchOnce(true);
+  if (response.ok) return { response };
+
+  const bodyText = await readResponseText(response, onActivity);
+  if (!isUnsupportedStreamOptionsResponse(response, bodyText)) {
+    return { response, bodyText };
+  }
+
+  // A rejected request cannot have produced a successful completion. Retry at
+  // most once, and only after the endpoint explicitly rejects stream_options.
+  try {
+    request.onCompatibilityRetry?.(
+      createCompatibilityRetryError(response, bodyText),
+    );
+  } catch {
+    // Accounting/telemetry callbacks must not alter provider behavior.
+  }
+  return { response: await fetchOnce(false) };
 }
 
 /**
@@ -466,9 +599,7 @@ async function nonStreamCompletion(
   }
 
   // Extract usage
-  const usage = body.usage as
-    | { prompt_tokens: number; completion_tokens: number; total_tokens: number }
-    | undefined;
+  const usage = parseCompletionUsage(body.usage);
 
   return {
     content,
@@ -487,28 +618,16 @@ async function* streamCompletion(
   signal: AbortSignal,
   onActivity: () => void,
 ): AsyncIterable<LLMStreamEvent> {
-  const response = await fetch(resolveChatCompletionsUrl(endpoint), {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${endpoint.apiKey}`,
-    },
-    body: JSON.stringify({
-      model: request.model,
-      messages: request.messages,
-      ...(request.tools ? { tools: request.tools } : {}),
-      ...(request.toolChoice ? { tool_choice: request.toolChoice } : {}),
-      ...(request.maxTokens ? { max_tokens: request.maxTokens } : {}),
-      stream: true,
-    }),
-    signal,
-  });
-  onActivity();
+  const {
+    response,
+    bodyText: inspectedErrorBody,
+  } = await fetchStreamResponse(endpoint, request, signal, onActivity);
 
   // Check for non-stream fallback: server returned JSON instead of SSE
   const contentType = response.headers.get('content-type') ?? '';
   if (contentType.includes('application/json')) {
-    const bodyText = await readResponseText(response, onActivity);
+    const bodyText =
+      inspectedErrorBody ?? await readResponseText(response, onActivity);
 
     if (!response.ok) {
       await normalizeError(response, bodyText);
@@ -537,9 +656,7 @@ async function* streamCompletion(
     }
 
     // Extract usage
-    const usage = body.usage as
-      | { prompt_tokens: number; completion_tokens: number; total_tokens: number }
-      | undefined;
+    const usage = parseCompletionUsage(body.usage);
 
     // Extract tool calls from non-stream response
     let toolCalls: ChatCompletionResponse['toolCalls'] | undefined;
@@ -555,6 +672,7 @@ async function* streamCompletion(
     yield {
       type: 'done',
       content,
+      transport: 'json_fallback',
       ...(toolCalls ? { toolCalls } : {}),
       ...(usage ? { usage } : {}),
     };
@@ -564,7 +682,8 @@ async function* streamCompletion(
   // Non-ok response with non-JSON content — try to read body for error info
   if (!response.ok) {
     // Try to read error body
-    const bodyText = await readResponseText(response, onActivity);
+    const bodyText =
+      inspectedErrorBody ?? await readResponseText(response, onActivity);
     await normalizeError(response, bodyText);
   }
 
@@ -581,6 +700,8 @@ async function* streamCompletion(
   let pendingBuffer = ''; // only the unfinished SSE tail
   let lastFinishReason: string | null = null;
   let sawDoneSentinel = false;
+  let completedNaturally = false;
+  let accumulatedUsage: CompletionUsage | undefined;
   const toolCallAccumulator = new Map<
     number,
     { id: string; name: string; argumentsFragments: string[] }
@@ -625,10 +746,13 @@ async function* streamCompletion(
             }));
           }
 
+          completedNaturally = true;
           yield {
             type: 'done',
             content: accumulatedContent,
+            transport: 'sse',
             ...(finalToolCalls ? { toolCalls: finalToolCalls } : {}),
+            ...(accumulatedUsage ? { usage: accumulatedUsage } : {}),
           };
           return;
         }
@@ -636,6 +760,9 @@ async function* streamCompletion(
         // Parse the SSE data as JSON
         try {
           const delta = JSON.parse(event.data);
+          const usage = parseCompletionUsage(delta.usage);
+          if (usage) accumulatedUsage = usage;
+
           const choice = delta.choices?.[0];
           if (!choice) continue;
           if (typeof choice.finish_reason === 'string') {
@@ -725,13 +852,24 @@ async function* streamCompletion(
       );
     }
 
+    completedNaturally = true;
     yield {
       type: 'done',
       content: accumulatedContent,
+      transport: 'sse',
       ...(finalToolCalls ? { toolCalls: finalToolCalls } : {}),
+      ...(accumulatedUsage ? { usage: accumulatedUsage } : {}),
     };
   } finally {
-    // Ensure reader is released
+    // An early consumer return must tear down the upstream response, not just
+    // release our local lock and leave the provider generating in background.
+    if (!completedNaturally) {
+      try {
+        await reader.cancel();
+      } catch {
+        // Fetch may already have been aborted by the request guard.
+      }
+    }
     try {
       reader.releaseLock();
     } catch {
@@ -798,12 +936,16 @@ export async function chatCompletion(
       onActivity,
     );
   } catch (error: unknown) {
+    // An explicit cancellation wins races with provider/network failures. Some
+    // fetch implementations surface a concurrent abort as a generic fetch
+    // error (and a downstream helper may already have normalized that error),
+    // but callers still need the stable external-abort contract.
+    if (guard.signal.aborted) throwGuardAbort(guard.reason());
+
     // If already an LLMError, re-throw as-is
     if (error instanceof LLMError) {
       throw error;
     }
-
-    if (guard.signal.aborted) throwGuardAbort(guard.reason());
 
     // Network/fetch errors
     return mapNetworkError(error);
@@ -820,31 +962,107 @@ export async function chatCompletion(
  * Any error (abort, timeout, network) surfaces during iteration and is
  * normalized here.
  */
-async function* wrapAsyncIterable(
+function normalizeStreamIterationError(
+  error: unknown,
+  guard: RequestGuard,
+): never {
+  // Check the request guard before preserving an existing LLMError. A stream
+  // abort can race with a provider socket failure that was already mapped to
+  // NetworkError; the externally visible result must remain AbortedError.
+  if (guard.signal.aborted) throwGuardAbort(guard.reason());
+  if (error instanceof LLMError) throw error;
+
+  if (
+    error instanceof DOMException ||
+    (error instanceof Error && error.name === 'AbortError')
+  ) {
+    throw new AbortedError();
+  }
+
+  mapNetworkError(error);
+}
+
+function wrapAsyncIterable(
   source: AsyncIterable<LLMStreamEvent>,
   guard: RequestGuard,
 ): AsyncIterable<LLMStreamEvent> {
-  try {
-    for await (const event of source) {
-      yield event;
-    }
-  } catch (error: unknown) {
-    // If already an LLMError, re-throw as-is
-    if (error instanceof LLMError) {
-      throw error;
-    }
+  const sourceIterator = source[Symbol.asyncIterator]();
+  let closed = false;
+  let terminalEventSeen = false;
+  let cleanedUp = false;
 
-    // AbortError (from AbortSignal)
-    if (
-      error instanceof DOMException ||
-      (error instanceof Error && error.name === 'AbortError')
-    ) {
-      if (guard.signal.aborted) throwGuardAbort(guard.reason());
-      throw new AbortedError();
-    }
-
-    mapNetworkError(error);
-  } finally {
+  const cleanup = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
     guard.cleanup();
-  }
+  };
+  const doneResult = (value?: unknown): IteratorResult<LLMStreamEvent> => ({
+    done: true,
+    value,
+  });
+
+  const wrapped: AsyncIterableIterator<LLMStreamEvent> = {
+    async next(): Promise<IteratorResult<LLMStreamEvent>> {
+      if (closed) return doneResult();
+      try {
+        const result = await sourceIterator.next();
+        if (result.done) {
+          closed = true;
+          cleanup();
+        } else if (result.value.type === 'done') {
+          terminalEventSeen = true;
+          cleanup();
+        }
+        return result;
+      } catch (error: unknown) {
+        closed = true;
+        cleanup();
+        normalizeStreamIterationError(error, guard);
+      }
+    },
+
+    async return(value?: unknown): Promise<IteratorResult<LLMStreamEvent>> {
+      const cancelledEarly = !closed && !terminalEventSeen;
+      closed = true;
+      if (cancelledEarly) {
+        // Abort immediately, including when a read/fetch is currently pending.
+        // The source generator's finally block also cancels its reader.
+        guard.abort('external');
+      }
+      try {
+        if (sourceIterator.return) {
+          return await sourceIterator.return(value);
+        }
+        return doneResult(value);
+      } catch (error: unknown) {
+        // Cancellation is a successful iterator close operation. Abort errors
+        // caused by that close belong to the pending next(), not return().
+        if (cancelledEarly) return doneResult(value);
+        normalizeStreamIterationError(error, guard);
+      } finally {
+        cleanup();
+      }
+    },
+
+    async throw(error?: unknown): Promise<IteratorResult<LLMStreamEvent>> {
+      const cancelledEarly = !closed && !terminalEventSeen;
+      closed = true;
+      if (cancelledEarly) guard.abort('external');
+      try {
+        if (sourceIterator.throw) {
+          return await sourceIterator.throw(error);
+        }
+        if (sourceIterator.return) await sourceIterator.return();
+        throw error;
+      } finally {
+        cleanup();
+      }
+    },
+
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+  };
+
+  return wrapped;
 }

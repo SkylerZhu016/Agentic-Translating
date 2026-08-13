@@ -261,6 +261,7 @@ describe('POST /api/sessions/[id]/stages/[stage]/run', () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     db.close();
   });
 
@@ -536,7 +537,12 @@ describe('POST /api/sessions/[id]/stages/[stage]/run', () => {
   describe('stage error', () => {
     it('emits stage_error SSE event when LLM caller throws', async () => {
       const sid = seedSession(repos);
-      vi.mocked(chatCompletion).mockRejectedValue(new Error('LLM network failure'));
+      const sensitiveProviderError =
+        'Bearer sk-stage-secret https://stage.private/v1 leaked source and review prompt';
+      const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+      vi.mocked(chatCompletion).mockRejectedValue(
+        new Error(sensitiveProviderError),
+      );
 
       const req = new Request(`http://localhost/api/sessions/${sid}/stages/review/run`, {
         method: 'POST',
@@ -550,11 +556,46 @@ describe('POST /api/sessions/[id]/stages/[stage]/run', () => {
       const errorEvents = events.filter(
         (e) => e.event === 'stage_error' || e.event === 'stage_schema_error',
       );
-      expect(errorEvents.length).toBeGreaterThan(0);
+      expect(errorEvents).toHaveLength(1);
+      expect(errorEvents[0].data).toEqual(
+        expect.objectContaining({
+          stage: 'review',
+          code: 'stage_execution_failed',
+          error: '统筹阶段执行失败，请稍后重试。',
+          message: '统筹阶段执行失败，请稍后重试。',
+          diagnosticId: expect.stringMatching(
+            /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+          ),
+        }),
+      );
 
       // DB: status should be 'failed'
       const saved = repos.stageOutputs.getBySessionAndStage(sid, 'review');
       expect(saved!.status).toBe('failed');
+      const persistedError = JSON.parse(saved!.error!) as Record<string, string>;
+      expect(persistedError).toEqual({
+        error: 'stage_execution_failed',
+        message: '统筹阶段执行失败，请稍后重试。',
+        diagnosticId: (errorEvents[0].data as any).diagnosticId,
+      });
+
+      const exposed = JSON.stringify({
+        events,
+        saved,
+        diagnostics: consoleError.mock.calls,
+      });
+      for (const sensitive of [
+        sensitiveProviderError,
+        'sk-stage-secret',
+        'https://stage.private/v1',
+        'leaked source',
+        'review prompt',
+      ]) {
+        expect(exposed).not.toContain(sensitive);
+      }
+      expect(JSON.stringify(consoleError.mock.calls)).toContain(
+        persistedError.diagnosticId,
+      );
     });
   });
 

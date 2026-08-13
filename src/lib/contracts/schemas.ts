@@ -68,6 +68,7 @@ export const sessionCreateSchema = z.object({
   reviewMode: z.enum(['main_editor', 'four_stage']).default('main_editor'),
   presetRevisionId: z.string().min(1).nullable().optional(),
   promptBundleRevisionId: z.string().min(1).nullable().optional(),
+  projectId: z.string().uuid().nullable().optional(),
   allowedAgentVariantIds: z.array(z.string().min(1)).optional(),
   constraints: z.object({
     preserveParagraphs: z.boolean().optional(),

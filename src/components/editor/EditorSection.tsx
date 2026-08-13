@@ -29,6 +29,7 @@ import type {
   ToolCallView,
 } from './types'
 import { RevisionEvidence } from './RevisionEvidence'
+import { DisagreementMap } from './DisagreementMap'
 
 /** 高亮停留时长（ms） */
 const HIGHLIGHT_DURATION = 2600
@@ -63,7 +64,7 @@ type ChatActivityPhase =
   | 'applying_edits'
 
 export function EditorSection() {
-  const { data, sessionId, refresh } = useSessionFull()
+  const { data, sessionId, candidateRevision, refresh } = useSessionFull()
 
   /** 本地流式叠加层：乐观用户消息 + 流式 AI 消息；服务端落库后清空 */
   const [live, setLive] = useState<ChatMessageView[]>([])
@@ -386,6 +387,18 @@ export function EditorSection() {
             onChanged={refresh}
           />
         </Card>
+
+        <DisagreementMap
+          sessionId={sessionId}
+          finalVersionId={currentVersion?.id ?? null}
+          candidateRevision={candidateRevision}
+          currentText={currentText}
+          canAdopt={canChat}
+          busy={chatBusy}
+          onAdopt={(instruction, selection) => {
+            void sendChat(instruction, selection)
+          }}
+        />
       </div>
     </div>
   )

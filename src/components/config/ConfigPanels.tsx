@@ -15,6 +15,8 @@ import { DirectionSettingsCard } from './DirectionSettingsCard'
 import { AgentLibraryPanel } from './AgentLibraryPanel'
 import { WorkflowPresetPanel } from './WorkflowPresetPanel'
 import { PromptBundlePanel } from './PromptBundlePanel'
+import { OnboardingDoctor } from './OnboardingDoctor'
+import { ProjectMemoryPanel } from './ProjectMemoryPanel'
 
 export function ConfigPanels() {
   const [loading, setLoading] = useState(true)
@@ -51,7 +53,7 @@ export function ConfigPanels() {
       <PageHeader
         overline="Settings"
         title="配置"
-        description="管理 OpenAI 兼容端点、翻译 Agent 阵容与统筹模型。配置保存在本机，不上传。"
+        description="管理模型端点、Agent 阵容与工作流。配置和历史保存在本机；使用远程模型时，任务内容会发送至所选端点。"
       />
 
       {loading ? (
@@ -68,7 +70,9 @@ export function ConfigPanels() {
         </div>
       ) : (
         <div className="mx-auto grid max-w-3xl grid-cols-1 gap-5">
+          <OnboardingDoctor endpoints={endpoints} notify={push} />
           <DirectionSettingsCard notify={push} />
+          <ProjectMemoryPanel notify={push} />
           <AgentLibraryPanel notify={push} />
           <WorkflowPresetPanel endpoints={endpoints} notify={push} />
           {endpointError && (
@@ -79,12 +83,14 @@ export function ConfigPanels() {
               </Button>
             </Card>
           )}
-          <EndpointPanel
-            endpoints={endpoints}
-            agents={agents}
-            notify={push}
-            onChanged={refreshEndpoints}
-          />
+          <div id="endpoint-management" className="scroll-mt-5">
+            <EndpointPanel
+              endpoints={endpoints}
+              agents={agents}
+              notify={push}
+              onChanged={refreshEndpoints}
+            />
+          </div>
           <PromptBundlePanel notify={push} />
         </div>
       )}

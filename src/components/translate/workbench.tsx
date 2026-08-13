@@ -28,7 +28,7 @@ export function Workbench() {
       <PageHeader
         overline="Workbench"
         title="工作台"
-        description="粘贴原文，多名翻译 Agent 并行产出；统筹管道经审查、筛选、编排、组装四阶段合成最终译文。"
+        description="面向高难文本的多方案翻译决策台：独立候选、分歧审议、证据化取舍与可回溯修改。"
       />
 
       {/* 三栏响应式骨架：移动端单列，lg 起 7/5 双列两行 */}

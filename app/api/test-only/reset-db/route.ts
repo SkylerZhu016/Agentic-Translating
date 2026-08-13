@@ -31,8 +31,17 @@ import { waitForVNextRunsToSettle } from '@/src/lib/orchestration/vnext-runner'
 // not leak between E2E cases. FK enforcement is OFF during deletion, but order
 // is kept logical.
 const DOMAIN_TABLES = [
+  'project_idempotency_records',
+  'session_project_contexts',
+  'project_snapshot_entries',
+  'project_memory_suggestions',
+  'project_snapshots',
+  'project_resource_revisions',
+  'project_resources',
+  'translation_projects',
   'batch_items',
   'batch_jobs',
+  'llm_call_records',
   'text_patches',
   'agent_invocations',
   'run_events',
@@ -61,6 +70,8 @@ const DOMAIN_TABLES = [
   'config_preset_coordinator',
   'config_preset_agents',
   'config_presets',
+  'endpoint_capability_profiles',
+  'onboarding_state',
   'endpoints',
 ] as const
 
@@ -89,6 +100,13 @@ export async function POST(_req: NextRequest) {
 
     // Disable FK enforcement during bulk delete to avoid ordering pitfalls,
     // then re-enable. WAL + foreign_keys pragma is restored below.
+    const previousUserVersion = Number(
+      db.pragma('user_version', { simple: true }),
+    )
+    // Migration 0009 protects audit rows from direct deletion. This private
+    // connection flag is recognized only while the non-production reset route
+    // performs a complete, FK-safe test cleanup.
+    db.pragma('user_version = 9009')
     db.pragma('foreign_keys = OFF')
     try {
       for (const table of DOMAIN_TABLES) {
@@ -96,6 +114,7 @@ export async function POST(_req: NextRequest) {
       }
     } finally {
       db.pragma('foreign_keys = ON')
+      db.pragma(`user_version = ${previousUserVersion}`)
     }
 
     // Re-seed built-in prompts, direction catalog, drafts and settings.

@@ -1,6 +1,6 @@
 {
   "name": "agentic-translating",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "A bidirectional, multi-model translation deliberation and evidence-based editing workspace.",
   "author": "SkylerZhu",
   "license": "MIT",
@@ -17,8 +17,9 @@
     "lint": "next lint",
     "typecheck": "node node_modules/typescript/lib/tsc.js --noEmit",
     "e2e": "npm run build:standalone && playwright test",
-    "build:standalone": "next build && node scripts/prepare-standalone.mjs",
+    "build:standalone": "next build && node scripts/prepare-standalone.mjs && node scripts/verify-release-tree.mjs && node scripts/smoke-standalone.mjs",
     "verify:release-tree": "node scripts/verify-release-tree.mjs",
+    "verify:standalone-smoke": "node scripts/smoke-standalone.mjs",
     "desktop": "electron .",
     "icon:build": "node scripts/generate-icon.mjs",
     "package:win": "node scripts/package-win.mjs",
@@ -58,7 +59,8 @@
     "zod": "^4.4.3"
   },
   "overrides": {
-    "postcss": "^8.5.19",
+    "postcss": "^8.5.26",
+    "nanoid": "^3.3.18",
     "sharp": "^0.35.0"
   },
   "build": {

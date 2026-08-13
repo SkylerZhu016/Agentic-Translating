@@ -22,6 +22,12 @@ import {
 import { encodeSSE } from '@/src/lib/contracts/sse';
 import { InvalidTransitionError } from '@/src/lib/guards';
 import type { ConfigSnapshot } from '@/src/lib/contracts/types';
+import {
+  executionDiagnosticError,
+  logSafeDiagnostic,
+  serializeExecutionDiagnosticError,
+  type ExecutionDiagnosticErrorDto,
+} from '@/src/lib/security/diagnostic-error';
 
 export async function POST(
   request: Request,
@@ -52,9 +58,13 @@ export async function POST(
 
   // ── Guard: snapshot agents ≥ 1 ────────────────────────────────
   const config: ConfigSnapshot = service.snapshotConfig(session.config_snapshot);
-  if (!config.agents || config.agents.length === 0) {
+  const boundAgents = (config.agents ?? []).filter(
+    (agent): agent is typeof agent & { endpoint_id: number } =>
+      agent.endpoint_id !== null,
+  );
+  if (boundAgents.length === 0) {
     return Response.json(
-      { error: 'No translator agents configured in session snapshot' },
+      { error: 'No translator agents are bound in session snapshot' },
       { status: 400 },
     );
   }
@@ -75,7 +85,7 @@ export async function POST(
     ),
   );
 
-  const agents: AgentRuntime[] = config.agents.map((agent) => {
+  const agents: AgentRuntime[] = boundAgents.map((agent) => {
     const endpointConfig =
       endpointById.get(agent.endpoint_id) ?? config.endpoint;
     if (!endpointConfig) {
@@ -157,6 +167,43 @@ export async function POST(
         }
       };
 
+      const failures = new Map<string, ExecutionDiagnosticErrorDto>();
+      const emittedFailures = new Set<string>();
+      const failureFor = (
+        agentKey: string,
+        cause: unknown,
+      ): ExecutionDiagnosticErrorDto => {
+        const existing = failures.get(agentKey);
+        if (existing) return existing;
+        const diagnostic = executionDiagnosticError(
+          'translation_agent_failed',
+        );
+        failures.set(agentKey, diagnostic);
+        logSafeDiagnostic({
+          scope: 'legacy.translate.agent',
+          diagnosticId: diagnostic.diagnosticId,
+          cause,
+        });
+        return diagnostic;
+      };
+      const sendAgentFailure = (
+        agentKey: string,
+        cause: unknown,
+      ): ExecutionDiagnosticErrorDto => {
+        const diagnostic = failureFor(agentKey, cause);
+        if (!emittedFailures.has(agentKey)) {
+          emittedFailures.add(agentKey);
+          send('agent_error', {
+            agent_key: agentKey,
+            error: diagnostic.message,
+            code: diagnostic.error,
+            message: diagnostic.message,
+            diagnosticId: diagnostic.diagnosticId,
+          });
+        }
+        return diagnostic;
+      };
+
       const callbacks: FanOutCallbacks = {
         onAgentStart(agentKey: string) {
           agentStartTimes.set(agentKey, performance.now());
@@ -166,6 +213,10 @@ export async function POST(
           send('token', { agent_key: agentKey, delta: content });
         },
         onAgentComplete(agentKey: string, result) {
+          if (result.status !== 'complete') {
+            sendAgentFailure(agentKey, { code: 'empty_response' });
+            return;
+          }
           send('agent_complete', {
             agent_key: agentKey,
             status: result.status,
@@ -173,10 +224,7 @@ export async function POST(
           });
         },
         onAgentError(agentKey: string, error: Error) {
-          send('agent_error', {
-            agent_key: agentKey,
-            error: error.message,
-          });
+          sendAgentFailure(agentKey, error);
         },
       };
 
@@ -199,14 +247,20 @@ export async function POST(
             result.status === 'aborted'
               ? ('error' as const)
               : (result.status as 'complete' | 'error');
+          const failure =
+            dbStatus === 'error'
+              ? sendAgentFailure(result.agentKey, {
+                  code: result.status === 'aborted' ? 'aborted' : 'unknown',
+                })
+              : null;
 
           repos.translationResults.update({
             id: trRow.id,
             status: dbStatus,
             output_text: result.content ?? null,
-            error:
-              result.error ??
-              (result.status === 'aborted' ? 'Request was aborted' : null),
+            error: failure
+              ? serializeExecutionDiagnosticError(failure)
+              : null,
             latency_ms: startTime
               ? Math.round(performance.now() - startTime)
               : null,
@@ -230,9 +284,20 @@ export async function POST(
         send('done', {});
         streamController.close();
       } catch (error: unknown) {
-        const message =
-          error instanceof Error ? error.message : String(error);
-        send('error', { error: message });
+        const diagnostic = executionDiagnosticError(
+          'translation_pipeline_failed',
+        );
+        logSafeDiagnostic({
+          scope: 'legacy.translate.pipeline',
+          diagnosticId: diagnostic.diagnosticId,
+          cause: error,
+        });
+        send('error', {
+          error: diagnostic.message,
+          code: diagnostic.error,
+          message: diagnostic.message,
+          diagnosticId: diagnostic.diagnosticId,
+        });
 
         // Update all results to error for untracked agents
         for (const agent of agents) {
@@ -245,7 +310,7 @@ export async function POST(
               id: trRow.id,
               status: 'error',
               output_text: null,
-              error: 'Fan-out pipeline failed',
+              error: serializeExecutionDiagnosticError(diagnostic),
               latency_ms: null,
               attempt: trRow.attempt,
             });

@@ -23,6 +23,7 @@ import type {
 } from '@/src/lib/contracts/vnext'
 import type { TranslationEvidenceReport } from '@/src/lib/evidence/checker'
 import { parseSemanticAgentOutput } from '@/src/lib/protocol/semantic-output'
+import type { SessionProjectContext } from '@/src/lib/contracts/projects'
 
 // ── Public types ────────────────────────────────────────────────
 
@@ -64,6 +65,21 @@ export interface StartTranslationInput {
   constraints: TranslationConstraints
   presetRevisionId?: string | null
   promptBundleRevisionId?: string | null
+  projectId?: string | null
+}
+
+export interface RestoredTranslationState {
+  sourceText: string
+  taskBrief: string
+  reviewMode: ReviewMode
+  selectedPresetRevisionId: string | null
+  promptBundleRevisionId: string | null
+  constraints: TranslationConstraints
+  allowedAgentVariantIds: string[]
+  selectedProjectId: string | null
+  projectSnapshotId: string | null
+  projectTokenEstimate: number | null
+  projectApprovedResourceCount: number | null
 }
 
 interface RestorableInvocation {
@@ -405,6 +421,7 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
     if (!response.ok) throw new Error('无法恢复历史会话')
     const payload = await response.json() as {
       session: SessionRow
+      projectContext?: SessionProjectContext | null
       invocations?: RestorableInvocation[]
       invocationChains?: Array<{
         rootInvocationId: string
@@ -537,7 +554,16 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
       constraints: snapshot?.constraints ?? {},
       allowedAgentVariantIds:
         snapshot?.agentVariantSnapshots?.map((variant) => variant.id) ?? [],
-    }
+      selectedProjectId:
+        payload.projectContext?.projectId ?? snapshot?.projectId ?? null,
+      projectSnapshotId:
+        payload.projectContext?.projectSnapshotId ??
+        snapshot?.projectSnapshotId ??
+        null,
+      projectTokenEstimate: payload.projectContext?.tokenEstimate ?? null,
+      projectApprovedResourceCount:
+        payload.projectContext?.resourceRevisionIds.length ?? null,
+    } satisfies RestoredTranslationState
   }, [applyEvent])
 
   // ── 主流程：创建会话 → 触发翻译 SSE ────────────────────────────
@@ -773,6 +799,7 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
   return {
     configStatus,
     phase,
+    sessionId,
     cards,
     langPair,
     globalError,

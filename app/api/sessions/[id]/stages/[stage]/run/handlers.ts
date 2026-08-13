@@ -24,6 +24,12 @@ import { encodeSSE } from '@/src/lib/contracts/sse'
 import type { Stage, StageOutput, TranslationResult } from '@/src/lib/contracts/types'
 import type { SessionContext, StageRunResult } from '@/src/lib/orchestration/pipeline'
 import { decryptSecret } from '@/src/lib/security/secrets'
+import {
+  executionDiagnosticError,
+  logSafeDiagnostic,
+  serializeExecutionDiagnosticError,
+  type ExecutionDiagnosticErrorDto,
+} from '@/src/lib/security/diagnostic-error'
 
 // =============================================================================
 // Constants
@@ -358,6 +364,32 @@ export function createHandlers(db: Database.Database) {
     const stream = new ReadableStream({
       async start(controller) {
         let stageResult: StageRunResult | null = null
+        let stageFailure: ExecutionDiagnosticErrorDto | null = null
+        let failureEmitted = false
+        const failureFor = (cause: unknown): ExecutionDiagnosticErrorDto => {
+          if (stageFailure) return stageFailure
+          stageFailure = executionDiagnosticError('stage_execution_failed')
+          logSafeDiagnostic({
+            scope: 'legacy.stage.execute',
+            diagnosticId: stageFailure.diagnosticId,
+            cause,
+          })
+          return stageFailure
+        }
+        const emitFailure = (cause: unknown): ExecutionDiagnosticErrorDto => {
+          const diagnostic = failureFor(cause)
+          if (!failureEmitted) {
+            failureEmitted = true
+            sseStream(controller, 'stage_error', {
+              stage,
+              error: diagnostic.message,
+              code: diagnostic.error,
+              message: diagnostic.message,
+              diagnosticId: diagnostic.diagnosticId,
+            })
+          }
+          return diagnostic
+        }
 
         try {
           sseStream(controller, 'stage_start', { stage })
@@ -377,11 +409,8 @@ export function createHandlers(db: Database.Database) {
               onStageComplete(_s, _result) {
                 // Handled after runStage returns
               },
-              onError(s, error) {
-                sseStream(controller, 'stage_error', {
-                  stage: s,
-                  error: error.message,
-                })
+              onError(_s, error) {
+                emitFailure(error)
               },
               onAssembled(_finalText) {
                 // Handled in persistence below
@@ -390,8 +419,7 @@ export function createHandlers(db: Database.Database) {
             chatCompletion,
           )
         } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err)
-          sseStream(controller, 'stage_error', { stage, error: msg })
+          emitFailure(err)
         }
 
         // ── 10. Persist result ────────────────────────────────────
@@ -414,6 +442,11 @@ export function createHandlers(db: Database.Database) {
           const upsertStatus: StageOutput['status'] = stageResult.ok
             ? 'complete'
             : 'failed'
+          const persistedFailure = stageResult.ok
+            ? null
+            : serializeExecutionDiagnosticError(
+                emitFailure({ code: stageResult.code }),
+              )
 
           if (currentRow) {
             repos.stageOutputs.update({
@@ -421,7 +454,7 @@ export function createHandlers(db: Database.Database) {
               status: upsertStatus,
               prompt_used: promptUsedText,
               raw_output: stageResult.raw_text || null,
-              error: stageResult.ok ? null : stageResult.detail || null,
+              error: persistedFailure,
             })
           } else {
             repos.stageOutputs.insert({
@@ -430,7 +463,7 @@ export function createHandlers(db: Database.Database) {
               status: upsertStatus,
               prompt_used: promptUsedText,
               raw_output: stageResult.raw_text || null,
-              error: stageResult.ok ? null : stageResult.detail || null,
+              error: persistedFailure,
             })
           }
 
@@ -482,11 +515,20 @@ export function createHandlers(db: Database.Database) {
               raw_text: stageResult.raw_text,
             })
           } else {
-            // Emit appropriate error event
-            sseStream(controller, 'stage_error', {
-              stage,
-              code: stageResult.code,
-              detail: stageResult.detail,
+            emitFailure({ code: stageResult.code })
+          }
+        } else if (stageFailure) {
+          const currentRow = repos.stageOutputs.getBySessionAndStage(
+            sessionId,
+            stage,
+          )
+          if (currentRow) {
+            repos.stageOutputs.update({
+              id: currentRow.id,
+              status: 'failed',
+              prompt_used: promptUsedText,
+              raw_output: null,
+              error: serializeExecutionDiagnosticError(stageFailure),
             })
           }
         }

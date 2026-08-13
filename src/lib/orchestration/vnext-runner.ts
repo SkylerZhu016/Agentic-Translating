@@ -13,8 +13,9 @@ import {
   LLMError,
   type ChatCompletionRequest,
   type ChatCompletionResponse,
+  type LLMStreamEvent,
 } from '../llm/client'
-import { runFanOut, type AgentRuntime } from './fanout'
+import { runFanOut, type AgentRuntime, type LLMCaller } from './fanout'
 import { estimateTokens, resolveCompletionTokenBudget } from '../guards/tokens'
 import { detectSystemPromptLeak } from '../guards/prompt-leak'
 import { parseSemanticAgentOutput } from '../protocol/semantic-output'
@@ -34,6 +35,12 @@ import { createVNextRepositories } from '../db/vnext-repositories'
 import { createWorkspaceModelProfilesRepo } from '../db/release-config-repositories'
 import { decryptSecret, encryptSecret } from '../security/secrets'
 import { RETRY_DELAYS_MS } from '../constants'
+import type { LlmCallUsage } from '../contracts/llm-call-records'
+import { createLlmCallRecordsService } from '../services/llm-call-records-service'
+import {
+  appendSessionProjectContext,
+  cloneSessionProjectContext,
+} from '../projects/session-context'
 
 const callAgentsArgsSchema = z.object({
   calls: z.array(z.object({
@@ -96,6 +103,35 @@ interface ResolvedEndpoint {
   chatCompletionsPath: string
   apiKey: string
   contextWindow: number | null
+}
+
+export type VNextLlmOperation =
+  | 'team_selection'
+  | 'context_analysis'
+  | 'poetry_plan'
+  | 'worker'
+  | 'main_draft'
+  | 'stage_review'
+  | 'filter'
+  | 'orchestrate'
+  | 'assemble'
+  | 'submit'
+
+export interface VNextLlmLedgerContext {
+  db: Database.Database
+  sessionId: string
+  runId: string
+  invocationId?: string
+  operation: VNextLlmOperation
+}
+
+type LlmCallRecordsService = ReturnType<typeof createLlmCallRecordsService>
+
+interface LedgerAttempt {
+  service: LlmCallRecordsService
+  recordId: string
+  receivingAttempted: boolean
+  terminal: boolean
 }
 
 const running = new Map<string, Promise<void>>()
@@ -234,7 +270,7 @@ function loadCheckpointOutputs(
            replaces_invocation_id, created_at
     FROM agent_invocations
     WHERE session_id=?
-    ORDER BY created_at, id
+    ORDER BY created_at, rowid
   `).all(session.id) as StoredInvocation[]
   const byId = new Map(rows.map((row) => [row.id, row]))
   const rootOf = (row: StoredInvocation) => {
@@ -390,9 +426,218 @@ function assertContextFits(
   }
 }
 
-async function complete(
+const SAFE_LEDGER_ERROR_CODES = new Set([
+  'auth_error',
+  'rate_limit',
+  'server_error',
+  'timeout',
+  'network',
+  'client_error',
+  'tools_not_supported',
+  'aborted',
+  'incomplete_output',
+  'unknown',
+  'system_prompt_leak',
+])
+
+function providerUsage(
+  usage: ChatCompletionResponse['usage'] | undefined,
+): LlmCallUsage | undefined {
+  if (!usage) return undefined
+  const inputTokens =
+    Number.isInteger(usage.prompt_tokens) && usage.prompt_tokens >= 0
+      ? usage.prompt_tokens
+      : null
+  const outputTokens =
+    Number.isInteger(usage.completion_tokens) && usage.completion_tokens >= 0
+      ? usage.completion_tokens
+      : null
+  if (inputTokens === null && outputTokens === null) return undefined
+  return {
+    source: 'provider',
+    inputTokens,
+    outputTokens,
+    reasoningTokens: null,
+  }
+}
+
+function beginLedgerAttempt(
+  context: VNextLlmLedgerContext | undefined,
   endpoint: ResolvedEndpoint,
   request: ChatCompletionRequest,
+  retryCount: number,
+): LedgerAttempt | null {
+  if (!context) return null
+  try {
+    const service = createLlmCallRecordsService(context.db)
+    const record = service.begin({
+      sessionId: context.sessionId,
+      runId: context.runId,
+      invocationId: context.invocationId,
+      endpointId: endpoint.id,
+      operation: context.operation,
+      requestedModel: request.model,
+      retryCount,
+    })
+    return {
+      service,
+      recordId: record.id,
+      receivingAttempted: false,
+      terminal: false,
+    }
+  } catch {
+    // Accounting is deliberately best-effort and may never mask an LLM result.
+    return null
+  }
+}
+
+function markLedgerReceiving(attempt: LedgerAttempt | null) {
+  if (!attempt || attempt.receivingAttempted || attempt.terminal) return
+  attempt.receivingAttempted = true
+  try {
+    attempt.service.markReceiving(attempt.recordId)
+  } catch {
+    // Keep the provider call alive even if its accounting transition fails.
+  }
+}
+
+function completeLedgerAttempt(
+  attempt: LedgerAttempt | null,
+  usage?: ChatCompletionResponse['usage'],
+) {
+  if (!attempt || attempt.terminal) return
+  attempt.terminal = true
+  try {
+    attempt.service.complete(attempt.recordId, {
+      usage: providerUsage(usage),
+    })
+  } catch {
+    // The model response remains authoritative when accounting is unavailable.
+  }
+}
+
+function ledgerErrorCode(error: unknown): string {
+  if (error instanceof LLMError && SAFE_LEDGER_ERROR_CODES.has(error.code)) {
+    return error.code
+  }
+  return 'llm_call_failed'
+}
+
+function failLedgerAttempt(
+  attempt: LedgerAttempt | null,
+  error: unknown,
+  usage?: ChatCompletionResponse['usage'],
+  overrideCode?: 'empty_response' | 'stream_cancelled',
+) {
+  if (!attempt || attempt.terminal) return
+  attempt.terminal = true
+  const errorCode = overrideCode ?? ledgerErrorCode(error)
+  try {
+    attempt.service.fail(attempt.recordId, {
+      outcome:
+        errorCode === 'aborted' || errorCode === 'stream_cancelled'
+          ? 'cancelled'
+          : 'failed',
+      errorCode,
+      usage: providerUsage(usage),
+    })
+  } catch {
+    // Never replace a provider failure with a secondary accounting failure.
+  }
+}
+
+export async function ledgeredFanOutCall(
+  endpoint: ResolvedEndpoint,
+  request: ChatCompletionRequest,
+  context: VNextLlmLedgerContext,
+  retryCount: number,
+): Promise<ChatCompletionResponse | AsyncIterable<LLMStreamEvent>> {
+  const ledgerAttempt = beginLedgerAttempt(
+    context,
+    endpoint,
+    request,
+    retryCount,
+  )
+  try {
+    const response = await chatCompletion(
+      {
+        baseUrl: endpoint.baseUrl,
+        chatCompletionsPath: endpoint.chatCompletionsPath,
+        apiKey: endpoint.apiKey,
+      },
+      {
+        ...request,
+        onActivity() {
+          markLedgerReceiving(ledgerAttempt)
+          request.onActivity?.()
+        },
+      },
+    )
+    if (!isAsyncIterable(response)) {
+      markLedgerReceiving(ledgerAttempt)
+      if (!response.content.trim() && !response.toolCalls?.length) {
+        failLedgerAttempt(
+          ledgerAttempt,
+          new Error('empty_response'),
+          response.usage,
+          'empty_response',
+        )
+      } else {
+        completeLedgerAttempt(ledgerAttempt, response.usage)
+      }
+      return response
+    }
+
+    return (async function* ledgeredStream() {
+      let content = ''
+      let usage: ChatCompletionResponse['usage']
+      let ended = false
+      try {
+        for await (const event of response) {
+          markLedgerReceiving(ledgerAttempt)
+          if (event.type === 'text') content += event.content
+          if (event.type === 'done') {
+            content = event.content || content
+            usage = event.usage ?? usage
+          }
+          yield event
+        }
+        ended = true
+        if (content.trim()) {
+          completeLedgerAttempt(ledgerAttempt, usage)
+        } else {
+          failLedgerAttempt(
+            ledgerAttempt,
+            new Error('empty_response'),
+            usage,
+            'empty_response',
+          )
+        }
+      } catch (error) {
+        ended = true
+        failLedgerAttempt(ledgerAttempt, error, usage)
+        throw error
+      } finally {
+        if (!ended) {
+          failLedgerAttempt(
+            ledgerAttempt,
+            new Error('stream_cancelled'),
+            usage,
+            'stream_cancelled',
+          )
+        }
+      }
+    })()
+  } catch (error) {
+    failLedgerAttempt(ledgerAttempt, error)
+    throw error
+  }
+}
+
+export async function complete(
+  endpoint: ResolvedEndpoint,
+  request: ChatCompletionRequest,
+  ledgerContext?: VNextLlmLedgerContext,
 ): Promise<ChatCompletionResponse> {
   assertContextFits(endpoint, request.messages, request.tools)
   const systemPrompt = request.messages
@@ -411,6 +656,7 @@ async function complete(
   }
   const maxAttempts = RETRY_DELAYS_MS.length + 1
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    let ledgerAttempt: LedgerAttempt | null = null
     try {
       const maxTokens = resolveCompletionTokenBudget(
         request.messages.map((message) => message.content).join('\n') +
@@ -418,38 +664,93 @@ async function complete(
         endpoint.contextWindow,
         request.maxTokens,
       )
+      ledgerAttempt = beginLedgerAttempt(
+        ledgerContext,
+        endpoint,
+        request,
+        attempt,
+      )
       const response = await chatCompletion(
         {
           baseUrl: endpoint.baseUrl,
           chatCompletionsPath: endpoint.chatCompletionsPath,
           apiKey: endpoint.apiKey,
         },
-        { ...request, maxTokens, stream: request.stream ?? true },
+        {
+          ...request,
+          maxTokens,
+          stream: request.stream ?? true,
+          onActivity() {
+            markLedgerReceiving(ledgerAttempt)
+            request.onActivity?.()
+          },
+        },
       )
       if (!isAsyncIterable(response)) {
+        markLedgerReceiving(ledgerAttempt)
         assertVisibleOutputIntegrity(response.content)
-        if (!response.content?.trim() && attempt < maxAttempts - 1) {
-          await new Promise((resolve) => setTimeout(resolve, RETRY_DELAYS_MS[attempt]))
-          continue
+        if (!response.content?.trim() && !response.toolCalls?.length) {
+          failLedgerAttempt(
+            ledgerAttempt,
+            new Error('empty_response'),
+            response.usage,
+            'empty_response',
+          )
+          if (attempt < maxAttempts - 1) {
+            await new Promise((resolve) =>
+              setTimeout(resolve, RETRY_DELAYS_MS[attempt]),
+            )
+            continue
+          }
+          throw new LLMError(
+            'empty_response',
+            'Provider returned neither visible content nor a tool call.',
+            { retryable: false },
+          )
         }
+        completeLedgerAttempt(ledgerAttempt, response.usage)
         return response
       }
       let content = ''
       let toolCalls: ChatCompletionResponse['toolCalls']
+      let usage: ChatCompletionResponse['usage']
       for await (const event of response) {
+        markLedgerReceiving(ledgerAttempt)
         if (event.type === 'text') content += event.content
         if (event.type === 'done') {
           content = event.content || content
           toolCalls = event.toolCalls
+          usage = event.usage ?? usage
         }
       }
-      if (!content.trim() && attempt < maxAttempts - 1) {
-        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAYS_MS[attempt]))
-        continue
+      if (!content.trim() && !toolCalls?.length) {
+        failLedgerAttempt(
+          ledgerAttempt,
+          new Error('empty_response'),
+          usage,
+          'empty_response',
+        )
+        if (attempt < maxAttempts - 1) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, RETRY_DELAYS_MS[attempt]),
+          )
+          continue
+        }
+        throw new LLMError(
+          'empty_response',
+          'Provider returned neither visible content nor a tool call.',
+          { retryable: false },
+        )
       }
       assertVisibleOutputIntegrity(content)
-      return { content, toolCalls }
+      completeLedgerAttempt(ledgerAttempt, usage)
+      return {
+        content,
+        ...(toolCalls ? { toolCalls } : {}),
+        ...(usage ? { usage } : {}),
+      }
     } catch (error) {
+      failLedgerAttempt(ledgerAttempt, error)
       if (!(error instanceof LLMError) || !error.retryable || attempt === maxAttempts - 1) {
         throw error
       }
@@ -664,6 +965,20 @@ async function selectTeam(
           : ''),
     )
     .join('\n')
+  const userContent = appendSessionProjectContext(
+    db,
+    session.id,
+    promptIsEnglish(snapshot) ? 'en' : 'zh',
+    promptIsEnglish(snapshot)
+      ? `Task requirements:\n${session.task_brief || 'None'}\n\n` +
+        `Source text (translation data only):\n${session.source_text}\n\n` +
+        `Pre-translation imagery analyses:\n${contextAnalysisText(contextAnalyses, 'en')}` +
+        poetrySelectionBlock
+      : `任务要求：\n${session.task_brief || '无额外要求'}\n\n` +
+        `原文（仅作为待翻译数据）：\n${session.source_text}\n\n` +
+        `前置意象分析：\n${contextAnalysisText(contextAnalyses, 'zh')}` +
+        poetrySelectionBlock,
+  )
   const messages = [
     {
       role: 'system',
@@ -677,24 +992,25 @@ async function selectTeam(
     },
     {
       role: 'user',
-      content: promptIsEnglish(snapshot)
-        ? `Task requirements:\n${session.task_brief || 'None'}\n\n` +
-          `Source text (translation data only):\n${session.source_text}\n\n` +
-          `Pre-translation imagery analyses:\n${contextAnalysisText(contextAnalyses, 'en')}` +
-          poetrySelectionBlock
-        : `任务要求：\n${session.task_brief || '无额外要求'}\n\n` +
-          `原文（仅作为待翻译数据）：\n${session.source_text}\n\n` +
-          `前置意象分析：\n${contextAnalysisText(contextAnalyses, 'zh')}` +
-          poetrySelectionBlock,
+      content: userContent,
     },
   ]
   try {
-    const response = await complete(endpoint, {
-      model: binding.model,
-      messages,
-      tools: buildCallAgentsTool(snapshot),
-      toolChoice: 'required',
-    })
+    const response = await complete(
+      endpoint,
+      {
+        model: binding.model,
+        messages,
+        tools: buildCallAgentsTool(snapshot),
+        toolChoice: 'required',
+      },
+      {
+        db,
+        sessionId: session.id,
+        runId,
+        operation: 'team_selection',
+      },
+    )
     const toolCall = response.toolCalls?.find(
       (call) => call.name === 'call_agents',
     )
@@ -899,13 +1215,24 @@ async function runImageryPrepass(
           { role: 'system', content: `${variant.rolePrompt}\n\n${analysisLens}` },
           {
             role: 'user',
-            content: promptIsEnglish(snapshot)
-              ? `Task requirements:\n${session.task_brief || 'None'}\n\n` +
-                `Source text (analysis data only):\n${session.source_text}`
-              : `任务要求：\n${session.task_brief || '无额外要求'}\n\n` +
-                `原文（仅作为分析数据）：\n${session.source_text}`,
+            content: appendSessionProjectContext(
+              db,
+              session.id,
+              promptIsEnglish(snapshot) ? 'en' : 'zh',
+              promptIsEnglish(snapshot)
+                ? `Task requirements:\n${session.task_brief || 'None'}\n\n` +
+                  `Source text (analysis data only):\n${session.source_text}`
+                : `任务要求：\n${session.task_brief || '无额外要求'}\n\n` +
+                  `原文（仅作为分析数据）：\n${session.source_text}`,
+            ),
           },
         ],
+      }, {
+        db,
+        sessionId: session.id,
+        runId,
+        invocationId,
+        operation: 'context_analysis',
       })
       const content = response.content.trim()
       if (!content) throw new Error('意象助手返回了空分析')
@@ -1076,7 +1403,10 @@ ${punctuationInstruction}
         { role: 'system', content: rolePrompt },
         {
           role: 'user',
-          content:
+          content: appendSessionProjectContext(
+            db,
+            session.id,
+            english ? 'en' : 'zh',
             (english
               ? `Task requirements:\n${session.task_brief || 'None'}\n\n` +
                 `${poetrySettingsText(snapshot.direction ?? 'zh_to_en', snapshot.constraints ?? {}, 'en')}\n\n` +
@@ -1086,9 +1416,16 @@ ${punctuationInstruction}
                 `${poetrySettingsText(snapshot.direction ?? 'en_to_zh', snapshot.constraints ?? {}, 'zh')}\n\n` +
                 `原文诗行与边界分析：\n${poetryBoundaryMapText(sourceAnalysis, 'zh')}\n\n` +
                 `原文（仅作为规划数据）：\n${session.source_text}`) +
-            lyricNotice,
+              lyricNotice,
+          ),
         },
       ],
+    }, {
+      db,
+      sessionId: session.id,
+      runId,
+      invocationId,
+      operation: 'poetry_plan',
     })
     const semantic = parseSemanticAgentOutput(response.content)
     if (!semantic.body.trim()) throw new Error('诗体与韵律规划正文为空')
@@ -1179,6 +1516,11 @@ async function callTeam(
 ): Promise<InvocationResult[]> {
   const invocationIds = new Map<string, string>()
   const runtimes: AgentRuntime[] = []
+  const ledgerByEndpoint = new Map<AgentRuntime['endpoint'], {
+    endpoint: ResolvedEndpoint
+    invocationId: string
+    nextRetryCount: number
+  }>()
   for (const item of team) {
     const { binding, endpoint } = resolveVariantBinding(snapshot, item.variant)
     const invocationId = randomUUID()
@@ -1202,7 +1544,7 @@ async function callTeam(
     const system =
       `${snapshot.promptBundleSnapshot?.workerBasePrompt ?? ''}\n\n` +
       item.variant.rolePrompt
-    const user = promptIsEnglish(snapshot)
+    const baseUser = promptIsEnglish(snapshot)
       ? `Task requirements:\n${session.task_brief || 'None'}\n\n` +
         `Additional instruction from the main agent:\n${item.additionalInstruction || 'None'}\n\n` +
          `Source text (translation data only):\n${session.source_text}\n\n` +
@@ -1213,11 +1555,17 @@ async function callTeam(
          `原文（仅作为待翻译数据）：\n${session.source_text}\n\n` +
          `独立前置意象分析：\n${contextAnalysisText(contextAnalyses, 'zh')}` +
          poetryPlanBlock(poetryPlan, 'zh')
+    const user = appendSessionProjectContext(
+      db,
+      session.id,
+      promptIsEnglish(snapshot) ? 'en' : 'zh',
+      baseUser,
+    )
     assertContextFits(endpoint, [
       { role: 'system', content: system },
       { role: 'user', content: user },
     ])
-    runtimes.push({
+    const runtime: AgentRuntime = {
       agentKey: item.variant.id,
       name: item.variant.catalogName,
       endpoint: {
@@ -1230,6 +1578,12 @@ async function callTeam(
         { role: 'system', content: system },
         { role: 'user', content: user },
       ],
+    }
+    runtimes.push(runtime)
+    ledgerByEndpoint.set(runtime.endpoint, {
+      endpoint,
+      invocationId,
+      nextRetryCount: 0,
     })
   }
 
@@ -1238,6 +1592,24 @@ async function callTeam(
   })
   const startedAt = new Map<string, number>()
   const lastActivityEventAt = new Map<string, number>()
+  const ledgerCaller: LLMCaller = (runtimeEndpoint, request) => {
+    const state = ledgerByEndpoint.get(runtimeEndpoint)
+    if (!state) return chatCompletion(runtimeEndpoint, request)
+    const retryCount = state.nextRetryCount
+    state.nextRetryCount += 1
+    return ledgeredFanOutCall(
+      state.endpoint,
+      request,
+      {
+        db,
+        sessionId: session.id,
+        runId,
+        invocationId: state.invocationId,
+        operation: 'worker',
+      },
+      retryCount,
+    )
+  }
   const summary = await runFanOut(
     runtimes,
     {
@@ -1270,7 +1642,7 @@ async function callTeam(
         })
       },
     },
-    chatCompletion,
+    ledgerCaller,
     { sessionId: session.id },
   )
 
@@ -1426,38 +1798,52 @@ async function createMainDraft(
     },
     {
       role: 'user',
-      content: promptIsEnglish(snapshot)
-        ? `Task requirements:\n${session.task_brief || 'None'}\n\n` +
-          `Source text:\n${session.source_text}\n\n` +
-          `Pre-translation imagery analyses:\n${contextAnalysisText(contextAnalyses, 'en')}` +
-          poetryPlanBlock(poetryPlan, 'en') +
-          `\n\n` +
-          `Candidate bodies:\n${candidateContext(
-            candidates,
-            'en',
-            candidateAnnotationMode(snapshot),
-          )}`
-        : `任务要求：\n${session.task_brief || '无额外要求'}\n\n` +
-          `原文：\n${session.source_text}\n\n` +
-          `前置意象分析：\n${contextAnalysisText(contextAnalyses, 'zh')}` +
-          poetryPlanBlock(poetryPlan, 'zh') +
-          `\n\n` +
-          `候选正文：\n${candidateContext(
-            candidates,
-            'zh',
-            candidateAnnotationMode(snapshot),
-          )}`,
+      content: appendSessionProjectContext(
+        db,
+        session.id,
+        promptIsEnglish(snapshot) ? 'en' : 'zh',
+        promptIsEnglish(snapshot)
+          ? `Task requirements:\n${session.task_brief || 'None'}\n\n` +
+            `Source text:\n${session.source_text}\n\n` +
+            `Pre-translation imagery analyses:\n${contextAnalysisText(contextAnalyses, 'en')}` +
+            poetryPlanBlock(poetryPlan, 'en') +
+            `\n\n` +
+            `Candidate bodies:\n${candidateContext(
+              candidates,
+              'en',
+              candidateAnnotationMode(snapshot),
+            )}`
+          : `任务要求：\n${session.task_brief || '无额外要求'}\n\n` +
+            `原文：\n${session.source_text}\n\n` +
+            `前置意象分析：\n${contextAnalysisText(contextAnalyses, 'zh')}` +
+            poetryPlanBlock(poetryPlan, 'zh') +
+            `\n\n` +
+            `候选正文：\n${candidateContext(
+              candidates,
+              'zh',
+              candidateAnnotationMode(snapshot),
+            )}`,
+      ),
     },
   ]
-  const response = await complete(endpoint, {
-    model: binding.model,
-    messages,
-    tools: [writeDraftTool],
-    toolChoice: {
-      type: 'function',
-      function: { name: 'write_draft' },
+  const response = await complete(
+    endpoint,
+    {
+      model: binding.model,
+      messages,
+      tools: [writeDraftTool],
+      toolChoice: {
+        type: 'function',
+        function: { name: 'write_draft' },
+      },
     },
-  })
+    {
+      db,
+      sessionId: session.id,
+      runId,
+      operation: 'main_draft',
+    },
+  )
   assertRunMayContinue(db, session.id)
   const toolCall = response.toolCalls?.find((call) => call.name === 'write_draft')
   let args: unknown = null
@@ -1554,6 +1940,11 @@ async function createMainDraft(
       type: 'function',
       function: { name: 'submit_final' },
     },
+  }, {
+    db,
+    sessionId: session.id,
+    runId,
+    operation: 'submit',
   })
   assertRunMayContinue(db, session.id)
   const submitCall = submitResponse.toolCalls?.find(
@@ -1689,6 +2080,11 @@ async function runIndependentReviewAudits(params: {
           },
           { role: 'user', content: params.userContent },
         ],
+      }, {
+        db,
+        sessionId: session.id,
+        runId,
+        operation: 'stage_review',
       })
       const semantic = parseSemanticAgentOutput(response.content)
       assertRunMayContinue(db, session.id)
@@ -1798,7 +2194,11 @@ async function runFourStages(
         },
         {
           role: 'user',
-          content: bundle.promptLanguage === 'en'
+          content: appendSessionProjectContext(
+            db,
+            session.id,
+            bundle.promptLanguage,
+            bundle.promptLanguage === 'en'
             ? `Task requirements:\n${session.task_brief || 'None'}\n\n` +
               `Source text:\n${session.source_text}\n\n` +
               `Independent pre-translation evidence (advisory; source and brief remain authoritative):\n${contextAnalysisText(contextAnalyses, 'en')}\n\n` +
@@ -1825,6 +2225,7 @@ async function runFourStages(
               `前置阶段正文：\n${Object.entries(prior)
                 .map(([name, body]) => `${name}:\n${body}`)
                 .join('\n\n')}`,
+          ),
         },
         ],
       }
@@ -1839,7 +2240,12 @@ async function runFourStages(
             promptLanguage: bundle.promptLanguage,
             userContent: request.messages[1].content,
           })
-        : parseSemanticAgentOutput((await complete(endpoint, request)).content)
+        : parseSemanticAgentOutput((await complete(endpoint, request, {
+            db,
+            sessionId: session.id,
+            runId,
+            operation: stage,
+          })).content)
       assertRunMayContinue(db, session.id)
       if (!semantic.body.trim()) throw new Error(`${stage} 阶段正文为空`)
       db.prepare(`
@@ -2368,24 +2774,27 @@ export function restartVNextSession(
   }) | undefined
   if (!source) throw new Error('session_not_found')
   const newSessionId = randomUUID()
-  db.prepare(`
-    INSERT INTO sessions
-      (id, source_text, source_lang, target_lang, state, config_snapshot,
-       direction, task_brief, review_mode, preset_revision_id,
-       client_request_id)
-    VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?)
-  `).run(
-    newSessionId,
-    source.source_text,
-    source.source_lang,
-    source.target_lang,
-    source.config_snapshot,
-    source.direction ?? 'en_to_zh',
-    source.task_brief ?? '',
-    source.review_mode ?? 'main_editor',
-    source.preset_revision_id ?? null,
-    randomUUID(),
-  )
+  db.transaction(() => {
+    db.prepare(`
+      INSERT INTO sessions
+        (id, source_text, source_lang, target_lang, state, config_snapshot,
+         direction, task_brief, review_mode, preset_revision_id,
+         client_request_id)
+      VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?)
+    `).run(
+      newSessionId,
+      source.source_text,
+      source.source_lang,
+      source.target_lang,
+      source.config_snapshot,
+      source.direction ?? 'en_to_zh',
+      source.task_brief ?? '',
+      source.review_mode ?? 'main_editor',
+      source.preset_revision_id ?? null,
+      randomUUID(),
+    )
+    cloneSessionProjectContext(db, sessionId, newSessionId)
+  })()
   const { runId } = startVNextRun(db, newSessionId)
   return { sessionId: newSessionId, runId }
 }
@@ -2512,7 +2921,7 @@ async function executeInvocationRetry(
     ? variant.rolePrompt
     : `${snapshot.promptBundleSnapshot?.workerBasePrompt ?? ''}\n\n` +
       variant.rolePrompt
-  const user = isContextAnalysis
+  const baseUser = isContextAnalysis
     ? promptIsEnglish(snapshot)
       ? `Task requirements:\n${session.task_brief || 'None'}\n\n` +
         `Source text (analysis data only):\n${session.source_text}`
@@ -2542,6 +2951,12 @@ async function executeInvocationRetry(
       : `任务要求：\n${session.task_brief || '无额外要求'}\n\n` +
         `主 Agent 补充要求：\n${source.additional_instruction || '无'}\n\n` +
         `原文（仅作为待翻译数据）：\n${session.source_text}`
+  const user = appendSessionProjectContext(
+    db,
+    session.id,
+    promptIsEnglish(snapshot) ? 'en' : 'zh',
+    baseUser,
+  )
   try {
     db.prepare(`
       UPDATE orchestration_runs
@@ -2565,6 +2980,27 @@ async function executeInvocationRetry(
     })
     const startedAt = performance.now()
     let lastActivityEventAt = 0
+    let nextRetryCount = 0
+    const ledgerCaller: LLMCaller = (_runtimeEndpoint, request) => {
+      const retryCount = nextRetryCount
+      nextRetryCount += 1
+      return ledgeredFanOutCall(
+        endpoint,
+        request,
+        {
+          db,
+          sessionId: session.id,
+          runId,
+          invocationId: newInvocationId,
+          operation: isContextAnalysis
+            ? 'context_analysis'
+            : isPoetryPlan
+              ? 'poetry_plan'
+              : 'worker',
+        },
+        retryCount,
+      )
+    }
     const summary = await runFanOut(
       [{
         agentKey: variant.id,
@@ -2597,7 +3033,7 @@ async function executeInvocationRetry(
           })
         },
       },
-      chatCompletion,
+      ledgerCaller,
       { sessionId: session.id },
     )
     const result = summary.results[0]
@@ -2875,7 +3311,7 @@ export function startVNextFailedRetries(
         SELECT 1 FROM agent_invocations newer
         WHERE newer.replaces_invocation_id=i.id
       )
-    ORDER BY i.created_at, i.id
+    ORDER BY i.created_at, i.rowid
   `).all(sessionId) as Array<{ id: string }>
   if (!failed.length) throw new Error('no_failed_invocations')
   return failed.map((item) =>

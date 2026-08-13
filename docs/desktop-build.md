@@ -29,6 +29,8 @@ npm run build:standalone
 npm run package:win
 ```
 
+`build:standalone` 只清理可再生成的 `.next/standalone` 目录：它会移除 tracing 意外带入的 `.omo/`、`data/`、`迭代文档/` 等本地路径，再自动执行发行树扫描。扫描通过后，构建会使用独立临时数据目录和随机密钥，在系统分配的非 3000 端口真实启动 standalone，并等待 `/api/health/ready` 成功。发现数据库、运行记录、研发文档、疑似凭据或缺失运行时依赖时，构建直接失败；现有服务和工作区中的真实数据目录不会被停止、删除或改写。
+
 `package:win` 会在不含空格的隔离暂存目录中为 Electron ABI 重新构建 `better-sqlite3`，准备 standalone 资源，并由 electron-builder 同时生成 NSIS 和便携版目标。打包前会从 `app/icon.svg` 独立生成包含 16 到 256 px 多尺寸图层的 Windows ICO，无需依赖外部图标转换工具。短暂的下载或构建故障最多重试三次；确定性错误仍会以非零状态退出。该命令不会覆盖开发环境中 Node.js 使用的原生模块。
 
 当前 Windows x64 产物位于 `dist-electron/`：

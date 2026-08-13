@@ -12,45 +12,14 @@ export async function register() {
     const { getDb } = await import('@/src/lib/db')
     const { migrate } = await import('@/src/lib/db/migrate')
     const { seed } = await import('@/src/lib/db/seed')
+    const { recoverInterruptedWork } = await import(
+      '@/src/lib/db/startup-recovery'
+    )
     const db = getDb()
     migrate(db)
     seed(db)
 
-    // A local process cannot resume an in-flight HTTP model call after restart.
-    // Preserve completed events and mark only unfinished nodes as interrupted.
-    db.transaction(() => {
-      db.prepare(`
-        UPDATE orchestration_runs
-        SET status='interrupted',
-            error=COALESCE(error, 'Application stopped while the run was active'),
-            completed_at=datetime('now')
-        WHERE status IN ('queued','running')
-      `).run()
-      db.prepare(`
-        UPDATE agent_invocations
-        SET status='interrupted',
-            error=COALESCE(error, 'Application stopped while the call was active'),
-            updated_at=datetime('now')
-        WHERE status IN ('queued','running')
-      `).run()
-      db.prepare(`
-        UPDATE sessions
-        SET state=CASE
-              WHEN state='coordinating' THEN 'translated'
-              ELSE 'draft'
-            END,
-            updated_at=datetime('now')
-        WHERE state IN ('translating','coordinating')
-          AND final_version_id IS NULL
-      `).run()
-      db.prepare(`
-        UPDATE batch_jobs
-        SET status='paused',
-            error=COALESCE(error, 'Application restarted; resume the batch to continue'),
-            updated_at=datetime('now')
-        WHERE status='running'
-      `).run()
-    })()
+    recoverInterruptedWork(db)
 
     // Ensure run artifacts directory exists
     const dataDir = process.env.AGENTIC_DATA_DIR

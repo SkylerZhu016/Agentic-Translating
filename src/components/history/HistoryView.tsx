@@ -6,6 +6,7 @@ import { PageHeader } from '@/src/components/shell/PageHeader'
 import { useDirection } from '@/src/components/direction/DirectionProvider'
 import type { BuiltinDirection } from '@/src/lib/contracts/vnext'
 import { BatchManager } from './BatchManager'
+import { UsageOverviewCard } from './UsageOverviewCard'
 
 interface HistorySession {
   id: string
@@ -84,7 +85,8 @@ export function HistoryView() {
         title="历史"
         description="会话、候选来源、审议过程、工具事件与文本版本均可恢复和导出。"
       />
-      <div className="mx-auto max-w-5xl">
+      <div className="mx-auto max-w-5xl space-y-4">
+        <UsageOverviewCard />
         <Card
           overline="Sessions"
           title="历史会话"

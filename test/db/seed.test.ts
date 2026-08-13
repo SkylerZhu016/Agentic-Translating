@@ -4,6 +4,10 @@ import { migrate } from '../../src/lib/db/migrate'
 import { seed } from '../../src/lib/db/seed'
 import { createRepositories } from '../../src/lib/db/repositories'
 import type { PromptTemplateRow } from '../../src/lib/db/repositories'
+import {
+  BUILTIN_AGENT_ARCHETYPES,
+  BUILTIN_AGENT_VARIANTS,
+} from '../../src/lib/prompts/bidirectional'
 
 function createMemoryDb(): Database.Database {
   const db = new Database(':memory:')
@@ -111,6 +115,46 @@ describe('seed — built-in prompt templates', () => {
       'SELECT * FROM agent_direction_variants WHERE id=?',
     ).get(variantId)
     expect(after).toEqual(before)
+  })
+
+  it('does not claim or overwrite user rows that collide with official IDs', () => {
+    const officialArchetype = BUILTIN_AGENT_ARCHETYPES[0]
+    const officialVariant = BUILTIN_AGENT_VARIANTS.find(
+      (variant) => variant.archetypeId === officialArchetype.id,
+    )!
+    db.prepare(`
+      INSERT INTO agent_archetypes
+        (id, slug, display_name_zh, category, tags_json, is_builtin)
+      VALUES (?, ?, '用户碰撞 Agent', 'expression', '["private"]', 0)
+    `).run(officialArchetype.id, 'user-owned-collision')
+    db.prepare(`
+      INSERT INTO agent_direction_variants
+        (id, archetype_id, direction, catalog_name, catalog_description,
+         role_prompt, prompt_language, prompt_version, enabled,
+         endpoint_override_id, model_override, sort_order)
+      VALUES (?, ?, ?, '用户碰撞变体', '不得被官方 seed 修改',
+              '用户私有提示词', ?, 99, 0, NULL, 'private-model', 999)
+    `).run(
+      officialVariant.id,
+      officialArchetype.id,
+      officialVariant.direction,
+      officialVariant.promptLanguage,
+    )
+    const beforeArchetype = db.prepare(
+      'SELECT * FROM agent_archetypes WHERE id=?',
+    ).get(officialArchetype.id)
+    const beforeVariant = db.prepare(
+      'SELECT * FROM agent_direction_variants WHERE id=?',
+    ).get(officialVariant.id)
+
+    seed(db)
+
+    expect(db.prepare(
+      'SELECT * FROM agent_archetypes WHERE id=?',
+    ).get(officialArchetype.id)).toEqual(beforeArchetype)
+    expect(db.prepare(
+      'SELECT * FROM agent_direction_variants WHERE id=?',
+    ).get(officialVariant.id)).toEqual(beforeVariant)
   })
 
   it('covers all 5 required kinds', () => {

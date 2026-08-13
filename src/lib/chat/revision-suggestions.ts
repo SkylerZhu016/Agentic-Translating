@@ -1,9 +1,12 @@
 import {
-  chatCompletion,
   isAsyncIterable,
   type ChatCompletionResponse,
 } from '../llm/client'
 import { semanticBody } from '../protocol/semantic-output'
+import {
+  ledgeredChatCompletion,
+  type BestEffortLlmCallContext,
+} from '../services/llm-call-ledger'
 
 export const REVISION_SUGGESTION_MAX_TOKENS = 131_072
 
@@ -19,6 +22,7 @@ export interface RevisionSuggestionInput {
   taskBrief: string
   currentTranslation: string
   userRequest: string
+  ledger?: Omit<BestEffortLlmCallContext, 'operation' | 'retryCount'>
 }
 
 export interface RevisionSuggestionResult {
@@ -30,16 +34,30 @@ export interface RevisionSuggestionResult {
 async function completeText(
   input: RevisionSuggestionInput,
   messages: Array<{ role: string; content: string }>,
+  operation:
+    | 'chat_revision_suggestion_target_reader'
+    | 'chat_revision_suggestion_bilingual'
+    | 'chat_revision_suggestion_arbiter',
 ): Promise<string> {
   // 必须使用流式：推理模型在首个可见 token 前可能静默数十秒，
   // 非流式连接会被上游网关读超时切断（504），而推理仍继续计费。
   // 流式期间思维链分片由客户端丢弃，但分片活动会保持连接存活。
-  const response = await chatCompletion(input.endpoint, {
-    model: input.model,
-    messages,
-    stream: true,
-    maxTokens: REVISION_SUGGESTION_MAX_TOKENS,
-  })
+  const response = await ledgeredChatCompletion(
+    input.endpoint,
+    {
+      model: input.model,
+      messages,
+      stream: true,
+      maxTokens: REVISION_SUGGESTION_MAX_TOKENS,
+    },
+    input.ledger
+      ? {
+          ...input.ledger,
+          operation,
+          retryCount: 0,
+        }
+      : undefined,
+  )
   if (!isAsyncIterable(response)) {
     // 部分上游会以非流式 JSON 应答流式请求（客户端自动降级）。
     return semanticBody((response as ChatCompletionResponse).content).trim()
@@ -164,12 +182,21 @@ export async function generateRevisionSuggestion(
   input: RevisionSuggestionInput,
 ): Promise<RevisionSuggestionResult> {
   const [targetReaderReport, bilingualReport] = await Promise.all([
-    completeText(input, targetReaderMessages(input)),
-    completeText(input, bilingualMessages(input)),
+    completeText(
+      input,
+      targetReaderMessages(input),
+      'chat_revision_suggestion_target_reader',
+    ),
+    completeText(
+      input,
+      bilingualMessages(input),
+      'chat_revision_suggestion_bilingual',
+    ),
   ])
   const feedback = await completeText(
     input,
     arbiterMessages(input, targetReaderReport, bilingualReport),
+    'chat_revision_suggestion_arbiter',
   )
   return { feedback, targetReaderReport, bilingualReport }
 }

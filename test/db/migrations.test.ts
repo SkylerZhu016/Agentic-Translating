@@ -75,15 +75,36 @@ describe('DB Migrations — In-Memory DB', () => {
     expect(tables).toContain('prompt_bundle_families')
     expect(tables).toContain('prompt_bundle_revisions')
     expect(tables).toContain('session_run_controls')
-    expect(tables.length).toBeGreaterThanOrEqual(24)
+    // Migrations 0009-0014 add project memory, onboarding capability profiles,
+    // the privacy-safe LLM call ledger, draft binding, idempotency hashes, and
+    // non-destructive legacy Agent endpoint removal.
+    expect(tables).toContain('translation_projects')
+    expect(tables).toContain('project_resources')
+    expect(tables).toContain('project_resource_revisions')
+    expect(tables).toContain('project_snapshots')
+    expect(tables).toContain('project_snapshot_entries')
+    expect(tables).toContain('project_memory_suggestions')
+    expect(tables).toContain('session_project_contexts')
+    expect(tables).toContain('project_idempotency_records')
+    expect(tables).toContain('session_idempotency_records')
+    expect(tables).toContain('onboarding_state')
+    expect(tables).toContain('endpoint_capability_profiles')
+    expect(tables).toContain('llm_call_records')
+    const draftColumns = db.prepare(
+      "PRAGMA table_info('workspace_drafts')",
+    ).all() as Array<{ name: string }>
+    expect(draftColumns.map((column) => column.name)).toContain(
+      'selected_project_id',
+    )
+    expect(tables.length).toBeGreaterThanOrEqual(35)
   })
 
   it('is idempotent — 3x migrate → 1 version', () => {
     migrate(db); migrate(db); migrate(db)
     const version = (db.prepare('SELECT MAX(version) as v FROM migrations').get() as { v: number | null }).v
-    expect(version).toBe(8)
+    expect(version).toBe(14)
     const count = (db.prepare('SELECT COUNT(*) as c FROM migrations').get() as { c: number }).c
-    expect(count).toBe(8)
+    expect(count).toBe(14)
   })
 
   it('creates config_presets and child tables (migration 0002)', () => {
@@ -186,7 +207,7 @@ describe('DB Migrations — File DB', () => {
     db2.pragma('foreign_keys = ON')
     migrate(db2)
     const v = (db2.prepare('SELECT MAX(version) as v FROM migrations').get() as { v: number | null }).v
-    expect(v).toBe(8)
+    expect(v).toBe(14)
     expect(listTables(db2)).toContain('endpoints')
     expect(listTables(db2)).toContain('config_presets')
     expect(listTables(db2)).toContain('agent_direction_variants')

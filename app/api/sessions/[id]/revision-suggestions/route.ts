@@ -4,6 +4,11 @@ import { getDb } from '@/src/lib/db'
 import { createRepositories } from '@/src/lib/db/repositories'
 import { resolveChatConfig } from '../chat/handlers'
 import { generateRevisionSuggestion } from '@/src/lib/chat/revision-suggestions'
+import { sessionProjectContextBlock } from '@/src/lib/projects/session-context'
+import {
+  logSafeDiagnostic,
+  publicDiagnosticError,
+} from '@/src/lib/security/diagnostic-error'
 
 function inferRevisionPromptLanguage(params: {
   snapshot: ConfigSnapshot
@@ -61,6 +66,14 @@ export async function POST(
     return NextResponse.json({ error: 'no_chat_config' }, { status: 400 })
   }
 
+  const promptLanguage = inferRevisionPromptLanguage({
+    snapshot,
+    direction: session.direction,
+    targetLang: session.target_lang,
+  })
+  const projectContext = sessionProjectContextBlock(db, id, promptLanguage)
+  const taskBrief = session.task_brief ?? ''
+
   try {
     const result = await generateRevisionSuggestion({
       endpoint: {
@@ -69,22 +82,31 @@ export async function POST(
         apiKey: config.apiKey,
       },
       model: config.model,
-      promptLanguage: inferRevisionPromptLanguage({
-        snapshot,
-        direction: session.direction,
-        targetLang: session.target_lang,
-      }),
+      promptLanguage,
       sourceText: session.source_text,
-      taskBrief: session.task_brief ?? '',
+      taskBrief: projectContext
+        ? `${taskBrief || (promptLanguage === 'zh' ? '无' : 'None')}\n\n${projectContext}`
+        : taskBrief,
       currentTranslation: latest.text,
       userRequest: body.message.trim(),
+      ledger: {
+        db,
+        sessionId: id,
+        endpointId: config.endpointId,
+      },
     })
     return NextResponse.json(result)
   } catch (error) {
+    const diagnostic = publicDiagnosticError('suggestion_failed')
+    logSafeDiagnostic({
+      scope: 'chat.revision_suggestion',
+      diagnosticId: diagnostic.diagnosticId,
+      cause: error,
+    })
     return NextResponse.json(
       {
-        error: 'suggestion_failed',
-        message: error instanceof Error ? error.message : '生成修订建议失败',
+        ...diagnostic,
+        message: '生成修订建议失败，请稍后重试。',
       },
       { status: 502 },
     )

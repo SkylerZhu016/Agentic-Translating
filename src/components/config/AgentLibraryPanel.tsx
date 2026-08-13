@@ -157,8 +157,14 @@ function VariantEditor({
         body?: string
         annotation?: string | null
         error?: string
+        diagnosticId?: string
       }
-      if (!response.ok) throw new Error(payload.error ?? '测试调用失败')
+      if (!response.ok) {
+        const diagnostic = payload.diagnosticId
+          ? `（诊断 ID：${payload.diagnosticId}）`
+          : ''
+        throw new Error(`${payload.error ?? '测试调用失败'}${diagnostic}`)
+      }
       setResult({
         raw: payload.raw,
         body: payload.body ?? '',
@@ -574,8 +580,14 @@ export function AgentLibraryPanel({ notify }: { notify: NotifyFn }) {
         body?: string
         annotation?: string | null
         error?: string
+        diagnosticId?: string
       }
-      if (!response.ok) throw new Error(payload.error ?? '独立测试失败')
+      if (!response.ok) {
+        const diagnostic = payload.diagnosticId
+          ? `（诊断 ID：${payload.diagnosticId}）`
+          : ''
+        throw new Error(`${payload.error ?? '独立测试失败'}${diagnostic}`)
+      }
       setPreviewResult({
         raw: payload.raw,
         body: payload.body ?? '',

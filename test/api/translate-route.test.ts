@@ -11,6 +11,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import Database from 'better-sqlite3';
+import { NextRequest } from 'next/server';
 import fs from 'fs';
 import path from 'path';
 import { createRepositories, type Repositories } from '../../src/lib/db/repositories';
@@ -41,6 +42,7 @@ vi.mock('@/src/lib/db', () => ({
 // ── Route handlers (imported AFTER mocks are set up) ───────────────────────
 import { POST as translatePost } from '../../app/api/sessions/[id]/translate/route';
 import { POST as retryPost } from '../../app/api/sessions/[id]/agents/[agentKey]/retry/route';
+import { createHandlers as createSessionDetailHandlers } from '../../app/api/sessions/[id]/handlers';
 
 // ── Migration SQL ──────────────────────────────────────────────────────────
 const MIGRATION_SQL_0001 = fs.readFileSync(
@@ -164,6 +166,7 @@ describe('Translate SSE Route (fanout + retry)', () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     db.close();
   });
 
@@ -248,12 +251,15 @@ describe('Translate SSE Route (fanout + retry)', () => {
     });
 
     it('handles 1 mock error agent with status=error, rest complete', async () => {
+      const sensitiveProviderError =
+        'Bearer sk-provider-secret https://provider.private/v1 leaked Hello world and Translate from prompt';
+      const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
       let callCount = 0;
       mockChatCompletion.mockImplementation(async () => {
         callCount++;
         if (callCount === 2) {
           // Second agent errors (non-retryable)
-          throw new Error('Mock agent failure');
+          throw new Error(sensitiveProviderError);
         }
         return mockStream('success text');
       });
@@ -276,7 +282,16 @@ describe('Translate SSE Route (fanout + retry)', () => {
 
       const errors = eventsByName(events, 'agent_error');
       expect(errors).toHaveLength(1);
-      expect((errors[0] as any).error).toBe('Mock agent failure');
+      expect(errors[0]).toEqual(
+        expect.objectContaining({
+          code: 'translation_agent_failed',
+          error: '翻译 Agent 调用失败，请稍后重试。',
+          message: '翻译 Agent 调用失败，请稍后重试。',
+          diagnosticId: expect.stringMatching(
+            /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+          ),
+        }),
+      );
 
       // fanout_complete shows 1 succeeded, 1 failed
       const fanout = eventsByName(events, 'fanout_complete')[0] as any;
@@ -294,7 +309,46 @@ describe('Translate SSE Route (fanout + retry)', () => {
 
       const beta = dbResults.find((r) => r.agent_key === 'agent-beta')!;
       expect(beta.status).toBe('error');
-      expect(beta.error).toBe('Mock agent failure');
+      const persistedError = JSON.parse(beta.error!) as Record<string, string>;
+      expect(persistedError).toEqual({
+        error: 'translation_agent_failed',
+        message: '翻译 Agent 调用失败，请稍后重试。',
+        diagnosticId: (errors[0] as any).diagnosticId,
+      });
+
+      const detailResponse = await createSessionDetailHandlers(db).GET(
+        new NextRequest(`http://localhost/api/sessions/${session.id}`),
+        { params: Promise.resolve({ id: session.id }) },
+      );
+      const detail = await detailResponse.json();
+      const publicBeta = detail.results.find(
+        (result: { agent_key: string }) => result.agent_key === 'agent-beta',
+      );
+      expect(publicBeta).toEqual(
+        expect.objectContaining({
+          error: persistedError.message,
+          errorDiagnostic: persistedError,
+        }),
+      );
+
+      const exposed = JSON.stringify({
+        events,
+        dbResults,
+        detail: { results: detail.results, stages: detail.stages },
+        diagnostics: consoleError.mock.calls,
+      });
+      for (const sensitive of [
+        sensitiveProviderError,
+        'sk-provider-secret',
+        'https://provider.private/v1',
+        'Hello world',
+        'Translate from prompt',
+      ]) {
+        expect(exposed).not.toContain(sensitive);
+      }
+      expect(JSON.stringify(consoleError.mock.calls)).toContain(
+        persistedError.diagnosticId,
+      );
     });
 
     it('returns 404 for non-existent session', async () => {
@@ -562,8 +616,11 @@ describe('Translate SSE Route (fanout + retry)', () => {
     });
 
     it('handles retry agent error and updates DB as error', async () => {
+      const sensitiveProviderError =
+        'sk-retry-secret https://retry.private/v1 leaked Hello world and translator prompt';
+      const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
       mockChatCompletion.mockImplementation(async () => {
-        throw new Error('Retry agent failure');
+        throw new Error(sensitiveProviderError);
       });
 
       const session = service.createSession(DEF_SOURCE);
@@ -577,7 +634,16 @@ describe('Translate SSE Route (fanout + retry)', () => {
       // agent_error emitted
       const errors = eventsByName(events, 'agent_error');
       expect(errors).toHaveLength(1);
-      expect((errors[0] as any).error).toBe('Retry agent failure');
+      expect(errors[0]).toEqual(
+        expect.objectContaining({
+          code: 'translation_retry_failed',
+          error: '翻译 Agent 重试失败，请稍后重试。',
+          message: '翻译 Agent 重试失败，请稍后重试。',
+          diagnosticId: expect.stringMatching(
+            /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+          ),
+        }),
+      );
 
       // fanout_complete: succeeded=0, failed=1
       const fanout = eventsByName(events, 'fanout_complete')[0] as any;
@@ -588,7 +654,29 @@ describe('Translate SSE Route (fanout + retry)', () => {
       const results = repos.translationResults.listBySession(session.id);
       const alpha = results.find((r) => r.agent_key === 'agent-alpha')!;
       expect(alpha.status).toBe('error');
-      expect(alpha.error).toBe('Retry agent failure');
+      const persistedError = JSON.parse(alpha.error!) as Record<string, string>;
+      expect(persistedError).toEqual({
+        error: 'translation_retry_failed',
+        message: '翻译 Agent 重试失败，请稍后重试。',
+        diagnosticId: (errors[0] as any).diagnosticId,
+      });
+      const exposed = JSON.stringify({
+        events,
+        results,
+        diagnostics: consoleError.mock.calls,
+      });
+      for (const sensitive of [
+        sensitiveProviderError,
+        'sk-retry-secret',
+        'https://retry.private/v1',
+        'Hello world',
+        'translator prompt',
+      ]) {
+        expect(exposed).not.toContain(sensitive);
+      }
+      expect(JSON.stringify(consoleError.mock.calls)).toContain(
+        persistedError.diagnosticId,
+      );
     });
   });
 });

@@ -498,25 +498,27 @@ describe('Presets Repository', () => {
     })
 
     it('is transactional: a mid-apply failure rolls back global changes', () => {
-      // We trigger a mid-transaction failure by giving one preset agent a
-      // null endpoint_id. The schema for translator_agents requires
-      // `endpoint_id INTEGER NOT NULL`, so the INSERT will fail with a
-      // NOT NULL constraint violation. Because applyToGlobalConfig wraps
-      // all writes in db.transaction(() => { ... })(), the prior
-      // `DELETE FROM translator_agents` must be rolled back.
+      // Trigger a deterministic insert failure after the transaction has
+      // deleted the current live configuration. Nullable endpoint bindings
+      // are now valid and are skipped, so a NOT NULL violation is no longer
+      // an appropriate rollback fixture.
       const id = repos.presets.create('Txn Fail')
-      // Agent 'Bad' has endpoint_id=null — will fail at INSERT time because
-      // translator_agents.endpoint_id is NOT NULL.
-      // The preset's own schema allows null endpoint_id (FK is nullable),
-      // so saveContent succeeds.
       repos.presets.saveContent(
         id,
         [
-          { name: 'Bad', endpoint_id: null, model: 'm', prompt_override: null, sort_order: 0 },
+          { name: 'Bad', endpoint_id: 1, model: 'm', prompt_override: null, sort_order: 0 },
         ],
         null,
         [],
       )
+      db.exec(`
+        CREATE TRIGGER fail_bad_translator_agent_insert
+        BEFORE INSERT ON translator_agents
+        WHEN NEW.name = 'Bad'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced transactional test failure');
+        END;
+      `)
 
       // Seed an existing global agent that should survive rollback
       repos.translatorAgents.insert({
@@ -525,7 +527,7 @@ describe('Presets Repository', () => {
       })
       expect(repos.translatorAgents.list()).toHaveLength(1)
 
-      // The apply must throw because of the NOT NULL violation
+      // The apply must throw after its initial delete.
       expect(() => repos.presets.applyToGlobalConfig(id, [])).toThrow()
 
       // After rollback: the original 'survivor' agent must still exist

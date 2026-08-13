@@ -10,13 +10,16 @@
 // - fanout_complete 后汇总条（成功 N / 失败 M），全部完成提示可进统筹
 // ---------------------------------------------------------------------------
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'next/navigation'
 import { Button, Card, Modal, Spinner, Textarea, Toast } from '@/src/components/ui'
 import { TID } from '@/src/lib/testids'
 import { estimateTokens } from '@/src/lib/guards/tokens'
 import { AgentStreamCard } from './agent-stream-card'
-import { useTranslation } from './use-translation'
+import {
+  useTranslation,
+  type RestoredTranslationState,
+} from './use-translation'
 import { useDirection } from '@/src/components/direction/DirectionProvider'
 import { onSessionChanged } from '@/src/components/coordinator/session-bus'
 import type {
@@ -27,6 +30,10 @@ import type {
   WorkflowPreset,
   WorkflowPresetRevision,
 } from '@/src/lib/contracts/vnext'
+import type {
+  ProjectSnapshot,
+  TranslationProject,
+} from '@/src/lib/contracts/projects'
 
 export interface TranslatePanelProps {
   className?: string
@@ -36,6 +43,14 @@ export interface TranslatePanelProps {
 
 const emptyBox =
   'rounded-sm border border-dashed border-line-2 bg-paper/60 px-4 py-6 text-center text-sm leading-6 text-ink-4'
+
+interface ProjectSelectionSummary {
+  name: string
+  snapshotRevisionNo: number | null
+  approvedResourceCount: number
+  tokenEstimate: number
+  frozen: boolean
+}
 
 const DEFAULT_POETRY_CONSTRAINTS: TranslationConstraints = {
   poetryMode: 'auto',
@@ -74,6 +89,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
   const {
     configStatus,
     phase,
+    sessionId,
     cards,
     langPair,
     globalError,
@@ -99,6 +115,14 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
 
   const [source, setSource] = useState('')
   const [taskBrief, setTaskBrief] = useState('')
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null)
+  const [projects, setProjects] = useState<TranslationProject[]>([])
+  const [selectedProjectSummary, setSelectedProjectSummary] =
+    useState<ProjectSelectionSummary | null>(null)
+  const [projectSummaryLoading, setProjectSummaryLoading] = useState(false)
+  const [projectSummaryError, setProjectSummaryError] = useState<string | null>(null)
+  const [restoredProjectState, setRestoredProjectState] =
+    useState<RestoredTranslationState | null>(null)
   const [reviewMode, setReviewMode] = useState<ReviewMode>('main_editor')
   const [constraints, setConstraints] = useState<TranslationConstraints>(
     DEFAULT_POETRY_CONSTRAINTS,
@@ -122,6 +146,9 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     useState<WorkspaceDraft | null>(null)
   const [retryAllOpen, setRetryAllOpen] = useState(false)
   const [timelineOpen, setTimelineOpen] = useState(false)
+  const pendingDraftSavesRef = useRef<Set<Promise<void>>>(new Set())
+  const draftSaveTimerRef = useRef<number | null>(null)
+  const submitPreparingRef = useRef(false)
   const routeSessionId = searchParams.get('session')
   const freshWorkspace = searchParams.get('fresh') === '1' && !routeSessionId
 
@@ -164,12 +191,28 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
             }>>
           : [],
       ),
-    ]).then(([draftOrSession, catalogue, presetList, bundleList]) => {
+      fetch(`/api/projects?status=active&direction=${direction}`).then(
+        (response) =>
+          response.ok
+            ? response.json() as Promise<{ projects: TranslationProject[] }>
+            : { projects: [] },
+      ),
+    ]).then(([
+      draftOrSession,
+      catalogue,
+      presetList,
+      bundleList,
+      projectList,
+    ]) => {
       if (cancelled) return
       const variants = catalogue?.variants ?? []
       setCatalog(variants)
       setPresets(presetList)
       setPromptBundles(bundleList)
+      setProjects(projectList.projects)
+      const restoredState = activeSessionId
+        ? (draftOrSession as RestoredTranslationState | null)
+        : null
       const savedDraft =
         !activeSessionId && draftOrSession
           ? (draftOrSession as WorkspaceDraft)
@@ -179,6 +222,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
           (
             savedDraft.sourceText.trim() ||
             savedDraft.taskBrief.trim() ||
+            savedDraft.selectedProjectId ||
             savedDraft.selectedPresetRevisionId ||
             hasNonDefaultPoetryConstraints(savedDraft.constraints)
           ),
@@ -187,9 +231,16 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
         freshWorkspace && hasSavedDraft ? savedDraft : null,
       )
       const visibleState =
-        freshWorkspace && !activeSessionId ? null : draftOrSession
+        freshWorkspace && !activeSessionId
+          ? null
+          : (draftOrSession as
+              | WorkspaceDraft
+              | RestoredTranslationState
+              | null)
       setSource(visibleState?.sourceText ?? '')
       setTaskBrief(visibleState?.taskBrief ?? '')
+      setSelectedProjectId(visibleState?.selectedProjectId ?? null)
+      setRestoredProjectState(restoredState)
       setReviewMode(visibleState?.reviewMode ?? 'main_editor')
       setConstraints({
         ...DEFAULT_POETRY_CONSTRAINTS,
@@ -247,6 +298,80 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     }
   }, [direction, freshWorkspace, restoreSession, routeSessionId])
 
+  useEffect(() => {
+    if (sessionId) setRestoredSession(true)
+  }, [sessionId])
+
+  useEffect(() => {
+    if (!selectedProjectId) {
+      setSelectedProjectSummary(null)
+      setProjectSummaryLoading(false)
+      setProjectSummaryError(null)
+      return
+    }
+
+    let cancelled = false
+    const frozenState =
+      restoredProjectState?.selectedProjectId === selectedProjectId
+        ? restoredProjectState
+        : null
+    setProjectSummaryLoading(true)
+    setProjectSummaryError(null)
+    void Promise.all([
+      fetch(`/api/projects/${encodeURIComponent(selectedProjectId)}`).then(
+        async (response) => {
+          if (!response.ok) throw new Error('无法读取项目详情')
+          return response.json() as Promise<{
+            project: TranslationProject
+            resourceCount: number
+            tokenEstimate: number
+          }>
+        },
+      ),
+      fetch(
+        `/api/projects/${encodeURIComponent(selectedProjectId)}/snapshots`,
+      ).then(async (response) => {
+        if (!response.ok) throw new Error('无法读取项目快照')
+        return response.json() as Promise<{ snapshots: ProjectSnapshot[] }>
+      }),
+    ])
+      .then(([detail, snapshotPayload]) => {
+        if (cancelled) return
+        const snapshotId =
+          frozenState?.projectSnapshotId ?? detail.project.currentSnapshotId
+        const snapshot = snapshotPayload.snapshots.find(
+          (item) => item.id === snapshotId,
+        )
+        setSelectedProjectSummary({
+          name: detail.project.name,
+          snapshotRevisionNo:
+            snapshot?.revisionNo ?? detail.project.currentSnapshotRevisionNo,
+          approvedResourceCount:
+            frozenState?.projectApprovedResourceCount ??
+            detail.resourceCount,
+          tokenEstimate:
+            frozenState?.projectTokenEstimate ??
+            detail.tokenEstimate,
+          frozen: Boolean(frozenState),
+        })
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setSelectedProjectSummary(null)
+          setProjectSummaryError(
+            error instanceof Error ? error.message : '无法读取项目摘要',
+          )
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setProjectSummaryLoading(false)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [restoredProjectState, selectedProjectId])
+
   const removeFreshMarker = useCallback(() => {
     const url = new URL(window.location.href)
     url.searchParams.delete('fresh')
@@ -257,6 +382,8 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     if (!recoverableDraft) return
     setSource(recoverableDraft.sourceText)
     setTaskBrief(recoverableDraft.taskBrief)
+    setSelectedProjectId(recoverableDraft.selectedProjectId)
+    setRestoredProjectState(null)
     setReviewMode(recoverableDraft.reviewMode)
     setConstraints({
       ...DEFAULT_POETRY_CONSTRAINTS,
@@ -271,14 +398,15 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     removeFreshMarker()
   }, [recoverableDraft, removeFreshMarker])
 
-  const flushDraft = useCallback(async () => {
-    if (!draftLoaded || busy || restoredSession) return
-    await fetch(`/api/workspace-drafts/${direction}`, {
+  const flushDraft = useCallback((): Promise<void> => {
+    if (!draftLoaded || busy || restoredSession) return Promise.resolve()
+    const request = fetch(`/api/workspace-drafts/${direction}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         sourceText: source,
         taskBrief,
+        selectedProjectId,
         selectedPresetRevisionId,
         promptBundleRevisionId,
         allowedAgentVariantIds,
@@ -286,6 +414,13 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
         constraints,
       }),
     })
+      .then(() => undefined)
+      .catch(() => undefined)
+    pendingDraftSavesRef.current.add(request)
+    void request.then(() => {
+      pendingDraftSavesRef.current.delete(request)
+    })
+    return request
   }, [
     allowedAgentVariantIds,
     busy,
@@ -295,6 +430,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     reviewMode,
     constraints,
     restoredSession,
+    selectedProjectId,
     selectedPresetRevisionId,
     source,
     taskBrief,
@@ -307,6 +443,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
         (
           source.trim().length > 0 ||
           taskBrief.trim().length > 0 ||
+          selectedProjectId != null ||
           selectedPresetRevisionId != null ||
           promptBundleRevisionId != null ||
           reviewMode !== 'main_editor' ||
@@ -329,6 +466,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     restoredSession,
     reviewMode,
     constraints,
+    selectedProjectId,
     selectedPresetRevisionId,
     source,
     taskBrief,
@@ -336,8 +474,19 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
 
   useEffect(() => {
     if (!draftLoaded || busy || restoredSession) return
-    const timer = window.setTimeout(() => void flushDraft(), 500)
-    return () => window.clearTimeout(timer)
+    const timer = window.setTimeout(() => {
+      if (draftSaveTimerRef.current === timer) {
+        draftSaveTimerRef.current = null
+      }
+      void flushDraft()
+    }, 500)
+    draftSaveTimerRef.current = timer
+    return () => {
+      window.clearTimeout(timer)
+      if (draftSaveTimerRef.current === timer) {
+        draftSaveTimerRef.current = null
+      }
+    }
   }, [
     allowedAgentVariantIds,
     busy,
@@ -368,23 +517,35 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     ).length >= 2 &&
     configStatus === 'ready'
 
-  const handleTranslate = () => {
-    if (!canSubmit) return
-    void start({
-      sourceText: source,
-      direction,
-      taskBrief,
-      reviewMode,
-      constraints,
-      allowedAgentVariantIds: Array.from(new Set([
-        ...allowedAgentVariantIds,
-        ...catalog
-          .filter((variant) => variant.archetypeId === 'cultural-context')
-          .map((variant) => variant.id),
-      ])),
-      presetRevisionId: selectedPresetRevisionId,
-      promptBundleRevisionId,
-    })
+  const handleTranslate = async () => {
+    if (!canSubmit || submitPreparingRef.current) return
+    submitPreparingRef.current = true
+    if (draftSaveTimerRef.current != null) {
+      window.clearTimeout(draftSaveTimerRef.current)
+      draftSaveTimerRef.current = null
+    }
+    try {
+      await Promise.all([...pendingDraftSavesRef.current])
+      await flushDraft()
+      await start({
+        sourceText: source,
+        direction,
+        taskBrief,
+        reviewMode,
+        constraints,
+        allowedAgentVariantIds: Array.from(new Set([
+          ...allowedAgentVariantIds,
+          ...catalog
+            .filter((variant) => variant.archetypeId === 'cultural-context')
+            .map((variant) => variant.id),
+        ])),
+        presetRevisionId: selectedPresetRevisionId,
+        promptBundleRevisionId,
+        projectId: selectedProjectId,
+      })
+    } finally {
+      submitPreparingRef.current = false
+    }
   }
 
   const loadPreset = async (presetId: string) => {
@@ -429,13 +590,13 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
   // ── 未配置端点 / Agent → 引导 CTA ─────────────────────────────
   if (configStatus === 'unconfigured') {
     return (
-      <Card overline="Get Started" title="从一次配置开始" className={className}>
+      <Card overline="Get Started" title="先完成一次兼容性检查" className={className}>
         <div className="flex min-h-56 flex-col items-center justify-center gap-3 text-center">
           <p className="max-w-md text-sm leading-6 text-ink-3">
-            工作台需要至少一个可用端点与一名翻译 Agent，才能开始并行翻译与统筹。
+            兼容性医生会检查模型列表、普通响应、流式、Token 用量与工具调用，并生成一份属于你的可编辑工作流。
           </p>
-          <Button href="/config" className="mt-2">
-            请先配置端点与翻译 Agent
+          <Button href="/config#compatibility-doctor" className="mt-2">
+            打开首次运行向导
           </Button>
         </div>
       </Card>
@@ -496,6 +657,56 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
           翻译要求与 Agent 范围
         </summary>
         <div className="space-y-4 border-t border-line px-3 py-3">
+          <div className="rounded-sm border border-line bg-paper/70 px-3 py-3">
+            <label className="block text-xs font-medium text-ink-3">
+              项目档案
+              <select
+                aria-label="项目档案"
+                value={selectedProjectId ?? ''}
+                disabled={busy || restoredSession}
+                onChange={(event) => {
+                  setSelectedProjectId(event.target.value || null)
+                  setRestoredProjectState(null)
+                }}
+                className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-2 text-sm text-ink"
+              >
+                <option value="">不使用项目档案</option>
+                {selectedProjectId &&
+                  !projects.some((project) => project.id === selectedProjectId) && (
+                    <option value={selectedProjectId}>
+                      {selectedProjectSummary?.name ?? '已冻结或不可用的项目'}
+                    </option>
+                  )}
+                {projects.map((project) => (
+                  <option key={project.id} value={project.id}>
+                    {project.name} · snapshot r
+                    {project.currentSnapshotRevisionNo ?? '—'}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {projectSummaryLoading && (
+              <p className="mt-2 text-xs text-ink-4">正在读取项目快照…</p>
+            )}
+            {projectSummaryError && (
+              <p className="mt-2 text-xs text-ink-3">
+                {projectSummaryError}
+              </p>
+            )}
+            {selectedProjectSummary && !projectSummaryLoading && (
+              <p className="mt-2 text-xs leading-5 text-ink-2">
+                {selectedProjectSummary.name} · snapshot r
+                {selectedProjectSummary.snapshotRevisionNo ?? '—'} · 已批准资源{' '}
+                {selectedProjectSummary.approvedResourceCount} 条 · 预计约{' '}
+                {selectedProjectSummary.tokenEstimate.toLocaleString('zh-CN')} token
+              </p>
+            )}
+            <p className="mt-2 text-xs leading-5 text-ink-4">
+              {selectedProjectSummary?.frozen
+                ? '本会话已冻结创建时的项目快照；之后对项目的修改不会影响本会话。'
+                : '创建会话时会冻结当时的项目快照；之后修改项目不会影响本会话。'}
+            </p>
+          </div>
           <label className="block text-xs font-medium text-ink-3">
             当前预设
             <select

@@ -66,6 +66,67 @@ test.describe('AC16 — endpoint configuration', () => {
     expect(endpoints.length).toBeGreaterThanOrEqual(1)
     expect(endpoints.some((e: { base_url: string }) => e.base_url === MOCK_URL)).toBe(true)
   })
+
+  test('unbinds references before deleting an endpoint without deleting the Agent', async ({
+    page,
+  }) => {
+    const endpointResponse = await page.request.post('/api/endpoints', {
+      data: {
+        name: 'Disposable provider',
+        base_url: MOCK_URL,
+        api_key: 'sk-mock',
+      },
+    })
+    expect(endpointResponse.status()).toBe(201)
+    const endpoint = (await endpointResponse.json()) as { id: number }
+
+    const agentResponse = await page.request.post('/api/agents', {
+      data: {
+        name: 'Agent that must survive',
+        endpoint_id: endpoint.id,
+        model: 'mock-model',
+        prompt_override: 'keep this user prompt',
+        sort_order: 17,
+      },
+    })
+    expect(agentResponse.status()).toBe(201)
+
+    await page.goto('/config')
+    const endpointRow = byTid(page, TID.endpoint.listItem).filter({
+      hasText: 'Disposable provider',
+    })
+    await expect(endpointRow).toBeVisible()
+    await endpointRow.getByRole('button', { name: '删除' }).click()
+
+    const dialog = page.getByRole('dialog')
+    await expect(dialog).toContainText('系统会先检查全部引用')
+    await dialog.getByRole('button', { name: '检查引用并删除' }).click()
+
+    await expect(dialog).toContainText('确认解绑并删除')
+    await expect(dialog).toContainText('旧版翻译 Agent')
+    await expect(dialog).toContainText('Agent、提示词、模型名称、预设内容和冻结历史都会保留')
+    await dialog.getByRole('button', { name: '解绑所有引用并删除' }).click()
+
+    await expect(endpointRow).not.toBeVisible()
+    const agentsResponse = await page.request.get('/api/agents')
+    expect(agentsResponse.status()).toBe(200)
+    const agents = (await agentsResponse.json()) as Array<{
+      name: string
+      endpoint_id: number | null
+      model: string
+      prompt_override: string | null
+      sort_order: number
+    }>
+    expect(agents).toContainEqual(
+      expect.objectContaining({
+        name: 'Agent that must survive',
+        endpoint_id: null,
+        model: 'mock-model',
+        prompt_override: 'keep this user prompt',
+        sort_order: 17,
+      }),
+    )
+  })
 })
 
 test.describe('AC17 — three translator agents', () => {

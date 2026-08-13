@@ -2,7 +2,9 @@
 
 [**中文**](docs/readme_cn.md) | [**English**](#)
 
-A bidirectional translation system for difficult translation tasks. It supports multi-model, multi-perspective deliberation and evidence-based workflows.
+A multi-option translation decision workbench for difficult texts. It supports bidirectional, multi-model deliberation, evidence-based decisions, and reusable project memory.
+
+**Latest release: [v0.1.2](https://github.com/SkylerZhu016/Agentic-Translating/releases/tag/v0.1.2)** — Windows installer and portable executable. Other platforms can build from source. See the [release notes](docs/releases/0.1.2.md).
 
 The key difference from a general-purpose coding agent is not treating translation as just another coding task. Instead, it lets multiple roles work on the same open problem. Disagreements between candidate versions are kept as comparable evidence. The main agent decides which perspectives to call on, how to deliberate and merge them, and produces the final version through traceable text operations.
 
@@ -12,7 +14,11 @@ The key difference from a general-purpose coding agent is not treating translati
 - 10 agent archetypes, each with 2 directional variants: fidelity, naturalness, voice, terminology, culture, long text, formal text, literary, poetry, and dissent.
 - Dynamic teaming and fixed presets coexist. The system keeps at least two successful candidates from different archetypes before forming the first version.
 - Two completion paths: direct editing by the main agent, or the classic four-stage process of review, filter, orchestrate, and assemble.
-- FSBP (Free-form Semantic Boundary Protocol). The final standalone `---` in a document acts as a divider. Content above is the body, content below is annotation. The full original is always archived. Downstream components only inherit the body.
+- A disagreement map aligns candidate bodies by paragraph, sentence, or poetry line and highlights wording, punctuation, number, negation, proper-noun, terminology, and structural differences. It is a deterministic comparison aid, not an automatic verdict on correctness.
+- Project-level translation archives maintain terminology, proper nouns, character voice, style rules, approved decisions, and contextual notes. New entries remain suggestions until a user approves them; approval creates an immutable snapshot that a session can freeze.
+- A first-run guide and endpoint compatibility doctor report model discovery, ordinary chat, genuine streaming, usage reporting, and tool-call results separately. Quick, balanced, and deep workflows are created as normal user-owned preset revisions.
+- A privacy-safe LLM call ledger covers every physical vNext orchestration request and retry, editing chat, the three revision-suggestion lenses, compatibility-doctor chat/stream/tool probes, and standalone Agent tests. It records status, known token usage, first-byte time, and total latency; missing usage remains unknown. Model-list discovery is metadata retrieval and is deliberately not counted as an LLM call.
+- FSBP (Free-form Semantic Boundary Protocol). The final standalone `---` in a document acts as a divider. Content above is the body, content below is annotation, and the full original is always archived. Workflows default to body-only inheritance and may explicitly opt into passing the separated annotation as untrusted supporting material.
 - Tools are exposed in stages: `call_agents`, `write_draft`, `replace_text`, `submit_final`. Each round injects only the tools needed at that point.
 - Versioned edits, Unicode diff comparisons, evidence citations, undo and redo.
 - User preset revision management, history recovery, safe export, and a batch queue supporting up to 100 files.
@@ -30,7 +36,7 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:3000`. On first use, add an OpenAI-compatible endpoint and bind a model on the Configuration page.
+Open `http://localhost:3000`. On first use, the Configuration page guides you through adding an OpenAI-compatible endpoint, checking its actual capabilities, and creating a user-owned workflow. Experienced users can skip the guide and configure each binding directly.
 
 Production mode:
 
@@ -42,10 +48,11 @@ npm start
 ## Workflow
 
 1. Select "English to Chinese" or "Chinese to English" in the top-right corner.
-2. Enter the source text and task requirements in natural language. Choose the allowed agents, preset, and deliberation mode.
+2. Enter the source text and task requirements in natural language. Optionally select a translation project, then choose the allowed agents, preset, and deliberation mode. Approved project resources are frozen for the session; later project edits do not rewrite its context.
 3. In dynamic mode, the main agent invokes 2 to 4 roles suited to the current text. If no valid selection is available, it falls back to the "semantic fidelity plus target language fluency" combination.
 4. The main agent builds the first version from at least two candidates, or runs the fixed four-stage deep deliberation process.
-5. Subsequent edits must go through precise text tools to create patches and new versions. The interface shows before-and-after comparisons, revision reasons, and candidate evidence.
+5. Use the disagreement map to inspect where candidates actually differ. It excludes Agent annotations from comparison and falls back to full-text comparison when reliable alignment is unavailable.
+6. Subsequent edits must go through precise text tools to create patches and new versions. A candidate fragment can be handed to the editing Agent through the existing revision path, preserving before-and-after comparisons, reasons, and evidence.
 
 Switching directions does not convert the current session. The system saves the current draft, then switches to the other direction's workspace draft. Old sessions remain in history. Background tasks are not canceled when the page is closed.
 
@@ -64,8 +71,8 @@ Rules:
 - Only the final standalone separator that equals `---` after trimming whitespace is recognized.
 - Supports both LF and CRLF line endings.
 - The `raw` content is saved and displayed permanently.
-- Downstream components only receive the `body`.
-- The `annotation` is for user reference only.
+- Body-only inheritance is the default. A workflow preset may explicitly choose `body_and_annotation`, which passes the annotation downstream as untrusted supporting material.
+- The `annotation` is always stored separately for inspection. The disagreement map compares only `body`, regardless of that workflow setting.
 - The four-stage process in the product does not require strict JSON.
 
 Configuration APIs, SSE events, and tool parameters use JSON for precise system state control. This is not part of the agent content protocol. See [docs/protocol-spec.en.md](docs/protocol-spec.en.md) for the full specification.
@@ -77,6 +84,13 @@ A preset is a reusable work contract created by the user, not a translation stra
 Batch tasks must select a valid revision. They support UTF-8 encoded `.txt` and `.md` files, 1 to 4 concurrent tasks, pause and resume, retry on failure, path mirroring, BOM and line ending preservation, and web ZIP export. See [docs/preset-and-batch.en.md](docs/preset-and-batch.en.md) for details.
 
 ## Desktop and Self-Hosting
+
+For ordinary Windows users, download one of the two assets from the [v0.1.2 release](https://github.com/SkylerZhu016/Agentic-Translating/releases/tag/v0.1.2):
+
+- `Agentic Translating-0.1.2-setup-x64.exe` — recommended installer;
+- `Agentic Translating-0.1.2-portable-x64.exe` — portable version that runs without installation.
+
+The first startup creates local application data. Upgrading does not delete translation history or custom agents. Before removing an endpoint, the application now shows every live and historical reference and can detach active bindings without deleting agent definitions.
 
 Windows packaging:
 
@@ -137,6 +151,12 @@ The harness intentionally does not reproduce configuration forms or batch-file
 selection. The browser remains the tool of choice for layout and visual
 regression; core model-flow verification can run entirely from the CLI.
 
+## Current Scope
+
+The built-in product concentrates on difficult general translation and poetry-related work. Users can add their own agents and prompt packs for other domains. Batch input currently supports UTF-8 `.txt` and `.md` files. EPUB support is intentionally deferred: a future implementation should evaluate a mature, appropriately licensed parser and round-trip pipeline instead of rebuilding the format from scratch.
+
+Version 0.1.2 has passed 911 Vitest checks, TypeScript validation, a standalone production smoke test, and 21 active Playwright workflows; 13 legacy manual-workflow fixtures are explicitly skipped because v3 orchestration supersedes them. These engineering checks do not claim that FSBP has already proved superior translation quality on a formal unseen evaluation set.
+
 ## Development Commands
 
 | Command | Description |
@@ -170,6 +190,8 @@ regression; core model-flow verification can run entirely from the CLI.
 - The development environment can generate a key file for local use only. The production environment does not auto-generate weak default keys.
 - Deleting sessions, presets, and batches requires confirmation through the interface. Presets use soft deletion by default.
 - Old session and preset tables are kept read-only for compatibility. Migrations do not perform destructive deletions.
+- Project resources suggested by an Agent are never approved automatically. Historical sessions keep their frozen project snapshot.
+- The local analytics overview contains allowlisted aggregates only. It does not expose prompts, source text, translations, full endpoint URLs, or API keys. The schema distinguishes provider-reported, locally estimated, and unknown cost, but known cost appears only when a caller supplies a verifiable amount or price snapshot; current requests normally remain unknown, and the overview is never a provider invoice.
 
 ## License
 

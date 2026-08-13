@@ -67,6 +67,8 @@ const IDLE_SESSION_POLL_MS = 5000
 interface SessionWorkspaceContextValue {
   data: SessionFullResponse | null
   sessionId: string | null
+  /** 候选正文/状态改变时变化，供按需证据面板失效并重取。 */
+  candidateRevision: string
   loading: boolean
   refresh: () => Promise<SessionFullResponse | null>
 }
@@ -85,6 +87,14 @@ export function SessionWorkspaceProvider({
   const [sessionId, setSessionId] = useState<string | null>(routeSessionId)
   const [loading, setLoading] = useState(true)
   const idRef = useRef<string | null>(routeSessionId)
+  const candidateRevision = JSON.stringify(
+    (data?.invocations ?? []).map((invocation) => [
+      invocation.id,
+      invocation.status,
+      invocation.model,
+      invocation.body_output,
+    ]),
+  )
 
   const refresh = useCallback(async (): Promise<SessionFullResponse | null> => {
     try {
@@ -177,7 +187,7 @@ export function SessionWorkspaceProvider({
 
   return (
     <SessionWorkspaceContext.Provider
-      value={{ data, sessionId, loading, refresh }}
+      value={{ data, sessionId, candidateRevision, loading, refresh }}
     >
       {children}
     </SessionWorkspaceContext.Provider>

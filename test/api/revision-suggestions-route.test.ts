@@ -16,6 +16,10 @@ import { chatCompletion } from '../../src/lib/llm/client'
 import { createRepositories } from '../../src/lib/db/repositories'
 import { createSessionService } from '../../src/lib/services/session-service'
 import { POST } from '../../app/api/sessions/[id]/revision-suggestions/route'
+import {
+  createProjectRepositories,
+  estimateProjectContextTokens,
+} from '../../src/lib/db/project-repositories'
 
 const MIGRATION_SQL_0001 = fs.readFileSync(
   path.join(process.cwd(), 'src/lib/db/migrations/0001_init.sql'),
@@ -28,6 +32,67 @@ const MIGRATION_SQL_0002 = fs.readFileSync(
   ),
   'utf8',
 )
+const MIGRATION_SQL_0009 = fs.readFileSync(
+  path.join(
+    process.cwd(),
+    'src/lib/db/migrations/0009_project_translation_memory.sql',
+  ),
+  'utf8',
+)
+
+function addFrozenProjectTerm(
+  db: Database.Database,
+  sessionId: string,
+): void {
+  const sessionColumns = new Set(
+    (db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>)
+      .map((column) => column.name),
+  )
+  if (!sessionColumns.has('direction')) {
+    db.exec("ALTER TABLE sessions ADD COLUMN direction TEXT NOT NULL DEFAULT 'en_to_zh'")
+  }
+  if (!sessionColumns.has('task_brief')) {
+    db.exec("ALTER TABLE sessions ADD COLUMN task_brief TEXT NOT NULL DEFAULT ''")
+  }
+  db.prepare(
+    "UPDATE sessions SET direction='en_to_zh', task_brief=? WHERE id=?",
+  ).run('保持叙事语气。', sessionId)
+
+  const projectRepos = createProjectRepositories(db)
+  const project = projectRepos.projects.create({
+    name: 'Frozen terminology project',
+    description: 'User-approved terminology for this translation.',
+    direction: 'en_to_zh',
+    sourceLang: 'English',
+    targetLang: 'Chinese',
+  })
+  const resource = projectRepos.resources.create(project.id, {
+    kind: 'term',
+    content: {
+      sourceText: 'Moon Gate',
+      targetText: '月门',
+      instruction: null,
+      note: '沿用用户批准的既有译名。',
+    },
+  })
+  const approved = projectRepos.resources.approve(
+    project.id,
+    resource.resource.id,
+    { revisionId: resource.currentRevision.id },
+  )
+  const frozenResources = projectRepos.snapshots.getResources(
+    project.id,
+    approved.snapshot.id,
+  )
+  projectRepos.sessionProjectContexts.freezeForSession({
+    sessionId,
+    projectId: project.id,
+    projectSnapshotId: approved.snapshot.id,
+    direction: 'en_to_zh',
+    resourceRevisionIds: approved.snapshot.approvedResourceRevisionIds,
+    tokenEstimate: estimateProjectContextTokens(frozenResources),
+  })
+}
 
 function request(body: unknown) {
   return new Request('http://localhost/api/sessions/test/revision-suggestions', {
@@ -47,6 +112,7 @@ describe('POST /api/sessions/:id/revision-suggestions', () => {
     db.pragma('foreign_keys = ON')
     db.exec(MIGRATION_SQL_0001)
     db.exec(MIGRATION_SQL_0002)
+    db.exec(MIGRATION_SQL_0009)
     repos = createRepositories(db)
 
     repos.endpoints.insert({
@@ -162,6 +228,113 @@ describe('POST /api/sessions/:id/revision-suggestions', () => {
       .join('\n')
     expect(combinedMessages).toContain('当前正式译文。')
     expect(combinedMessages).not.toContain('第一版译文。')
+    expect(combinedMessages).not.toContain('用户已批准的项目翻译档案')
+    expect(combinedMessages).not.toContain('secret-that-must-not-be-returned')
+    expect(combinedMessages).not.toContain('https://example.invalid')
+    const bilingualCall = vi
+      .mocked(chatCompletion)
+      .mock.calls.find(([, llmRequest]) =>
+        llmRequest.messages[0]?.content.includes('双语核验者'),
+      )
+    expect(bilingualCall?.[1].messages[1]).toEqual({
+      role: 'user',
+      content:
+        '用户的感受：\n读着有点绕。\n\n' +
+        '任务要求：\n无\n\n' +
+        '完整原文：\nA source sentence.\n\n' +
+        '当前完整译文：\n当前正式译文。',
+    })
+  })
+
+  it('injects the frozen archive only into user messages and remains read-only', async () => {
+    repos.finalVersions.insert({
+      session_id: sessionId,
+      version_no: 1,
+      text: '当前正式译文。',
+      source: 'assemble',
+    })
+    addFrozenProjectTerm(db, sessionId)
+    const versionCountBefore = (
+      db.prepare('SELECT COUNT(*) AS count FROM final_versions WHERE session_id=?')
+        .get(sessionId) as { count: number }
+    ).count
+
+    const response = await POST(request({ message: '术语读起来不一致。' }), {
+      params: Promise.resolve({ id: sessionId }),
+    })
+
+    expect(response.status).toBe(200)
+    const promptMessages = vi
+      .mocked(chatCompletion)
+      .mock.calls.flatMap(([, llmRequest]) => llmRequest.messages)
+    const userText = promptMessages
+      .filter((message) => message.role === 'user')
+      .map((message) => message.content)
+      .join('\n')
+    const systemText = promptMessages
+      .filter((message) => message.role === 'system')
+      .map((message) => message.content)
+      .join('\n')
+    const allPromptText = promptMessages
+      .map((message) => message.content)
+      .join('\n')
+    const versionCountAfter = (
+      db.prepare('SELECT COUNT(*) AS count FROM final_versions WHERE session_id=?')
+        .get(sessionId) as { count: number }
+    ).count
+
+    expect(userText).toContain('用户已批准的项目翻译档案（本会话冻结快照）')
+    expect(userText).toContain('Moon Gate → 月门')
+    expect(systemText).not.toContain('Moon Gate')
+    expect(systemText).not.toContain('月门')
+    expect(allPromptText).not.toContain('secret-that-must-not-be-returned')
+    expect(allPromptText).not.toContain('https://example.invalid')
+    expect(versionCountAfter).toBe(versionCountBefore)
+  })
+
+  it('returns only a safe diagnostic when the provider error contains sensitive data', async () => {
+    repos.finalVersions.insert({
+      session_id: sessionId,
+      version_no: 1,
+      text: 'Current approved translation.',
+      source: 'assemble',
+    })
+    const providerLeak =
+      'upstream rejected key sk-live-secret at https://provider.invalid/v1: A source sentence.'
+    vi.mocked(chatCompletion).mockRejectedValue(
+      Object.assign(new Error(providerLeak), { code: 'sk-live-secret' }),
+    )
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    try {
+      const response = await POST(request({ message: 'Please review this version.' }), {
+        params: Promise.resolve({ id: sessionId }),
+      })
+
+      expect(response.status).toBe(502)
+      const body = await response.json()
+      expect(body).toMatchObject({
+        error: 'suggestion_failed',
+        message: '生成修订建议失败，请稍后重试。',
+      })
+      expect(body.diagnosticId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+      )
+
+      const publicPayload = JSON.stringify(body)
+      const diagnostics = JSON.stringify(consoleError.mock.calls)
+      for (const sensitive of [
+        'sk-live-secret',
+        'https://provider.invalid/v1',
+        'A source sentence.',
+      ]) {
+        expect(publicPayload).not.toContain(sensitive)
+        expect(diagnostics).not.toContain(sensitive)
+      }
+      expect(diagnostics).toContain(body.diagnosticId)
+    } finally {
+      consoleError.mockRestore()
+    }
   })
 
   it('rejects a missing session and an empty message without model calls', async () => {

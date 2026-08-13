@@ -13,6 +13,8 @@ import {
 } from '@/src/lib/security/public-dto'
 import { checkTranslationEvidence } from '@/src/lib/evidence/checker'
 import type { ConfigSnapshot } from '@/src/lib/contracts/types'
+import { createProjectRepositories } from '@/src/lib/db/project-repositories'
+import { publicPersistedExecutionError } from '@/src/lib/security/diagnostic-error'
 
 export function createHandlers(db: Database.Database) {
   const repos = createRepositories(db)
@@ -46,9 +48,38 @@ export function createHandlers(db: Database.Database) {
           "SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_invocations'",
         ).get(),
       )
+      const hasProjectContexts = Boolean(
+        db.prepare(
+          "SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_project_contexts'",
+        ).get(),
+      )
+      const projectContext = hasProjectContexts
+        ? createProjectRepositories(db).sessionProjectContexts.getBySession(id) ??
+          null
+        : null
+      const publicResults = full.results.map((result) => {
+        const errorDiagnostic = publicPersistedExecutionError(
+          result.error,
+          'translation',
+          `${result.session_id}:${result.id}`,
+        )
+        return errorDiagnostic
+          ? { ...result, error: errorDiagnostic.message, errorDiagnostic }
+          : result
+      })
+      const publicStages = full.stages.map((stage) => {
+        const errorDiagnostic = publicPersistedExecutionError(
+          stage.error,
+          'stage',
+          `${stage.session_id}:${stage.id}`,
+        )
+        return errorDiagnostic
+          ? { ...stage, error: errorDiagnostic.message, errorDiagnostic }
+          : stage
+      })
       const invocations = hasVNext
         ? db.prepare(
-            'SELECT * FROM agent_invocations WHERE session_id=? ORDER BY created_at, id',
+            'SELECT * FROM agent_invocations WHERE session_id=? ORDER BY created_at, rowid',
           ).all(id)
         : []
       const invocationRows = invocations as Array<{
@@ -142,8 +173,9 @@ export function createHandlers(db: Database.Database) {
       return NextResponse.json(
         {
           session: toPublicSessionDto(full.session),
-          results: full.results,
-          stages: full.stages,
+          projectContext: redactSecrets(projectContext),
+          results: publicResults,
+          stages: publicStages,
           versions: full.versions,
           finalVersion,
           messages: full.messages,

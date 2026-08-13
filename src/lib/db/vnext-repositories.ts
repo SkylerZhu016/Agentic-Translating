@@ -53,6 +53,7 @@ interface WorkspaceDraftRow {
   direction: BuiltinDirection
   source_text: string
   task_brief: string
+  selected_project_id: string | null
   selected_preset_revision_id: string | null
   allowed_agent_variant_ids: string
   review_mode: WorkspaceDraft['reviewMode']
@@ -137,6 +138,7 @@ function mapDraft(row: WorkspaceDraftRow): WorkspaceDraft {
     direction: row.direction,
     sourceText: row.source_text,
     taskBrief: row.task_brief,
+    selectedProjectId: row.selected_project_id ?? null,
     selectedPresetRevisionId: row.selected_preset_revision_id,
     allowedAgentVariantIds: parseJson<string[]>(row.allowed_agent_variant_ids, []),
     reviewMode: row.review_mode,
@@ -144,6 +146,29 @@ function mapDraft(row: WorkspaceDraftRow): WorkspaceDraft {
     constraints: parseJson(row.constraints_json, {}),
     updatedAt: row.updated_at,
   }
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(',')}]`
+  }
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value)
+      .filter(([, child]) => child !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => `${JSON.stringify(key)}:${canonicalJson(child)}`)
+      .join(',')}}`
+  }
+  return JSON.stringify(value)
+}
+
+function sameStringSet(left: string[], right: string[]): boolean {
+  const leftSet = new Set(left)
+  const rightSet = new Set(right)
+  return (
+    leftSet.size === rightSet.size &&
+    [...leftSet].every((value) => rightSet.has(value))
+  )
 }
 
 function mapPreset(row: WorkflowPresetRow): WorkflowPreset {
@@ -322,16 +347,19 @@ export function createWorkspaceDraftsRepo(db: Database.Database) {
   const getStmt = db.prepare('SELECT * FROM workspace_drafts WHERE direction = ?')
   const upsertStmt = db.prepare(`
     INSERT INTO workspace_drafts
-      (direction, source_text, task_brief, selected_preset_revision_id,
+      (direction, source_text, task_brief, selected_project_id,
+       selected_preset_revision_id,
        allowed_agent_variant_ids, review_mode, prompt_bundle_revision_id,
        constraints_json, updated_at)
     VALUES
-      (@direction, @source_text, @task_brief, @selected_preset_revision_id,
+      (@direction, @source_text, @task_brief, @selected_project_id,
+       @selected_preset_revision_id,
        @allowed_agent_variant_ids, @review_mode, @prompt_bundle_revision_id,
        @constraints_json, datetime('now'))
     ON CONFLICT(direction) DO UPDATE SET
       source_text=excluded.source_text,
       task_brief=excluded.task_brief,
+      selected_project_id=excluded.selected_project_id,
       selected_preset_revision_id=excluded.selected_preset_revision_id,
       allowed_agent_variant_ids=excluded.allowed_agent_variant_ids,
       review_mode=excluded.review_mode,
@@ -341,12 +369,38 @@ export function createWorkspaceDraftsRepo(db: Database.Database) {
   `)
   const clearStmt = db.prepare(`
     UPDATE workspace_drafts SET source_text='', task_brief='',
-      selected_preset_revision_id=NULL, allowed_agent_variant_ids='[]',
+      selected_project_id=NULL, selected_preset_revision_id=NULL,
+      allowed_agent_variant_ids='[]',
       review_mode='main_editor', prompt_bundle_revision_id=NULL,
       constraints_json='{}',
       updated_at=datetime('now')
     WHERE direction=?
   `)
+  const clearIfMatchesTxn = db.transaction((
+    expected: Omit<WorkspaceDraft, 'updatedAt'>,
+    automaticallyIncludedAgentVariantIds: string[],
+  ) => {
+    const row = getStmt.get(expected.direction) as WorkspaceDraftRow | undefined
+    if (!row) return false
+    const current = mapDraft(row)
+    const submittedAgentVariantIds = expected.allowedAgentVariantIds
+    const currentAgentVariantIds = [
+      ...current.allowedAgentVariantIds,
+      ...automaticallyIncludedAgentVariantIds,
+    ]
+    const matches =
+      current.sourceText === expected.sourceText &&
+      current.taskBrief === expected.taskBrief &&
+      current.selectedProjectId === expected.selectedProjectId &&
+      current.selectedPresetRevisionId === expected.selectedPresetRevisionId &&
+      current.reviewMode === expected.reviewMode &&
+      (current.promptBundleRevisionId ?? null) ===
+        (expected.promptBundleRevisionId ?? null) &&
+      sameStringSet(currentAgentVariantIds, submittedAgentVariantIds) &&
+      canonicalJson(current.constraints) === canonicalJson(expected.constraints)
+    if (!matches) return false
+    return clearStmt.run(expected.direction).changes === 1
+  })
 
   return {
     get: (direction: BuiltinDirection) => {
@@ -358,6 +412,7 @@ export function createWorkspaceDraftsRepo(db: Database.Database) {
         direction: draft.direction,
         source_text: draft.sourceText,
         task_brief: draft.taskBrief,
+        selected_project_id: draft.selectedProjectId,
         selected_preset_revision_id: draft.selectedPresetRevisionId,
         allowed_agent_variant_ids: JSON.stringify(draft.allowedAgentVariantIds),
         review_mode: draft.reviewMode,
@@ -365,6 +420,11 @@ export function createWorkspaceDraftsRepo(db: Database.Database) {
         constraints_json: JSON.stringify(draft.constraints ?? {}),
       }),
     clear: (direction: BuiltinDirection) => clearStmt.run(direction),
+    clearIfMatches: (
+      expected: Omit<WorkspaceDraft, 'updatedAt'>,
+      automaticallyIncludedAgentVariantIds: string[] = [],
+    ): boolean =>
+      clearIfMatchesTxn(expected, automaticallyIncludedAgentVariantIds),
   }
 }
 

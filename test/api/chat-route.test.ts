@@ -13,7 +13,7 @@
  * Uses :memory: DB with mock LLM HTTP servers.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import fs from 'fs'
 import path from 'path'
@@ -26,6 +26,11 @@ import {
 } from '@/src/lib/handlers/chat-handler'
 import { encodeSSE, parseSSEChunk } from '@/src/lib/contracts/sse'
 import { startMockLLM, type MockLLMInstance } from '../fixtures/mock-llm'
+import {
+  createProjectRepositories,
+  estimateProjectContextTokens,
+} from '@/src/lib/db/project-repositories'
+import { getChatActivity } from '@/src/lib/chat/activity'
 
 // Inline migration SQL
 const MIGRATION_SQL_0001 = fs.readFileSync(
@@ -34,6 +39,14 @@ const MIGRATION_SQL_0001 = fs.readFileSync(
 )
 const MIGRATION_SQL_0002 = fs.readFileSync(
   path.join(process.cwd(), 'src/lib/db/migrations/0002_presets_and_drop_parsed_output.sql'),
+  'utf-8',
+)
+const MIGRATION_SQL_0009 = fs.readFileSync(
+  path.join(process.cwd(), 'src/lib/db/migrations/0009_project_translation_memory.sql'),
+  'utf-8',
+)
+const MIGRATION_SQL_0011 = fs.readFileSync(
+  path.join(process.cwd(), 'src/lib/db/migrations/0011_llm_call_records.sql'),
   'utf-8',
 )
 
@@ -71,12 +84,96 @@ function tryParseJSON(raw: string): unknown {
   }
 }
 
+async function withTestDeadline<T>(
+  promise: Promise<T>,
+  message: string,
+  timeoutMs = 1_000,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error(message)), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timeout) clearTimeout(timeout)
+  }
+}
+
 /** Restore a previously taken snapshot to session config */
 function setSnapshotConfig(db: Database.Database, sessionId: string, snapshot: object) {
   db.prepare('UPDATE sessions SET config_snapshot = ? WHERE id = ?').run(
     JSON.stringify(snapshot),
     sessionId,
   )
+}
+
+function enableZhEditingBundle(db: Database.Database, sessionId: string): void {
+  const session = db
+    .prepare('SELECT config_snapshot FROM sessions WHERE id=?')
+    .get(sessionId) as { config_snapshot: string }
+  const snapshot = JSON.parse(session.config_snapshot)
+  snapshot.promptBundleSnapshot = {
+    promptLanguage: 'zh',
+    editingPrompt: '你是最终译文编辑。只根据用户要求审慎修改。',
+  }
+  setSnapshotConfig(db, sessionId, snapshot)
+}
+
+function addFrozenProjectTerm(
+  db: Database.Database,
+  sessionId: string,
+): void {
+  const sessionColumns = new Set(
+    (db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>)
+      .map((column) => column.name),
+  )
+  if (!sessionColumns.has('direction')) {
+    db.exec("ALTER TABLE sessions ADD COLUMN direction TEXT NOT NULL DEFAULT 'en_to_zh'")
+  }
+  if (!sessionColumns.has('task_brief')) {
+    db.exec("ALTER TABLE sessions ADD COLUMN task_brief TEXT NOT NULL DEFAULT ''")
+  }
+  db.prepare(
+    "UPDATE sessions SET direction='en_to_zh', task_brief=? WHERE id=?",
+  ).run('Keep approved names consistent.', sessionId)
+
+  const projectRepos = createProjectRepositories(db)
+  const project = projectRepos.projects.create({
+    name: 'Frozen terminology project',
+    description: 'User-approved terminology for this translation.',
+    direction: 'en_to_zh',
+    sourceLang: 'English',
+    targetLang: 'Chinese',
+  })
+  const resource = projectRepos.resources.create(project.id, {
+    kind: 'term',
+    content: {
+      sourceText: 'Moon Gate',
+      targetText: '月门',
+      instruction: null,
+      note: '沿用用户批准的既有译名。',
+    },
+  })
+  const approved = projectRepos.resources.approve(
+    project.id,
+    resource.resource.id,
+    { revisionId: resource.currentRevision.id },
+  )
+  const frozenResources = projectRepos.snapshots.getResources(
+    project.id,
+    approved.snapshot.id,
+  )
+  projectRepos.sessionProjectContexts.freezeForSession({
+    sessionId,
+    projectId: project.id,
+    projectSnapshotId: approved.snapshot.id,
+    direction: 'en_to_zh',
+    resourceRevisionIds: approved.snapshot.approvedResourceRevisionIds,
+    tokenEstimate: estimateProjectContextTokens(frozenResources),
+  })
 }
 
 // =============================================================================
@@ -117,7 +214,12 @@ describe('Chat SSE Route', () => {
     // 1. Create in-memory DB + migrate
     db = new Database(':memory:')
     db.pragma('foreign_keys = ON')
-    db.exec(MIGRATION_SQL_0001); db.exec(MIGRATION_SQL_0002)
+    db.exec(MIGRATION_SQL_0001); db.exec(MIGRATION_SQL_0002); db.exec(MIGRATION_SQL_0009)
+    // This focused legacy-route fixture does not run the full vNext migration,
+    // but the ledger's nullable foreign keys still need their parent tables.
+    db.exec('CREATE TABLE orchestration_runs (id TEXT PRIMARY KEY)')
+    db.exec('CREATE TABLE agent_invocations (id TEXT PRIMARY KEY)')
+    db.exec(MIGRATION_SQL_0011)
 
     repos = createRepositories(db)
     service = createSessionService(db, repos)
@@ -244,6 +346,97 @@ describe('Chat SSE Route', () => {
       expect(resp.status).toBe(400)
       const body = await resp.json()
       expect(body.error).toBe('message_required')
+    })
+
+    it('does not expose provider errors in the chat SSE stream or diagnostics', async () => {
+      const providerLeak =
+        'upstream rejected key sk-live-secret at https://provider.invalid/v1: Hello world'
+      mockLLM.setBehavior('echo-model', {
+        behavior: 'error',
+        status: 502,
+        errorCode: 'provider_failure',
+        errorMessage: providerLeak,
+      })
+      const sid = await createAssembledSession()
+      const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+      try {
+        const request = new NextRequest(
+          `http://localhost/api/sessions/${sid}/chat`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message: 'Please revise the translation.' }),
+          },
+        )
+        const response = await handlers.POST(request, {
+          params: Promise.resolve({ id: sid }),
+        })
+        const events = await readSSEEvents(response)
+        const complete = events.find(
+          (event) => event.event === 'message_complete',
+        )?.data as Record<string, unknown> | undefined
+
+        expect(complete).toMatchObject({
+          error: 'chat_request_failed',
+          message: '对话修订请求失败，请稍后重试。',
+        })
+        expect(complete?.diagnosticId).toMatch(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+        )
+
+        const publicPayload = JSON.stringify(events)
+        const diagnostics = JSON.stringify(consoleError.mock.calls)
+        for (const sensitive of [
+          'sk-live-secret',
+          'https://provider.invalid/v1',
+          'Hello world',
+        ]) {
+          expect(publicPayload).not.toContain(sensitive)
+          expect(diagnostics).not.toContain(sensitive)
+        }
+        expect(diagnostics).toContain(complete?.diagnosticId)
+      } finally {
+        consoleError.mockRestore()
+      }
+    })
+
+    it('does not repeat model-supplied replacement text in the terminal failure or diagnostics', async () => {
+      mockLLM.setBehavior('echo-model', { behavior: 'tool_call' })
+      const sid = await createAssembledSession()
+      const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+      try {
+        const request = new NextRequest(
+          `http://localhost/api/sessions/${sid}/chat`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message: 'Replace a passage that is not present.' }),
+          },
+        )
+        const response = await handlers.POST(request, {
+          params: Promise.resolve({ id: sid }),
+        })
+        const events = await readSSEEvents(response)
+        const complete = events.find(
+          (event) => event.event === 'message_complete',
+        )?.data as Record<string, unknown> | undefined
+
+        expect(complete).toMatchObject({
+          error: 'chat_edit_correction_failed',
+          message: '模型未能定位唯一的待修改片段，请调整要求后重试。',
+        })
+        expect(complete?.diagnosticId).toMatch(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+        )
+        // Tool-call timeline events intentionally expose edit arguments for
+        // auditability; the terminal failure payload must not repeat them.
+        expect(JSON.stringify(complete)).not.toContain('original text')
+        expect(JSON.stringify(consoleError.mock.calls)).not.toContain('original text')
+      } finally {
+        consoleError.mockRestore()
+      }
     })
 
     it('returns 400 for empty message', async () => {
@@ -437,6 +630,168 @@ describe('Chat SSE Route', () => {
       })
     })
 
+    it.each(['response_cancel', 'request_signal'] as const)(
+      'aborts the provider and settles the ledger on %s',
+      async (disconnectMode) => {
+      const http = await import('http')
+      let heartbeat: ReturnType<typeof setInterval> | undefined
+      let resolveProviderReady!: () => void
+      let resolveProviderDisconnected!: () => void
+      const providerReady = new Promise<void>((resolve) => {
+        resolveProviderReady = resolve
+      })
+      const providerDisconnected = new Promise<void>((resolve) => {
+        resolveProviderDisconnected = resolve
+      })
+      const server = http.createServer((providerRequest, providerResponse) => {
+        providerRequest.resume()
+        providerRequest.once('end', () => {
+          providerResponse.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            Connection: 'keep-alive',
+          })
+          providerResponse.once('close', () => {
+            if (heartbeat) clearInterval(heartbeat)
+            resolveProviderDisconnected()
+          })
+          providerResponse.write(`data: ${JSON.stringify({
+            choices: [{
+              index: 0,
+              delta: { content: 'provider partial output' },
+              finish_reason: null,
+            }],
+          })}\n\n`)
+          heartbeat = setInterval(() => {
+            if (!providerResponse.destroyed) {
+              providerResponse.write(': provider heartbeat\n\n')
+            }
+          }, 20)
+          resolveProviderReady()
+        })
+      })
+      await new Promise<void>((resolve, reject) => {
+        server.once('error', reject)
+        server.listen(0, '127.0.0.1', () => resolve())
+      })
+      const address = server.address()
+      if (!address || typeof address === 'string') {
+        throw new Error('disconnect test provider did not bind a TCP port')
+      }
+      const providerUrl = `http://127.0.0.1:${address.port}`
+      const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+      const requestAbort = new AbortController()
+
+      try {
+        const sid = await createAssembledSession()
+        const session = repos.sessions.getById(sid)!
+        const snapshot = JSON.parse(session.config_snapshot)
+        if (snapshot.endpoint) snapshot.endpoint.base_url = providerUrl
+        for (const endpoint of snapshot.endpoints ?? []) {
+          endpoint.base_url = providerUrl
+        }
+        for (const endpoint of snapshot.endpointSnapshots ?? []) {
+          endpoint.baseUrl = providerUrl
+        }
+        setSnapshotConfig(db, sid, snapshot)
+
+        const request = new NextRequest(
+          `http://localhost/api/sessions/${sid}/chat`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: requestAbort.signal,
+            body: JSON.stringify({
+              message: 'DISCONNECT_PROMPT_MUST_NOT_ENTER_ERRORS',
+            }),
+          },
+        )
+        const response = await handlers.POST(request, {
+          params: Promise.resolve({ id: sid }),
+        })
+        const reader = response.body!.getReader()
+        await withTestDeadline(
+          providerReady,
+          'provider never received the chat request',
+        )
+        const firstChunk = await reader.read()
+        expect(firstChunk.done).toBe(false)
+        if (disconnectMode === 'response_cancel') {
+          await withTestDeadline(
+            reader.cancel('browser disconnected'),
+            'response reader cancellation did not settle',
+          )
+        } else {
+          requestAbort.abort()
+        }
+        await withTestDeadline(
+          providerDisconnected,
+          'provider connection stayed open',
+        )
+        if (disconnectMode === 'request_signal') {
+          while (true) {
+            const next = await withTestDeadline(
+              reader.read(),
+              'chat response did not close after request abort',
+            )
+            if (next.done) break
+          }
+        }
+
+        expect(getChatActivity(sid).active).toBe(false)
+        const ledgerRows = db.prepare(`
+          SELECT status, error_code, usage_source
+          FROM llm_call_records
+          WHERE session_id=? AND operation='chat_edit'
+        `).all(sid) as Array<{
+          status: string
+          error_code: string | null
+          usage_source: string
+        }>
+        expect(ledgerRows).toEqual([{
+          status: 'cancelled',
+          error_code: 'aborted',
+          usage_source: 'unknown',
+        }])
+        expect(
+          repos.chatMessages
+            .listBySession(sid)
+            .filter((message) => message.role === 'assistant'),
+        ).toHaveLength(0)
+        expect(repos.finalVersions.listBySession(sid)).toHaveLength(1)
+
+        const visibleChunk = firstChunk.value
+          ? new TextDecoder().decode(firstChunk.value)
+          : ''
+        const diagnostics = JSON.stringify(consoleError.mock.calls)
+        for (const sensitive of [
+          'sk-test',
+          providerUrl,
+          'DISCONNECT_PROMPT_MUST_NOT_ENTER_ERRORS',
+        ]) {
+          expect(visibleChunk).not.toContain(sensitive)
+          expect(diagnostics).not.toContain(sensitive)
+        }
+      } finally {
+        consoleError.mockRestore()
+        if (heartbeat) clearInterval(heartbeat)
+        await new Promise<void>((resolve, reject) => {
+          server.close((error) => {
+            if (
+              error &&
+              (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING'
+            ) {
+              reject(error)
+              return
+            }
+            resolve()
+          })
+          server.closeAllConnections()
+        })
+      }
+      },
+    )
+
     it('includes the current user instruction in the LLM context', async () => {
       mockLLM.setBehavior('echo-model', { behavior: 'echo' })
       const sid = await createAssembledSession()
@@ -450,11 +805,102 @@ describe('Chat SSE Route', () => {
       const resp = await handlers.POST(req, {
         params: Promise.resolve({ id: sid }),
       })
-      await readSSEEvents(resp)
+      const events = await readSSEEvents(resp)
+      expect(events.find((event) => event.event === 'message_complete')?.data)
+        .toMatchObject({ kind: 'message' })
 
       const messages = repos.chatMessages.listBySession(sid)
       const assistant = messages.find((message) => message.role === 'assistant')
       expect(assistant?.content).toBe(instruction)
+    })
+
+    it('injects the frozen project archive only as user context and preserves full history', async () => {
+      mockLLM.setBehavior('echo-model', { behavior: 'echo' })
+      const sid = await createAssembledSession()
+      enableZhEditingBundle(db, sid)
+      addFrozenProjectTerm(db, sid)
+      repos.chatMessages.insert({
+        session_id: sid,
+        role: 'user',
+        content: '上一轮用户消息',
+        tool_calls: null,
+        tool_results: null,
+        version_id: null,
+      })
+      repos.chatMessages.insert({
+        session_id: sid,
+        role: 'assistant',
+        content: '上一轮助手回复',
+        tool_calls: null,
+        tool_results: null,
+        version_id: null,
+      })
+
+      const req = new NextRequest(`http://localhost/api/sessions/${sid}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: '检查项目术语是否一致。' }),
+      })
+      const resp = await handlers.POST(req, {
+        params: Promise.resolve({ id: sid }),
+      })
+      await readSSEEvents(resp)
+
+      const requestBody = mockLLM.getRequests().at(-1)?.body as {
+        messages: Array<{ role: string; content: string }>
+      }
+      const systemText = requestBody.messages
+        .filter((message) => message.role === 'system')
+        .map((message) => message.content)
+        .join('\n')
+      const userText = requestBody.messages
+        .filter((message) => message.role === 'user')
+        .map((message) => message.content)
+        .join('\n')
+      const allPromptText = requestBody.messages
+        .map((message) => message.content)
+        .join('\n')
+
+      expect(userText).toContain('用户已批准的项目翻译档案（本会话冻结快照）')
+      expect(userText).toContain('Moon Gate → 月门')
+      expect(systemText).not.toContain('Moon Gate')
+      expect(systemText).not.toContain('月门')
+      expect(allPromptText).toContain('上一轮用户消息')
+      expect(allPromptText).toContain('上一轮助手回复')
+      expect(allPromptText).not.toContain('sk-test')
+      expect(allPromptText).not.toContain(mockLLM.url)
+    })
+
+    it('keeps the legacy revision reference unchanged without a project snapshot', async () => {
+      mockLLM.setBehavior('echo-model', { behavior: 'echo' })
+      const sid = await createAssembledSession()
+      enableZhEditingBundle(db, sid)
+      const instruction = '只检查现有译文。'
+      const req = new NextRequest(`http://localhost/api/sessions/${sid}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: instruction }),
+      })
+
+      const resp = await handlers.POST(req, {
+        params: Promise.resolve({ id: sid }),
+      })
+      await readSSEEvents(resp)
+
+      const requestBody = mockLLM.getRequests().at(-1)?.body as {
+        messages: Array<{ role: string; content: string }>
+      }
+      expect(requestBody.messages[1]).toEqual({
+        role: 'user',
+        content: buildRevisionReferenceMessage({
+          promptLanguage: 'zh',
+          taskBrief: '',
+          sourceText: DEF_SOURCE.sourceText,
+          decisionEvidence: {},
+        }),
+      })
+      expect(requestBody.messages.map((message) => message.content).join('\n'))
+        .not.toContain('用户已批准的项目翻译档案')
     })
 
     it('exposes only replace_text to the production translation chat model', async () => {
@@ -536,7 +982,12 @@ describe('Chat SSE Route', () => {
         }),
       })
 
-      await handlers.POST(req, { params: Promise.resolve({ id: sid }) })
+      const response = await handlers.POST(req, {
+        params: Promise.resolve({ id: sid }),
+      })
+      const events = await readSSEEvents(response)
+      expect(events.find((event) => event.event === 'message_complete')?.data)
+        .toMatchObject({ kind: 'message' })
 
       const messages = repos.chatMessages.listBySession(sid)
       const userMsg = messages.find((m) => m.role === 'user')
@@ -896,6 +1347,9 @@ describe('Chat SSE Route', () => {
       })
 
       expect(resp.status).toBe(200)
+      const events = await readSSEEvents(resp)
+      expect(events.find((event) => event.event === 'message_complete')?.data)
+        .toMatchObject({ kind: 'message' })
     })
 
     it('allows chat in refining state', async () => {
@@ -945,6 +1399,9 @@ describe('Chat SSE Route', () => {
       })
 
       expect(resp.status).toBe(200)
+      const events = await readSSEEvents(resp)
+      expect(events.find((event) => event.event === 'message_complete')?.data)
+        .toMatchObject({ kind: 'message' })
     })
   })
 

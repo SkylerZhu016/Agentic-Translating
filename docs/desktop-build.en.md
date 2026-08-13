@@ -29,6 +29,8 @@ npm run build:standalone
 npm run package:win
 ```
 
+`build:standalone` cleans only the reproducible `.next/standalone` output. It removes local paths such as `.omo/`, `data/`, and `迭代文档/` if tracing copied them, then automatically runs the release-tree scan. After the scan passes, it uses an isolated temporary data directory and random key to start the real standalone server on an OS-assigned non-3000 port and waits for `/api/health/ready`. The build fails when it finds a database, runtime record, development note, possible credential, or missing runtime dependency. Existing services and real workspace data directories are never stopped, deleted, or rewritten.
+
 `package:win` rebuilds `better-sqlite3` for the Electron ABI in a temporary staging directory without spaces, prepares the standalone assets, and lets electron-builder produce both NSIS and portable targets simultaneously. Before packaging, a Windows ICO with multiple layers ranging from 16 to 256 px is generated from `app/icon.svg`, eliminating the need for external icon conversion tools. Transient download or build failures retry up to three times; deterministic errors still exit with a non-zero status. The command does not overwrite native modules used by Node.js in the development environment.
 
 Current Windows x64 artifacts live under `dist-electron/`:

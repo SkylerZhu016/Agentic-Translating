@@ -1,6 +1,8 @@
+import type Database from 'better-sqlite3'
 import { chatCompletion, isAsyncIterable } from '../llm/client'
 import { parseSemanticAgentOutput } from '../protocol/semantic-output'
 import { resolveCompletionTokenBudget } from '../guards/tokens'
+import { beginBestEffortLlmCall } from './llm-call-ledger'
 
 export interface AgentTestPrompt {
   promptLanguage: 'zh' | 'en'
@@ -44,30 +46,59 @@ export async function runIndependentAgentTest(input: {
   prompt: AgentTestPrompt
   endpoint: AgentTestEndpoint
   model: string
+  ledger?: {
+    db: Database.Database
+    endpointId: number
+  }
 }) {
   const messages = buildAgentTestMessages(input.prompt)
   const requestMessages = [
     { role: 'system', content: messages.system },
     { role: 'user', content: messages.user },
   ]
-  const response = await chatCompletion(
-    {
-      baseUrl: input.endpoint.baseUrl,
-      chatCompletionsPath: input.endpoint.chatCompletionsPath,
-      apiKey: input.endpoint.apiKey,
-    },
-    {
-      model: input.model,
-      maxTokens: resolveCompletionTokenBudget(
-        requestMessages.map((message) => message.content).join('\n'),
-        input.endpoint.contextWindow,
-      ),
-      stream: false,
-      messages: requestMessages,
-    },
+  const maxTokens = resolveCompletionTokenBudget(
+    requestMessages.map((message) => message.content).join('\n'),
+    input.endpoint.contextWindow,
   )
-  if (isAsyncIterable(response)) {
-    throw new Error('unexpected_stream')
+  const ledger = input.ledger
+    ? beginBestEffortLlmCall({
+        db: input.ledger.db,
+        endpointId: input.ledger.endpointId,
+        model: input.model,
+        operation: 'agent.test',
+      })
+    : null
+  try {
+    const response = await chatCompletion(
+      {
+        baseUrl: input.endpoint.baseUrl,
+        chatCompletionsPath: input.endpoint.chatCompletionsPath,
+        apiKey: input.endpoint.apiKey,
+      },
+      {
+        model: input.model,
+        maxTokens,
+        stream: false,
+        messages: requestMessages,
+        onActivity: () => ledger?.markReceiving(),
+      },
+    )
+    if (isAsyncIterable(response)) {
+      throw new Error('unexpected_stream')
+    }
+    ledger?.markReceiving()
+    if (!response.content.trim() && !response.toolCalls?.length) {
+      ledger?.fail(
+        new Error('provider returned no visible content or tool call'),
+        response.usage,
+        'empty_response',
+      )
+      throw new Error('empty_response')
+    }
+    ledger?.complete(response.usage)
+    return parseSemanticAgentOutput(response.content)
+  } catch (error) {
+    ledger?.fail(error)
+    throw error
   }
-  return parseSemanticAgentOutput(response.content)
 }

@@ -135,6 +135,7 @@ export interface WorkspaceDraft {
   direction: BuiltinDirection
   sourceText: string
   taskBrief: string
+  selectedProjectId: string | null
   selectedPresetRevisionId: string | null
   allowedAgentVariantIds: string[]
   reviewMode: ReviewMode
@@ -179,6 +180,8 @@ export interface ConfigSnapshotVNext {
   }
   presetRevisionSnapshot: WorkflowPresetRevision | null
   promptBundleRevisionId?: string | null
+  projectId?: string | null
+  projectSnapshotId?: string | null
   taskBrief: string
   constraints: TranslationConstraints
   orchestrationPolicy: {

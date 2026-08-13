@@ -73,6 +73,7 @@ try {
   await run(process.execPath, [npmCli, 'run', 'build'])
   await run(process.execPath, ['scripts/prepare-standalone.mjs'])
   await run(process.execPath, ['scripts/verify-release-tree.mjs'])
+  await run(process.execPath, ['scripts/smoke-standalone.mjs'])
 
   cpSync(path.join(root, 'package.json'), path.join(stage, 'package.json'))
   cpSync(path.join(root, 'package-lock.json'), path.join(stage, 'package-lock.json'))

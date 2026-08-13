@@ -318,6 +318,89 @@ describe('GET /api/sessions/:id', () => {
     expect(body.latest_version_no).toBe(1)
   })
 
+  it('redacts legacy raw execution errors at the public detail boundary without rewriting history', async () => {
+    const session = service.createSession(DEF_INPUT)
+    const rawProviderError =
+      'sk-legacy-secret https://legacy.private/v1 LEAKED_SOURCE_FRAGMENT LEAKED_PROMPT_FRAGMENT'
+    const result = repos.translationResults.getBySessionAndAgent(
+      session.id,
+      'agent-alpha',
+    )!
+    repos.translationResults.update({
+      id: result.id,
+      status: 'error',
+      output_text: null,
+      error: rawProviderError,
+      latency_ms: 10,
+      attempt: 1,
+    })
+    repos.stageOutputs.insert({
+      session_id: session.id,
+      stage: 'review',
+      status: 'failed',
+      prompt_used: null,
+      raw_output: null,
+      error: rawProviderError,
+    })
+
+    const response = await GET(
+      new NextRequest(`http://localhost/api/sessions/${session.id}`),
+      { params: Promise.resolve({ id: session.id }) },
+    )
+    expect(response.status).toBe(200)
+    const body = await response.json()
+    const publicResult = body.results.find(
+      (item: { agent_key: string }) => item.agent_key === 'agent-alpha',
+    )
+    expect(publicResult).toEqual(
+      expect.objectContaining({
+        error: '该历史翻译错误的原始详情已隐藏。',
+        errorDiagnostic: expect.objectContaining({
+          error: 'legacy_translation_error_redacted',
+          message: '该历史翻译错误的原始详情已隐藏。',
+          diagnosticId: expect.stringMatching(
+            /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+          ),
+        }),
+      }),
+    )
+    expect(body.stages[0]).toEqual(
+      expect.objectContaining({
+        error: '该历史统筹错误的原始详情已隐藏。',
+        errorDiagnostic: expect.objectContaining({
+          error: 'legacy_stage_error_redacted',
+          message: '该历史统筹错误的原始详情已隐藏。',
+          diagnosticId: expect.stringMatching(
+            /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+          ),
+        }),
+      }),
+    )
+    const publicChildren = JSON.stringify({
+      results: body.results,
+      stages: body.stages,
+    })
+    for (const sensitive of [
+      rawProviderError,
+      'sk-legacy-secret',
+      'https://legacy.private/v1',
+      'LEAKED_SOURCE_FRAGMENT',
+      'LEAKED_PROMPT_FRAGMENT',
+    ]) {
+      expect(publicChildren).not.toContain(sensitive)
+    }
+
+    expect(
+      repos.translationResults.getBySessionAndAgent(
+        session.id,
+        'agent-alpha',
+      )!.error,
+    ).toBe(rawProviderError)
+    expect(
+      repos.stageOutputs.getBySessionAndStage(session.id, 'review')!.error,
+    ).toBe(rawProviderError)
+  })
+
   it('returns latest_version_no as null when no versions exist', async () => {
     const s = service.createSession(DEF_INPUT)
 

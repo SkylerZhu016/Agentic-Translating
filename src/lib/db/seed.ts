@@ -26,6 +26,7 @@ function seedVNext(db: Database.Database): void {
       tags_json=excluded.tags_json,
       is_builtin=1,
       updated_at=datetime('now')
+    WHERE agent_archetypes.is_builtin=1
   `)
 
   const insertVariant = db.prepare(`
@@ -47,6 +48,11 @@ function seedVNext(db: Database.Database): void {
       prompt_version=MAX(agent_direction_variants.prompt_version, excluded.prompt_version),
       sort_order=excluded.sort_order,
       updated_at=datetime('now')
+    WHERE agent_direction_variants.archetype_id=excluded.archetype_id
+      AND EXISTS (
+        SELECT 1 FROM agent_archetypes
+        WHERE id=agent_direction_variants.archetype_id AND is_builtin=1
+      )
   `)
 
   const insertBundle = db.prepare(`
@@ -72,6 +78,10 @@ function seedVNext(db: Database.Database): void {
     }
 
     for (const variant of BUILTIN_AGENT_VARIANTS) {
+      const owner = db.prepare(
+        'SELECT is_builtin FROM agent_archetypes WHERE id=?',
+      ).get(variant.archetypeId) as { is_builtin: number } | undefined
+      if (owner?.is_builtin !== 1) continue
       insertVariant.run({
         id: variant.id,
         archetype_id: variant.archetypeId,

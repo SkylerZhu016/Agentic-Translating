@@ -18,6 +18,12 @@ import {
 import { encodeSSE } from '@/src/lib/contracts/sse';
 import { InvalidTransitionError } from '@/src/lib/guards';
 import type { ConfigSnapshot } from '@/src/lib/contracts/types';
+import {
+  executionDiagnosticError,
+  logSafeDiagnostic,
+  serializeExecutionDiagnosticError,
+  type ExecutionDiagnosticErrorDto,
+} from '@/src/lib/security/diagnostic-error';
 
 export async function POST(
   request: Request,
@@ -134,6 +140,33 @@ export async function POST(
         }
       };
 
+      let failure: ExecutionDiagnosticErrorDto | null = null;
+      let failureEmitted = false;
+      const failureFor = (cause: unknown): ExecutionDiagnosticErrorDto => {
+        if (failure) return failure;
+        failure = executionDiagnosticError('translation_retry_failed');
+        logSafeDiagnostic({
+          scope: 'legacy.translate.retry_agent',
+          diagnosticId: failure.diagnosticId,
+          cause,
+        });
+        return failure;
+      };
+      const sendFailure = (cause: unknown): ExecutionDiagnosticErrorDto => {
+        const diagnostic = failureFor(cause);
+        if (!failureEmitted) {
+          failureEmitted = true;
+          send('agent_error', {
+            agent_key: agentKey,
+            error: diagnostic.message,
+            code: diagnostic.error,
+            message: diagnostic.message,
+            diagnosticId: diagnostic.diagnosticId,
+          });
+        }
+        return diagnostic;
+      };
+
       const callbacks: FanOutCallbacks = {
         onAgentStart() {
           agentStartTime = performance.now();
@@ -143,6 +176,10 @@ export async function POST(
           send('token', { agent_key: agentKey, delta: content });
         },
         onAgentComplete(_ak: string, result) {
+          if (result.status !== 'complete') {
+            sendFailure({ code: 'empty_response' });
+            return;
+          }
           send('agent_complete', {
             agent_key: agentKey,
             status: result.status,
@@ -150,10 +187,7 @@ export async function POST(
           });
         },
         onAgentError(_ak: string, error: Error) {
-          send('agent_error', {
-            agent_key: agentKey,
-            error: error.message,
-          });
+          sendFailure(error);
         },
       };
 
@@ -170,14 +204,20 @@ export async function POST(
             result.status === 'aborted'
               ? ('error' as const)
               : (result.status as 'complete' | 'error');
+          const diagnostic =
+            dbStatus === 'error'
+              ? sendFailure({
+                  code: result.status === 'aborted' ? 'aborted' : 'unknown',
+                })
+              : null;
 
           repos.translationResults.update({
             id: trRow.id,
             status: dbStatus,
             output_text: result.content ?? null,
-            error:
-              result.error ??
-              (result.status === 'aborted' ? 'Request was aborted' : null),
+            error: diagnostic
+              ? serializeExecutionDiagnosticError(diagnostic)
+              : null,
             latency_ms: agentStartTime
               ? Math.round(performance.now() - agentStartTime)
               : null,
@@ -195,16 +235,27 @@ export async function POST(
         send('done', {});
         streamController.close();
       } catch (error: unknown) {
-        const message =
-          error instanceof Error ? error.message : String(error);
-        send('error', { error: message });
+        const diagnostic = executionDiagnosticError(
+          'translation_retry_pipeline_failed',
+        );
+        logSafeDiagnostic({
+          scope: 'legacy.translate.retry_pipeline',
+          diagnosticId: diagnostic.diagnosticId,
+          cause: error,
+        });
+        send('error', {
+          error: diagnostic.message,
+          code: diagnostic.error,
+          message: diagnostic.message,
+          diagnosticId: diagnostic.diagnosticId,
+        });
 
         if (trRow) {
           repos.translationResults.update({
             id: trRow.id,
             status: 'error',
             output_text: null,
-            error: 'Retry pipeline failed',
+            error: serializeExecutionDiagnosticError(diagnostic),
             latency_ms: null,
             attempt: newAttempt,
           });

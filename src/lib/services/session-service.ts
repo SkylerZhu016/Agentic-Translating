@@ -7,7 +7,7 @@
 // Every public function is named per the Wave 2 Task 13 spec.
 // ---------------------------------------------------------------------------
 
-import { randomUUID } from 'crypto'
+import { createHash, randomUUID } from 'crypto'
 import type Database from 'better-sqlite3'
 import type { Repositories } from '../db/repositories'
 import {
@@ -21,6 +21,11 @@ import type {
   TranslationDirection,
 } from '../contracts/vnext'
 import { createVNextRepositories } from '../db/vnext-repositories'
+import {
+  createProjectRepositories,
+  estimateProjectContextTokens,
+  ProjectRepositoryError,
+} from '../db/project-repositories'
 import { createWorkspaceModelProfilesRepo } from '../db/release-config-repositories'
 import type {
   SessionState,
@@ -32,6 +37,7 @@ import type {
   ChatMessageRow,
 } from '../contracts/types'
 import { encryptSecret } from '../security/secrets'
+import type { FrozenProjectResource } from '../contracts/projects'
 
 // ===========================================================================
 // Custom Errors
@@ -55,6 +61,15 @@ export class InvalidCustomDirectionError extends Error {
   }
 }
 
+export class SessionIdempotencyConflictError extends Error {
+  readonly code = 'idempotency_conflict'
+
+  constructor() {
+    super('The client request ID was already used for a different request.')
+    this.name = 'SessionIdempotencyConflictError'
+  }
+}
+
 // ===========================================================================
 // Public Types
 // ===========================================================================
@@ -69,6 +84,7 @@ export interface CreateSessionInput {
   reviewMode?: ReviewMode
   presetRevisionId?: string | null
   promptBundleRevisionId?: string | null
+  projectId?: string | null
   allowedAgentVariantIds?: string[]
   constraints?: TranslationConstraints
 }
@@ -98,7 +114,9 @@ function deepClone<T>(obj: T): T {
 function buildConfigSnapshot(repos: Repositories): ConfigSnapshot {
   const endpoints = repos.endpoints.list()
   const endpoint = endpoints[0] ?? null
-  const agents = repos.translatorAgents.list()
+  const agents = repos.translatorAgents
+    .list()
+    .filter((agent) => agent.endpoint_id != null)
   const coordinator = repos.coordinatorConfig.get() ?? null
   const promptsList = repos.promptTemplates.list()
   const prompts: Record<string, string> = {}
@@ -114,6 +132,194 @@ function tableExists(db: Database.Database, table: string): boolean {
       "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
     ).get(table),
   )
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(',')}]`
+  }
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value)
+      .filter(([, child]) => child !== undefined)
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      .map(([key, child]) => `${JSON.stringify(key)}:${canonicalJson(child)}`)
+      .join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
+}
+
+function normalizedAgentVariantIds(ids: string[] | undefined): string[] {
+  return [...new Set(ids ?? [])].sort()
+}
+
+function sessionRequestHash(input: CreateSessionInput): string {
+  const canonicalRequest = {
+    version: 1,
+    sourceText: input.sourceText,
+    sourceLang: input.sourceLang,
+    targetLang: input.targetLang,
+    direction: input.direction ?? 'en_to_zh',
+    taskBrief: input.taskBrief ?? '',
+    reviewMode: input.reviewMode ?? 'main_editor',
+    presetRevisionId: input.presetRevisionId ?? null,
+    promptBundleRevisionId: input.promptBundleRevisionId ?? null,
+    projectId: input.projectId ?? null,
+    // A preset supplies its own immutable Agent snapshot, so this otherwise
+    // user-selectable field has no effect on the created session.
+    allowedAgentVariantIds: input.presetRevisionId
+      ? null
+      : normalizedAgentVariantIds(input.allowedAgentVariantIds),
+    constraints: input.constraints ?? {},
+  }
+  return createHash('sha256').update(canonicalJson(canonicalRequest)).digest('hex')
+}
+
+/**
+ * Old sessions predate request hashes. Compare every request field that can be
+ * reconstructed from the immutable row/config snapshot before lazily binding
+ * the legacy key to a hash. Ambiguous non-empty Agent selections are rejected.
+ */
+function legacySessionMatchesRequest(
+  session: SessionRow,
+  input: CreateSessionInput,
+): boolean {
+  let snapshot: ConfigSnapshot
+  try {
+    snapshot = JSON.parse(session.config_snapshot) as ConfigSnapshot
+  } catch {
+    return false
+  }
+
+  const direction = input.direction ?? 'en_to_zh'
+  const reviewMode = input.reviewMode ?? 'main_editor'
+  const presetRevisionId = input.presetRevisionId ?? null
+  if (
+    session.source_text !== input.sourceText ||
+    session.source_lang !== input.sourceLang ||
+    session.target_lang !== input.targetLang ||
+    (session.direction ?? snapshot.direction ?? 'en_to_zh') !== direction ||
+    (session.task_brief ?? snapshot.taskBrief ?? '') !== (input.taskBrief ?? '') ||
+    (session.review_mode ?? snapshot.orchestrationPolicy?.reviewMode ??
+      'main_editor') !== reviewMode ||
+    (session.preset_revision_id ??
+      snapshot.presetRevisionSnapshot?.id ??
+      null) !== presetRevisionId ||
+    (snapshot.promptBundleRevisionId ?? null) !==
+      (input.promptBundleRevisionId ?? null) ||
+    (snapshot.projectId ?? null) !== (input.projectId ?? null)
+  ) {
+    return false
+  }
+
+  const presetConstraints =
+    snapshot.presetRevisionSnapshot?.contract.constraints ?? {}
+  const expectedConstraints = {
+    ...presetConstraints,
+    ...(input.constraints ?? {}),
+  }
+  if (
+    canonicalJson(snapshot.constraints ?? {}) !==
+    canonicalJson(expectedConstraints)
+  ) {
+    return false
+  }
+
+  const requestedVariantIds = normalizedAgentVariantIds(
+    input.allowedAgentVariantIds,
+  )
+  if (requestedVariantIds.length > 0 && !presetRevisionId) {
+    const frozenVariantIds = normalizedAgentVariantIds(
+      snapshot.agentVariantSnapshots?.map((variant) => variant.id),
+    )
+    if (canonicalJson(requestedVariantIds) !== canonicalJson(frozenVariantIds)) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function normalizeLiteral(value: string): string {
+  return value.normalize('NFKC').toLowerCase()
+}
+
+function containsExactLiteral(
+  normalizedHaystack: string,
+  needle: string | null,
+): boolean {
+  const normalizedNeedle = needle ? normalizeLiteral(needle.trim()) : ''
+  if (!normalizedNeedle) return false
+  const needsLeadingBoundary = /[\p{Script=Latin}\p{N}_]/u.test(
+    normalizedNeedle[0],
+  )
+  const needsTrailingBoundary = /[\p{Script=Latin}\p{N}_]/u.test(
+    normalizedNeedle[normalizedNeedle.length - 1],
+  )
+  let offset = 0
+  while (offset <= normalizedHaystack.length - normalizedNeedle.length) {
+    const index = normalizedHaystack.indexOf(normalizedNeedle, offset)
+    if (index < 0) return false
+    const before = index > 0 ? normalizedHaystack[index - 1] : ''
+    const after = normalizedHaystack[index + normalizedNeedle.length] ?? ''
+    const leadingBoundaryOk =
+      !needsLeadingBoundary ||
+      !before ||
+      !/[\p{Script=Latin}\p{N}_]/u.test(before)
+    const trailingBoundaryOk =
+      !needsTrailingBoundary ||
+      !after ||
+      !/[\p{Script=Latin}\p{N}_]/u.test(after)
+    if (leadingBoundaryOk && trailingBoundaryOk) return true
+    offset = index + 1
+  }
+  return false
+}
+
+function selectRelevantProjectResources(
+  resources: FrozenProjectResource[],
+  sourceText: string,
+  taskBrief: string,
+): FrozenProjectResource[] {
+  const normalizedSourceText = normalizeLiteral(sourceText)
+  const normalizedTaskBrief = normalizeLiteral(taskBrief)
+  const requestText = `${normalizedSourceText}\n${normalizedTaskBrief}`
+  return resources.filter(({ revision }) => {
+    const { scope, kind, content } = revision
+    if (
+      scope.level !== 'project' &&
+      !containsExactLiteral(requestText, scope.selector)
+    ) {
+      return false
+    }
+    if (scope.pinned) return true
+    if (kind === 'style_rule' || kind === 'context_note') return true
+
+    if (
+      kind === 'term' ||
+      kind === 'proper_noun' ||
+      kind === 'approved_decision'
+    ) {
+      return (
+        containsExactLiteral(requestText, content.sourceText) ||
+        containsExactLiteral(normalizedTaskBrief, content.targetText)
+      )
+    }
+
+    const exactCandidates = [
+      content.sourceText,
+      content.targetText,
+      content.instruction,
+      content.note,
+    ]
+    const contentMatches = exactCandidates.some((candidate) =>
+      containsExactLiteral(requestText, candidate),
+    )
+
+    // Character/document-scoped voice and example entries become relevant
+    // once their mandatory selector matches. Project-wide examples still need
+    // an exact literal anchor so a large project snapshot is not injected whole.
+    return scope.level !== 'project' || contentMatches
+  })
 }
 
 // ===========================================================================
@@ -143,22 +349,80 @@ export function createSessionService(
     // createSession — create a draft session + translation_results
     // ──────────────────────────────────────────────────────────
     createSession(input: CreateSessionInput): SessionRow {
-      // 1. Guards
-      assertSourceNonEmpty(input.sourceText)
-
       const supportsClientRequestId = (
         db.prepare('PRAGMA table_info(sessions)').all() as Array<{
           name: string
         }>
       ).some((column) => column.name === 'client_request_id')
-      if (input.clientRequestId && supportsClientRequestId) {
+      const supportsIdempotencyHash = tableExists(
+        db,
+        'session_idempotency_records',
+      )
+      const requestHash = sessionRequestHash(input)
+      const findIdempotentSession = (): SessionRow | undefined => {
+        if (!input.clientRequestId || !supportsClientRequestId) return undefined
         const existing = db.prepare(
           'SELECT * FROM sessions WHERE client_request_id=?',
         ).get(input.clientRequestId) as SessionRow | undefined
+        if (!existing) return undefined
+
+        if (supportsIdempotencyHash) {
+          const record = db.prepare(
+            `SELECT request_hash, session_id
+             FROM session_idempotency_records
+             WHERE client_request_id=?`,
+          ).get(input.clientRequestId) as
+            | { request_hash: string; session_id: string }
+            | undefined
+          if (record) {
+            if (
+              record.session_id !== existing.id ||
+              record.request_hash !== requestHash
+            ) {
+              throw new SessionIdempotencyConflictError()
+            }
+            return existing
+          }
+        }
+
+        if (!legacySessionMatchesRequest(existing, input)) {
+          throw new SessionIdempotencyConflictError()
+        }
+        if (supportsIdempotencyHash) {
+          db.prepare(
+            `INSERT OR IGNORE INTO session_idempotency_records (
+               client_request_id, request_hash, session_id
+             ) VALUES (?, ?, ?)`,
+          ).run(input.clientRequestId, requestHash, existing.id)
+          const backfilled = db.prepare(
+            `SELECT request_hash, session_id
+             FROM session_idempotency_records
+             WHERE client_request_id=?`,
+          ).get(input.clientRequestId) as
+            | { request_hash: string; session_id: string }
+            | undefined
+          if (
+            !backfilled ||
+            backfilled.session_id !== existing.id ||
+            backfilled.request_hash !== requestHash
+          ) {
+            throw new SessionIdempotencyConflictError()
+          }
+        }
+        return existing
+      }
+      if (input.clientRequestId && supportsClientRequestId) {
+        const existing = findIdempotentSession()
         if (existing) return existing
       }
 
-      const agents = repos.translatorAgents.list()
+      // 1. Guards. Compare a previously used key first so every changed
+      // payload consistently reports an idempotency conflict.
+      assertSourceNonEmpty(input.sourceText)
+
+      const agents = repos.translatorAgents
+        .list()
+        .filter((agent) => agent.endpoint_id != null)
       const direction = input.direction ?? 'en_to_zh'
       const vnext = tableExists(db, 'agent_direction_variants')
         ? createVNextRepositories(db)
@@ -350,10 +614,74 @@ export function createSessionService(
           },
         })
       }
+
+      const resolveProjectFreezePlan = () => {
+        if (!input.projectId) return null
+        if (
+          !tableExists(db, 'translation_projects') ||
+          !tableExists(db, 'session_project_contexts')
+        ) {
+          throw new ProjectRepositoryError(
+            'project_not_found',
+            `Translation project ${input.projectId} was not found.`,
+          )
+        }
+        const projectRepositories = createProjectRepositories(db)
+        const project = projectRepositories.projects.get(input.projectId)
+        if (!project) {
+          throw new ProjectRepositoryError(
+            'project_not_found',
+            `Translation project ${input.projectId} was not found.`,
+          )
+        }
+        if (project.status !== 'active') {
+          throw new ProjectRepositoryError(
+            'project_archived',
+            `Translation project ${input.projectId} is archived and cannot start a new session.`,
+          )
+        }
+        if (project.direction !== direction) {
+          throw new ProjectRepositoryError(
+            'direction_mismatch',
+            `Project direction ${project.direction} does not match session direction ${direction}.`,
+          )
+        }
+        if (!project.currentSnapshotId) {
+          throw new ProjectRepositoryError(
+            'snapshot_not_found',
+            `Translation project ${input.projectId} has no current snapshot.`,
+          )
+        }
+        const snapshotResources = projectRepositories.snapshots.getResources(
+          project.id,
+          project.currentSnapshotId,
+        )
+        const resources = selectRelevantProjectResources(
+          snapshotResources,
+          input.sourceText,
+          input.taskBrief ?? '',
+        )
+        const projectFreezePlan = {
+          repositories: projectRepositories,
+          projectId: project.id,
+          projectSnapshotId: project.currentSnapshotId,
+          resourceRevisionIds: resources.map(
+            (resource) => resource.revision.id,
+          ),
+          tokenEstimate: estimateProjectContextTokens(resources),
+        }
+        Object.assign(snapshot, {
+          projectId: project.id,
+          projectSnapshotId: project.currentSnapshotId,
+        })
+        return projectFreezePlan
+      }
       const id = randomUUID()
 
-      // 3. Transaction: session + one translation_result per agent
+      // 3. Transaction: resolve the current project snapshot, insert the
+      // session and children, then freeze the selected resource subset.
       const txn = db.transaction(() => {
+        const projectFreezePlan = resolveProjectFreezePlan()
         repos.sessions.insert({
           id,
           source_text: input.sourceText,
@@ -389,6 +717,13 @@ export function createSessionService(
           db.prepare(
             'UPDATE sessions SET client_request_id=? WHERE id=?',
           ).run(input.clientRequestId, id)
+          if (supportsIdempotencyHash) {
+            db.prepare(
+              `INSERT INTO session_idempotency_records (
+                 client_request_id, request_hash, session_id
+               ) VALUES (?, ?, ?)`,
+            ).run(input.clientRequestId, requestHash, id)
+          }
         }
 
         for (const agent of agents) {
@@ -403,9 +738,30 @@ export function createSessionService(
             attempt: 0,
           })
         }
+
+        if (projectFreezePlan) {
+          projectFreezePlan.repositories.sessionProjectContexts.freezeForSession({
+            sessionId: id,
+            projectId: projectFreezePlan.projectId,
+            projectSnapshotId: projectFreezePlan.projectSnapshotId,
+            direction,
+            resourceRevisionIds: projectFreezePlan.resourceRevisionIds,
+            tokenEstimate: projectFreezePlan.tokenEstimate,
+          })
+        }
       })
 
-      txn()
+      try {
+        txn()
+      } catch (error) {
+        // A concurrent creator may have committed the same key after our
+        // initial lookup. Re-validate its request hash before replaying it.
+        if (input.clientRequestId && supportsClientRequestId) {
+          const existing = findIdempotentSession()
+          if (existing) return existing
+        }
+        throw error
+      }
 
       // 4. Return the fresh row
       return repos.sessions.getById(id)!

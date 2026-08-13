@@ -7,7 +7,7 @@
  * non-stream fallback, AbortSignal.any merging, network errors.
  */
 
-import { describe, it, expect, afterEach, beforeEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { startMockLLM, type MockLLMInstance } from '../fixtures/mock-llm';
 import {
   chatCompletion,
@@ -275,6 +275,262 @@ describe('chatCompletion', () => {
       } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
       }
+    });
+  });
+
+  describe('streaming usage compatibility', () => {
+    async function readRequestBody(
+      req: import('http').IncomingMessage,
+    ): Promise<Record<string, unknown>> {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      return JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<
+        string,
+        unknown
+      >;
+    }
+
+    async function listenOnLoopback(
+      server: import('http').Server,
+    ): Promise<string> {
+      await new Promise<void>((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(0, '127.0.0.1', () => resolve());
+      });
+      const address = server.address();
+      if (!address || typeof address === 'string') {
+        throw new Error('stream compatibility server did not bind a TCP port');
+      }
+      return `http://127.0.0.1:${address.port}`;
+    }
+
+    async function closeServer(server: import('http').Server): Promise<void> {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (
+            error &&
+            (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING'
+          ) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+        server.closeAllConnections();
+      });
+    }
+
+    it('requests usage and carries a choices=[] usage frame into done', async () => {
+      const http = await import('http');
+      const requestBodies: Array<Record<string, unknown>> = [];
+      const server = http.createServer(async (req, res) => {
+        requestBodies.push(await readRequestBody(req));
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.write(`data: ${JSON.stringify({
+          choices: [{
+            index: 0,
+            delta: { content: 'Usage-aware response' },
+            finish_reason: null,
+          }],
+          usage: null,
+        })}\n\n`);
+        res.write(`data: ${JSON.stringify({
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          usage: null,
+        })}\n\n`);
+        res.write(`data: ${JSON.stringify({
+          choices: [],
+          usage: {
+            prompt_tokens: 21,
+            completion_tokens: 8,
+            total_tokens: 29,
+          },
+        })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      });
+      const url = await listenOnLoopback(server);
+
+      try {
+        const result = await chatCompletion(
+          { baseUrl: url, apiKey: 'sk-test' },
+          makeRequest({ stream: true }),
+        );
+        const events = await collectStreamEvents(
+          result as AsyncIterable<LLMStreamEvent>,
+        );
+        const done = events.at(-1);
+
+        expect(requestBodies).toHaveLength(1);
+        expect(requestBodies[0].stream_options).toEqual({
+          include_usage: true,
+        });
+        expect(done).toMatchObject({
+          type: 'done',
+          content: 'Usage-aware response',
+          transport: 'sse',
+          usage: {
+            prompt_tokens: 21,
+            completion_tokens: 8,
+            total_tokens: 29,
+          },
+        });
+      } finally {
+        await closeServer(server);
+      }
+    });
+
+    it('retries once without stream_options when the endpoint rejects it', async () => {
+      const http = await import('http');
+      const requestBodies: Array<Record<string, unknown>> = [];
+      let retryError: ClientError | undefined;
+      let callbackObservedBeforeRetry = false;
+      const server = http.createServer(async (req, res) => {
+        const body = await readRequestBody(req);
+        requestBodies.push(body);
+        if ('stream_options' in body) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            error: {
+              message: 'Unsupported parameter: stream_options',
+              type: 'invalid_request_error',
+              code: 'unsupported_parameter',
+            },
+          }));
+          return;
+        }
+
+        callbackObservedBeforeRetry = retryError instanceof ClientError;
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.write(`data: ${JSON.stringify({
+          choices: [{
+            index: 0,
+            delta: { content: 'Compatible fallback' },
+            finish_reason: 'stop',
+          }],
+        })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      });
+      const url = await listenOnLoopback(server);
+
+      try {
+        const result = await chatCompletion(
+          { baseUrl: url, apiKey: 'sk-test' },
+          makeRequest({
+            stream: true,
+            onCompatibilityRetry(error) {
+              retryError = error;
+              throw new Error('telemetry failure must be ignored');
+            },
+          }),
+        );
+        const events = await collectStreamEvents(
+          result as AsyncIterable<LLMStreamEvent>,
+        );
+
+        expect(events.at(-1)).toMatchObject({
+          type: 'done',
+          content: 'Compatible fallback',
+        });
+        expect(requestBodies).toHaveLength(2);
+        expect(requestBodies[0].stream_options).toEqual({
+          include_usage: true,
+        });
+        expect(requestBodies[1]).not.toHaveProperty('stream_options');
+        expect(callbackObservedBeforeRetry).toBe(true);
+        expect(retryError).toMatchObject({
+          code: 'client_error',
+          status: 400,
+          message: 'Unsupported parameter: stream_options',
+        });
+      } finally {
+        await closeServer(server);
+      }
+    });
+
+    it('bounds an unsupported stream_options fallback to one retry', async () => {
+      const http = await import('http');
+      let requestCount = 0;
+      const server = http.createServer(async (req, res) => {
+        await readRequestBody(req);
+        requestCount++;
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          error: {
+            message: 'stream_options is not supported',
+            type: 'invalid_request_error',
+          },
+        }));
+      });
+      const url = await listenOnLoopback(server);
+
+      try {
+        const result = await chatCompletion(
+          { baseUrl: url, apiKey: 'sk-test' },
+          makeRequest({ stream: true }),
+        );
+        await expect(
+          collectStreamEvents(result as AsyncIterable<LLMStreamEvent>),
+        ).rejects.toBeInstanceOf(ClientError);
+        expect(requestCount).toBe(2);
+      } finally {
+        await closeServer(server);
+      }
+    });
+
+    it('does not retry an unrelated 400 that merely echoes the request', async () => {
+      const http = await import('http');
+      let requestCount = 0;
+      const server = http.createServer(async (req, res) => {
+        const request = await readRequestBody(req);
+        requestCount++;
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          error: {
+            message: 'max_tokens must be greater than zero',
+            type: 'invalid_request_error',
+          },
+          request,
+        }));
+      });
+      const url = await listenOnLoopback(server);
+
+      try {
+        const result = await chatCompletion(
+          { baseUrl: url, apiKey: 'sk-test' },
+          makeRequest({ stream: true }),
+        );
+        await expect(
+          collectStreamEvents(result as AsyncIterable<LLMStreamEvent>),
+        ).rejects.toBeInstanceOf(ClientError);
+        expect(requestCount).toBe(1);
+      } finally {
+        await closeServer(server);
+      }
+    });
+
+    it('does not retry a successful JSON fallback response', async () => {
+      llm.setBehavior('test-model', { behavior: 'non_stream' });
+
+      const result = await chatCompletion(
+        endpoint,
+        makeRequest({ stream: true }),
+      );
+      const events = await collectStreamEvents(
+        result as AsyncIterable<LLMStreamEvent>,
+      );
+
+      expect(events.at(-1)).toMatchObject({
+        type: 'done',
+        transport: 'json_fallback',
+      });
+      expect(llm.getRequests()).toHaveLength(1);
+      expect(
+        (llm.getRequests()[0].body as Record<string, unknown>).stream_options,
+      ).toEqual({ include_usage: true });
     });
   });
 
@@ -706,47 +962,212 @@ describe('chatCompletion', () => {
 
   describe('abort propagation', () => {
     it('aborts an in-progress streaming request and throws AbortedError', async () => {
-      llm.setBehavior('test-model', {
-        behavior: 'stream',
-        chunkDelayMs: 100, // slow enough to abort mid-stream
+      const http = await import('http');
+      let resolveProviderReady!: () => void;
+      let resolveProviderDisconnected!: () => void;
+      const providerReady = new Promise<void>((resolve) => {
+        resolveProviderReady = resolve;
       });
+      const providerDisconnected = new Promise<void>((resolve) => {
+        resolveProviderDisconnected = resolve;
+      });
+      const server = http.createServer((req, res) => {
+        req.resume();
+        req.once('end', () => {
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            Connection: 'keep-alive',
+          });
+          res.once('close', resolveProviderDisconnected);
+          res.write(`data: ${JSON.stringify({
+            choices: [{
+              index: 0,
+              delta: { content: 'first token' },
+              finish_reason: null,
+            }],
+          })}\n\n`);
+          resolveProviderReady();
+        });
+      });
+      await new Promise<void>((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(0, '127.0.0.1', () => resolve());
+      });
+      const address = server.address();
+      if (!address || typeof address === 'string') {
+        throw new Error('abort test server did not bind a TCP port');
+      }
 
       const controller = new AbortController();
-
-      const result = await chatCompletion(
-        endpoint,
-        makeRequest({ stream: true, signal: controller.signal }),
-      );
-
-      // Start consuming the async generator (this kicks off the fetch)
-      const consumePromise = collectStreamEvents(
-        result as AsyncIterable<LLMStreamEvent>,
-      );
-
-      // Wait until the mock server has accepted the request so this test
-      // exercises a mid-stream abort even when the full suite is under load.
-      const requestDeadline = Date.now() + 1_000;
-      while (llm.getRequests().length === 0 && Date.now() < requestDeadline) {
-        await new Promise((r) => setTimeout(r, 10));
-      }
-      controller.abort();
-
-      // The consumption should now throw AbortedError
-      await expect(consumePromise).rejects.toThrow(AbortedError);
-
       try {
-        await consumePromise;
-        expect.fail('Should have thrown');
-      } catch (err) {
-        expect(err).toBeInstanceOf(AbortedError);
-        const e = err as AbortedError;
+        const result = await chatCompletion(
+          {
+            baseUrl: `http://127.0.0.1:${address.port}`,
+            apiKey: 'sk-test',
+          },
+          makeRequest({ stream: true, signal: controller.signal }),
+        );
+
+        // Attach both fulfillment and rejection handlers before waiting for
+        // the provider. This promise can never reject unobserved, even when a
+        // busy full-suite worker loses the socket race.
+        const outcomePromise = collectStreamEvents(
+          result as AsyncIterable<LLMStreamEvent>,
+        ).then(
+          (events) => ({ status: 'fulfilled' as const, events }),
+          (error: unknown) => ({ status: 'rejected' as const, error }),
+        );
+
+        await providerReady;
+        controller.abort();
+
+        const outcome = await outcomePromise;
+        expect(outcome.status).toBe('rejected');
+        if (outcome.status !== 'rejected') {
+          throw new Error('stream consumption unexpectedly completed');
+        }
+        expect(outcome.error).toBeInstanceOf(AbortedError);
+        const e = outcome.error as AbortedError;
         expect(e.code).toBe('aborted');
         expect(e.retryable).toBe(false);
+
+        await providerDisconnected;
+      } finally {
+        await new Promise<void>((resolve, reject) => {
+          server.close((error) => {
+            if (
+              error &&
+              (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING'
+            ) {
+              reject(error);
+              return;
+            }
+            resolve();
+          });
+          server.closeAllConnections();
+        });
+      }
+    });
+
+    it('prioritizes an aborted external signal over an existing stream NetworkError', async () => {
+      const controller = new AbortController();
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response(null, {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        }),
+      );
+
+      try {
+        const result = await chatCompletion(
+          endpoint,
+          makeRequest({
+            stream: true,
+            signal: controller.signal,
+            onActivity: () => controller.abort(),
+          }),
+        );
+
+        await expect(
+          collectStreamEvents(result as AsyncIterable<LLMStreamEvent>),
+        ).rejects.toBeInstanceOf(AbortedError);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+
+    it('iterator.return aborts the upstream SSE connection', async () => {
+      const http = await import('http');
+      let heartbeat: ReturnType<typeof setInterval> | undefined;
+      let resolveDisconnected!: () => void;
+      const disconnected = new Promise<void>((resolve) => {
+        resolveDisconnected = resolve;
+      });
+      const server = http.createServer((req, res) => {
+        req.resume();
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+        });
+        res.on('close', () => {
+          if (heartbeat) clearInterval(heartbeat);
+          resolveDisconnected();
+        });
+        res.write(`data: ${JSON.stringify({
+          choices: [{
+            index: 0,
+            delta: { content: 'first token' },
+            finish_reason: null,
+          }],
+        })}\n\n`);
+        heartbeat = setInterval(() => {
+          if (!res.destroyed) res.write(': keep-alive\n\n');
+        }, 20);
+      });
+      await new Promise<void>((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(0, '127.0.0.1', () => resolve());
+      });
+      const address = server.address();
+      if (!address || typeof address === 'string') {
+        throw new Error('abort test server did not bind a TCP port');
       }
 
-      // Verify the mock server received the request (connection was made)
-      const requests = llm.getRequests();
-      expect(requests.length).toBe(1);
+      try {
+        const result = await chatCompletion(
+          {
+            baseUrl: `http://127.0.0.1:${address.port}`,
+            apiKey: 'sk-test',
+          },
+          makeRequest({
+            stream: true,
+            timeoutMs: 5_000,
+            maxDurationMs: 5_000,
+          }),
+        );
+        const iterator = (
+          result as AsyncIterable<LLMStreamEvent>
+        )[Symbol.asyncIterator]();
+        expect(await iterator.next()).toMatchObject({
+          done: false,
+          value: { type: 'text', content: 'first token' },
+        });
+
+        await expect(iterator.return?.()).resolves.toMatchObject({
+          done: true,
+        });
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([
+            disconnected,
+            new Promise<never>((_resolve, reject) => {
+              timeout = setTimeout(
+                () => reject(new Error('upstream SSE connection stayed open')),
+                1_000,
+              );
+            }),
+          ]);
+        } finally {
+          if (timeout) clearTimeout(timeout);
+        }
+      } finally {
+        if (heartbeat) clearInterval(heartbeat);
+        await new Promise<void>((resolve, reject) => {
+          server.close((error) => {
+            if (
+              error &&
+              (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING'
+            ) {
+              reject(error);
+              return;
+            }
+            resolve();
+          });
+          server.closeAllConnections();
+        });
+      }
     });
 
     it('aborts a non-streaming request and throws AbortedError', async () => {
@@ -968,6 +1389,44 @@ describe('chatCompletion', () => {
   // =========================================================================
 
   describe('reasoning-content stripping', () => {
+    const LOOPBACK_HOST = '127.0.0.1';
+
+    function listenOnLoopback(server: import('http').Server): Promise<string> {
+      return new Promise((resolve, reject) => {
+        const onError = (error: Error) => reject(error);
+        server.once('error', onError);
+        server.listen(0, LOOPBACK_HOST, () => {
+          server.off('error', onError);
+          const address = server.address();
+          if (!address || typeof address === 'string') {
+            reject(new Error('reasoning test server did not bind a TCP port'));
+            return;
+          }
+          resolve(`http://${LOOPBACK_HOST}:${address.port}`);
+        });
+      });
+    }
+
+    function closeTestServer(server: import('http').Server): Promise<void> {
+      return new Promise((resolve, reject) => {
+        server.close((error) => {
+          if (
+            error &&
+            (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING'
+          ) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+        // Undici keeps completed SSE connections alive for reuse. Closing the
+        // listener alone can therefore leave each test waiting several seconds
+        // and, under the full parallel suite, accumulate enough loopback
+        // sockets to make a later fetch fail before it reaches the fixture.
+        server.closeAllConnections();
+      });
+    }
+
     /** Start an inline HTTP server that returns a non-streaming response
      *  carrying both `content` and a reasoning field. */
     async function startReasoningNonStreamServer(
@@ -995,11 +1454,10 @@ describe('chatCompletion', () => {
           usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
         }));
       });
-      await new Promise<void>((resolve) => server.listen(0, () => resolve()));
-      const addr = server.address() as { port: number };
+      const url = await listenOnLoopback(server);
       return {
-        url: `http://localhost:${addr.port}`,
-        close: () => new Promise<void>((res) => server.close(() => res())),
+        url,
+        close: () => closeTestServer(server),
       };
     }
 
@@ -1043,11 +1501,10 @@ describe('chatCompletion', () => {
         };
         sendNext();
       });
-      await new Promise<void>((resolve) => server.listen(0, () => resolve()));
-      const addr = server.address() as { port: number };
+      const url = await listenOnLoopback(server);
       return {
-        url: `http://localhost:${addr.port}`,
-        close: () => new Promise<void>((res) => server.close(() => res())),
+        url,
+        close: () => closeTestServer(server),
       };
     }
 
@@ -1092,13 +1549,12 @@ describe('chatCompletion', () => {
         };
         send();
       });
-      await new Promise<void>((resolve) => server.listen(0, () => resolve()));
-      const addr = server.address() as { port: number };
+      const url = await listenOnLoopback(server);
       return {
-        url: `http://localhost:${addr.port}`,
+        url,
         close: () => {
           for (const timer of timers) clearTimeout(timer);
-          return new Promise<void>((resolve) => server.close(() => resolve()));
+          return closeTestServer(server);
         },
       };
     }

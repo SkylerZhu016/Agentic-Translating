@@ -41,7 +41,7 @@ export interface EndpointConfig {
 export interface TranslatorAgentConfig {
   id: number
   name: string
-  endpoint_id: number
+  endpoint_id: number | null
   model: string
   prompt_override: string | null
   sort_order: number
@@ -208,6 +208,8 @@ export interface ConfigSnapshot {
   }
   presetRevisionSnapshot?: WorkflowPresetRevision | null
   promptBundleRevisionId?: string | null
+  projectId?: string | null
+  projectSnapshotId?: string | null
   taskBrief?: string
   constraints?: TranslationConstraints
   orchestrationPolicy?: {

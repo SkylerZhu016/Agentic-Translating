@@ -12,13 +12,17 @@
 //     - Configurable loop cap via CHAT_LOOP_MAX
 // ---------------------------------------------------------------------------
 
-import { chatCompletion, isAsyncIterable, ToolsNotSupportedError } from '../llm/client';
+import { isAsyncIterable, ToolsNotSupportedError } from '../llm/client';
 import type { ChatCompletionRequest, ChatCompletionResponse, LLMStreamEvent } from '../llm/client';
 import { applyExactReplacementBatch, type Edit } from '../editing/replace';
 import { CHAT_TOOLS } from './tools';
 import { executeProgrammaticTool } from './program-tools';
 import { CHAT_LOOP_MAX } from '../constants';
 import { resolveCompletionTokenBudget } from '../guards/tokens';
+import {
+  ledgeredChatCompletion,
+  type BestEffortLlmCallContext,
+} from '../services/llm-call-ledger';
 
 const MAX_EDIT_CORRECTION_ATTEMPTS = 1;
 
@@ -56,6 +60,10 @@ export interface RunChatTurnParams {
   contextWindow?: number | null;
   /** Optional explicit completion budget. Defaults to 65,536 tokens. */
   maxTokens?: number;
+  /** Cancels every physical provider request made by this chat turn. */
+  signal?: AbortSignal;
+  /** Privacy-safe accounting identifiers for this session's physical calls. */
+  ledger?: Omit<BestEffortLlmCallContext, 'operation' | 'retryCount'>;
 }
 
 /** Result of a chat turn */
@@ -264,6 +272,8 @@ async function callWithTools(
   onActivity?: () => void,
   stream: boolean = true,
   maxTokens?: number,
+  signal?: AbortSignal,
+  ledgerContext?: BestEffortLlmCallContext,
 ): Promise<CollectedStreamResult> {
   const request: ChatCompletionRequest = {
     model,
@@ -272,9 +282,10 @@ async function callWithTools(
     maxTokens,
     stream,
     onActivity,
+    signal,
   };
 
-  const result = await chatCompletion(endpoint, request);
+  const result = await ledgeredChatCompletion(endpoint, request, ledgerContext);
   return collectStream(result, onDelta);
 }
 
@@ -289,6 +300,8 @@ async function callJsonFence(
   onDelta?: (text: string) => void,
   onActivity?: () => void,
   maxTokens?: number,
+  signal?: AbortSignal,
+  ledgerContext?: BestEffortLlmCallContext,
 ): Promise<CollectedStreamResult> {
   const request: ChatCompletionRequest = {
     model,
@@ -296,9 +309,10 @@ async function callJsonFence(
     maxTokens,
     stream: false, // Non-streaming for easier JSON parsing
     onActivity,
+    signal,
   };
 
-  const result = await chatCompletion(endpoint, request);
+  const result = await ledgeredChatCompletion(endpoint, request, ledgerContext);
   return collectStream(result, onDelta);
 }
 
@@ -356,6 +370,18 @@ export async function runChatTurn(
   let useFallbackProtocol = false;
   let fallbackSystemInjected = false;
   let editCorrectionAttempts = 0;
+  let physicalRequestCount = 0;
+
+  const nextLedgerContext = (): BestEffortLlmCallContext | undefined => {
+    if (!params.ledger) return undefined;
+    const retryCount = physicalRequestCount;
+    physicalRequestCount += 1;
+    return {
+      ...params.ledger,
+      operation: 'chat_edit',
+      retryCount,
+    };
+  };
 
   for (let iteration = 0; iteration < CHAT_LOOP_MAX; iteration++) {
     let collected: CollectedStreamResult;
@@ -390,6 +416,8 @@ export async function runChatTurn(
           onDelta,
           onActivity,
           maxTokens,
+          params.signal,
+          nextLedgerContext(),
         );
       } else {
         // Native tools protocol
@@ -402,6 +430,8 @@ export async function runChatTurn(
           onActivity,
           stream,
           maxTokens,
+          params.signal,
+          nextLedgerContext(),
         );
       }
     } catch (error: unknown) {

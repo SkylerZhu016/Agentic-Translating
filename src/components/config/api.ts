@@ -4,6 +4,7 @@
 // ---------------------------------------------------------------------------
 
 import type { ConfigPresetRow, FullPreset } from '@/src/lib/contracts/types'
+import type { EndpointDeleteConflictDto } from '@/src/lib/contracts/endpoint-references'
 
 export interface Endpoint {
   id: number
@@ -19,7 +20,7 @@ export interface Endpoint {
 export interface Agent {
   id: number
   name: string
-  endpoint_id: number
+  endpoint_id: number | null
   model: string
   prompt_override: string | null
   sort_order: number
@@ -67,11 +68,8 @@ export class ApiError extends Error {
   }
 }
 
-/** DELETE /api/endpoints/[id] 409 时的负载形状（E30） */
-export interface EndpointDeleteConflict {
-  error: string
-  usedBySessions: string[]
-}
+/** DELETE /api/endpoints/[id] 409 时的隐私安全引用摘要。 */
+export type EndpointDeleteConflict = EndpointDeleteConflictDto
 
 export function isApiError(e: unknown): e is ApiError {
   return e instanceof ApiError
@@ -125,7 +123,7 @@ export const configApi = {
     data: { name?: string; base_url?: string; chat_completions_path?: string; api_key?: string; context_window?: number | null },
   ) =>
     request<Endpoint>(`/api/endpoints/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
-  /** force=true 时绕过会话引用软锁（会话持有快照，删除不影响历史） */
+  /** force=true 时原子解除当前绑定并删除端点；冻结历史保持不变。 */
   deleteEndpoint: (id: number, opts?: { force?: boolean }) =>
     request<{ success: true }>(`/api/endpoints/${id}${opts?.force ? '?force=1' : ''}`, {
       method: 'DELETE',

@@ -13,6 +13,7 @@ const directionSchema = z.enum(['en_to_zh', 'zh_to_en'])
 const draftSchema = z.object({
   sourceText: z.string(),
   taskBrief: z.string(),
+  selectedProjectId: z.string().uuid().nullable().optional().default(null),
   selectedPresetRevisionId: z.string().min(1).nullable(),
   allowedAgentVariantIds: z.array(z.string().min(1)),
   reviewMode: z.enum(['main_editor', 'four_stage']),

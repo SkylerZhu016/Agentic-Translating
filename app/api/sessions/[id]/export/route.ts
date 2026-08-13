@@ -3,11 +3,28 @@ export const runtime = 'nodejs'
 import { getDb } from '@/src/lib/db'
 import { migrate } from '@/src/lib/db/migrate'
 import { createRepositories } from '@/src/lib/db/repositories'
+import { createProjectRepositories } from '@/src/lib/db/project-repositories'
 import { redactSecrets } from '@/src/lib/security/public-dto'
+import {
+  publicPersistedExecutionError,
+  type ExecutionDiagnosticErrorDto,
+} from '@/src/lib/security/diagnostic-error'
 import { parseSemanticAgentOutput } from '@/src/lib/protocol/semantic-output'
 
 function safeFilename(value: string) {
   return value.replace(/[^a-zA-Z0-9._-]+/g, '-').slice(0, 80)
+}
+
+function markdownExecutionError(
+  diagnostic: ExecutionDiagnosticErrorDto | null,
+): string {
+  if (!diagnostic) return ''
+  return [
+    diagnostic.message,
+    '',
+    `- 错误代码：${diagnostic.error}`,
+    `- diagnosticId：${diagnostic.diagnosticId}`,
+  ].join('\n')
 }
 
 export async function GET(
@@ -18,6 +35,7 @@ export async function GET(
   const db = getDb()
   migrate(db)
   const repos = createRepositories(db)
+  const projectRepos = createProjectRepositories(db)
   const session = repos.sessions.getById(id)
   if (!session) return Response.json({ error: 'session_not_found' }, { status: 404 })
   const results = repos.translationResults.listBySession(id)
@@ -30,19 +48,44 @@ export async function GET(
   const patches = db.prepare(
     'SELECT * FROM text_patches WHERE session_id=? ORDER BY created_at, id',
   ).all(id)
+  const projectContext =
+    projectRepos.sessionProjectContexts.getBySession(id) ?? null
   const config = redactSecrets(JSON.parse(session.config_snapshot))
+  const publicResults = results.map((result) => {
+    const errorDiagnostic = publicPersistedExecutionError(
+      result.error,
+      'translation',
+      `${result.session_id}:${result.id}`,
+    )
+    return {
+      ...result,
+      ...(errorDiagnostic
+        ? { error: errorDiagnostic.message, errorDiagnostic }
+        : {}),
+      semantic: parseSemanticAgentOutput(result.output_text ?? ''),
+    }
+  })
+  const publicStages = stages.map((stage) => {
+    const errorDiagnostic = publicPersistedExecutionError(
+      stage.error,
+      'stage',
+      `${stage.session_id}:${stage.id}`,
+    )
+    return {
+      ...stage,
+      ...(errorDiagnostic
+        ? { error: errorDiagnostic.message, errorDiagnostic }
+        : {}),
+      semantic: parseSemanticAgentOutput(stage.raw_output ?? ''),
+    }
+  })
   const payload = redactSecrets({
     session: { ...session, config_snapshot: undefined },
     config_snapshot: config,
-    legacy_results: results.map((result) => ({
-      ...result,
-      semantic: parseSemanticAgentOutput(result.output_text ?? ''),
-    })),
+    project_context: projectContext,
+    legacy_results: publicResults,
     invocations,
-    stages: stages.map((stage) => ({
-      ...stage,
-      semantic: parseSemanticAgentOutput(stage.raw_output ?? ''),
-    })),
+    stages: publicStages,
     versions,
     patches,
     messages,
@@ -62,6 +105,21 @@ export async function GET(
       '',
       session.task_brief || '无',
       '',
+      '## 本次冻结的项目档案',
+      '',
+      projectContext
+        ? [
+            `- 项目：${projectContext.projectId}`,
+            `- 快照：${projectContext.projectSnapshotId}`,
+            `- 资源 revision：${projectContext.resourceRevisionIds.length}`,
+            `- 上下文 token 估算：${projectContext.tokenEstimate}`,
+            '',
+            '```json',
+            JSON.stringify(projectContext.resources, null, 2),
+            '```',
+          ].join('\n')
+        : '未绑定项目档案。',
+      '',
       '## 原文',
       '',
       session.source_text,
@@ -78,8 +136,13 @@ export async function GET(
       )
     }
     lines.push('## 四阶段', '')
-    for (const stage of stages) {
-      lines.push(`### ${stage.stage}`, '', stage.raw_output ?? stage.error ?? '', '')
+    for (const stage of publicStages) {
+      lines.push(
+        `### ${stage.stage}`,
+        '',
+        stage.raw_output ?? markdownExecutionError(stage.errorDiagnostic ?? null),
+        '',
+      )
     }
     lines.push('## 版本历史', '')
     for (const version of versions) {

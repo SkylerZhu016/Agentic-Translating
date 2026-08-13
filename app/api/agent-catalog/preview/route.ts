@@ -7,6 +7,7 @@ import { seed } from '@/src/lib/db/seed'
 import { createRepositories } from '@/src/lib/db/repositories'
 import { createVNextRepositories } from '@/src/lib/db/vnext-repositories'
 import { runIndependentAgentTest } from '@/src/lib/services/agent-test-service'
+import { publicDiagnosticError } from '@/src/lib/security/diagnostic-error'
 
 const inputSchema = z.object({
   direction: z.enum(['en_to_zh', 'zh_to_en']),
@@ -60,10 +61,11 @@ export async function POST(request: Request) {
         contextWindow: endpoint.context_window ?? null,
       },
       model: parsed.data.model,
+      ledger: { db, endpointId: parsed.data.endpointId },
     }))
-  } catch (error) {
+  } catch {
     return Response.json(
-      { error: error instanceof Error ? error.message : String(error) },
+      publicDiagnosticError('agent_test_failed'),
       { status: 502 },
     )
   }
