@@ -9,6 +9,7 @@ import {
 } from '../llm/client'
 import type { LlmCallUsage } from '../contracts/llm-call-records'
 import { createLlmCallRecordsService } from './llm-call-records-service'
+import { currentRuntimeEndpoint } from './runtime-endpoint-credentials'
 
 const SAFE_ERROR_CODES = new Set([
   'auth_error',
@@ -161,9 +162,18 @@ export function beginBestEffortLlmCall(
 export interface BestEffortLlmCallContext {
   db: Database.Database
   sessionId: string
+  runId?: string | null
+  invocationId?: string | null
   endpointId: number
   operation: string
   retryCount?: number
+  /**
+   * Session-owned paid-call paths set this flag so the credential is loaded
+   * from the current endpoint row immediately before provider I/O. It stays
+   * separate from best-effort accounting: a broken ledger must not replace a
+   * valid provider response with an accounting failure.
+   */
+  requireCurrentCredential?: boolean
 }
 
 /**
@@ -182,13 +192,19 @@ export async function ledgeredChatCompletion(
   context?: BestEffortLlmCallContext,
 ): Promise<ChatCompletionResponse | AsyncIterable<LLMStreamEvent>> {
   const baseRetryCount = context?.retryCount ?? 0
+  // Validate the complete live connection before creating an accounting row.
+  // The supplier below still re-reads the same row immediately before every
+  // physical fetch, including the stream_options compatibility retry.
+  const initialEndpoint = context?.requireCurrentCredential
+    ? currentRuntimeEndpoint(context.db, context.endpointId)
+    : endpoint
   const beginLedger = (retryCount: number) =>
     context
       ? beginBestEffortLlmCall({
           db: context.db,
           sessionId: context.sessionId,
-          runId: null,
-          invocationId: null,
+          runId: context.runId ?? null,
+          invocationId: context.invocationId ?? null,
           endpointId: context.endpointId,
           model: request.model,
           operation: context.operation,
@@ -197,9 +213,18 @@ export async function ledgeredChatCompletion(
       : NOOP_LEDGER
   let compatibilityRetryOffset = 0
   let ledger = beginLedger(baseRetryCount)
+  const runtimeEndpoint = {
+    ...initialEndpoint,
+    ...(context?.requireCurrentCredential
+      ? {
+          resolveRuntimeEndpoint: () =>
+            currentRuntimeEndpoint(context.db, context.endpointId),
+        }
+      : {}),
+  }
 
   try {
-    const response = await chatCompletion(endpoint, {
+    const response = await chatCompletion(runtimeEndpoint, {
       ...request,
       onCompatibilityRetry(error) {
         // The first HTTP request was explicitly rejected by the provider.

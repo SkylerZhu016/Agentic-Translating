@@ -13,10 +13,12 @@ import { usePathname, useRouter, useSearchParams } from 'next/navigation'
 import { Button, Modal } from '@/src/components/ui'
 import type { BuiltinDirection } from '@/src/lib/contracts/vnext'
 import { TID } from '@/src/lib/testids'
+import { useI18n } from '@/src/i18n/LocaleProvider'
 
 interface DraftController {
   dirty: boolean
   flush: () => Promise<void>
+  isInteractionLocked: () => boolean
 }
 
 interface DirectionContextValue {
@@ -36,6 +38,7 @@ async function saveSetting(key: string, value: string) {
 }
 
 export function DirectionProvider({ children }: { children: ReactNode }) {
+  const { t } = useI18n()
   const pathname = usePathname()
   const searchParams = useSearchParams()
   const router = useRouter()
@@ -95,6 +98,7 @@ export function DirectionProvider({ children }: { children: ReactNode }) {
   }, [searchParams])
 
   const performSwitch = useCallback(async (target: BuiltinDirection, suppress: boolean) => {
+    if (draftController.current?.isInteractionLocked()) return
     await draftController.current?.flush()
     await saveSetting('workspace_direction', target).catch(() => undefined)
     if (suppress) {
@@ -113,6 +117,7 @@ export function DirectionProvider({ children }: { children: ReactNode }) {
 
   const requestDirection = useCallback((target: BuiltinDirection) => {
     if (target === direction) return
+    if (draftController.current?.isInteractionLocked()) return
     const hasSession = pathname === '/' && Boolean(searchParams.get('session'))
     const hasDraft = pathname === '/' && Boolean(draftController.current?.dirty)
     if (!suppressed && (hasSession || hasDraft)) {
@@ -138,7 +143,7 @@ export function DirectionProvider({ children }: { children: ReactNode }) {
           setPending(null)
           setSuppressChecked(false)
         }}
-        title="切换翻译模式？"
+        title={t('direction.warning.title')}
         footer={
           <>
             <Button
@@ -149,20 +154,22 @@ export function DirectionProvider({ children }: { children: ReactNode }) {
                 setSuppressChecked(false)
               }}
             >
-              取消
+              {t('direction.warning.cancel')}
             </Button>
             <Button
               size="sm"
               testId={TID.direction.confirmButton}
               onClick={() => pending && void performSwitch(pending, suppressChecked)}
             >
-              {pending === 'zh_to_en' ? '切换至中译英' : '切换至英译中'}
+              {pending === 'zh_to_en'
+                ? t('direction.warning.confirmZhToEn')
+                : t('direction.warning.confirmEnToZh')}
             </Button>
           </>
         }
       >
         <p className="text-sm leading-6 text-ink-2">
-          切换模式会自动切换会话。旧会话进度已自动保存。
+          {t('direction.warning.description')}
         </p>
         <label className="mt-4 flex cursor-pointer items-center gap-2 text-sm text-ink-2">
           <input
@@ -172,7 +179,7 @@ export function DirectionProvider({ children }: { children: ReactNode }) {
             onChange={(event) => setSuppressChecked(event.target.checked)}
             className="h-4 w-4 accent-ink"
           />
-          不再提示
+          {t('direction.warning.suppress')}
         </label>
       </Modal>
     </DirectionContext.Provider>

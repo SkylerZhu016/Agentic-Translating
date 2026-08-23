@@ -8,6 +8,7 @@ import {
   estimateProjectContextTokens,
 } from '@/src/lib/db/project-repositories'
 import { createSessionService } from '@/src/lib/services/session-service'
+import { createWorkspaceModelProfilesRepo } from '@/src/lib/db/release-config-repositories'
 import type {
   ProjectResourceContent,
   ProjectResourceKind,
@@ -24,8 +25,45 @@ describe('session project binding', () => {
     db.pragma('foreign_keys = ON')
     migrate(db)
     seed(db)
+    const repositories = createRepositories(db)
+    repositories.endpoints.insert({
+      name: 'fixture-endpoint',
+      base_url: 'https://fixture.invalid',
+      api_key: 'fixture-secret',
+      context_window: 128_000,
+    })
+    const endpoint = repositories.endpoints.list()[0]
+    repositories.coordinatorConfig.upsert({
+      endpoint_id: endpoint.id,
+      model: 'fixture-model',
+      chat_endpoint_id: endpoint.id,
+      chat_model: 'fixture-model',
+    })
+    repositories.translatorAgents.insert({
+      name: 'fixture-translator',
+      endpoint_id: endpoint.id,
+      model: 'fixture-model',
+      prompt_override: null,
+      sort_order: 0,
+    })
+    const binding = {
+      endpointId: endpoint.id,
+      model: 'fixture-model',
+      contextWindow: 128_000,
+      maxOutputTokens: 4_096,
+    }
+    createWorkspaceModelProfilesRepo(db).upsert({
+      direction: 'en_to_zh',
+      defaultWorker: binding,
+      mainAgent: binding,
+      reviewAgent: binding,
+      filterAgent: binding,
+      orchestrateAgent: binding,
+      assembleAgent: binding,
+      editingAgent: binding,
+    })
     projects = createProjectRepositories(db)
-    service = createSessionService(db, createRepositories(db))
+    service = createSessionService(db, repositories)
   })
 
   afterEach(() => db.close())

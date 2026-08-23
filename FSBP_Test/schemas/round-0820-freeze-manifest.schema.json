@@ -1,0 +1,213 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentic-translating.local/schemas/round-0820-freeze-manifest.schema.json",
+  "title": "Round 0820 Frozen Experiment Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "roundId",
+    "namespace",
+    "mode",
+    "frozenAt",
+    "formalEligible",
+    "formalValidation",
+    "source",
+    "annotation_source",
+    "annotation_version",
+    "annotation_hash",
+    "determinism_level",
+    "snapshot",
+    "hashes",
+    "freezeManifestSha256"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "1.0.0" },
+    "roundId": { "const": "round-0820" },
+    "namespace": { "const": "fsbp" },
+    "mode": { "enum": ["development", "formal"] },
+    "frozenAt": { "type": "string", "format": "date-time" },
+    "formalEligible": { "type": "boolean" },
+    "formalValidation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "quality", "annotationStress"],
+      "properties": {
+        "status": { "enum": ["not_evaluated_development_mode", "passed"] },
+        "quality": { "type": ["object", "null"] },
+        "annotationStress": { "type": ["object", "null"] }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "clean", "dirtyFiles"],
+      "properties": {
+        "commit": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+        "clean": { "type": "boolean" },
+        "dirtyFiles": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "annotation_source": { "type": "string", "minLength": 1 },
+    "annotation_version": { "type": "string", "minLength": 1 },
+    "annotation_hash": { "$ref": "#/$defs/hash" },
+    "determinism_level": { "enum": ["full", "partial", "none"] },
+    "snapshot": {
+      "type": "object",
+      "required": [
+        "roundId",
+        "namespace",
+        "seed",
+        "datasets",
+        "promptFiles",
+        "promptBundle",
+        "models",
+        "parameters",
+        "toolLimits",
+        "endpoint",
+        "conditions"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "roundId": { "const": "round-0820" },
+        "namespace": { "const": "fsbp" },
+        "seed": { "type": "string", "minLength": 1 },
+        "datasets": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "object",
+            "required": ["name", "kind", "path", "expectedCount", "sha256", "recordHashes"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "kind": { "enum": ["quality", "annotation_isolation"] },
+              "path": { "type": "string", "minLength": 1 },
+              "expectedCount": { "type": "integer", "minimum": 1 },
+              "sha256": { "$ref": "#/$defs/hash" },
+              "recordHashes": {
+                "type": "object",
+                "minProperties": 1,
+                "additionalProperties": { "$ref": "#/$defs/hash" }
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "promptFiles": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "sha256"],
+            "properties": {
+              "path": { "type": "string", "minLength": 1 },
+              "sha256": { "$ref": "#/$defs/hash" }
+            }
+          }
+        },
+        "promptBundle": { "type": "object" },
+        "models": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["direct", "analysis", "candidates", "editor", "fallbackModel"],
+          "properties": {
+            "direct": { "const": "GPT 5.6 Sol: CPA" },
+            "analysis": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "prefixItems": [
+                { "const": "GPT 5.6 Sol: CPA" },
+                { "const": "GPT 5.6 Sol: CPA" }
+              ],
+              "items": false
+            },
+            "candidates": {
+              "type": "array",
+              "minItems": 3,
+              "maxItems": 3,
+              "prefixItems": [
+                { "const": "GPT 5.6 Sol: CPA" },
+                { "const": "GPT 5.6 Sol: CPA" },
+                { "const": "GPT 5.6 Sol: CPA" }
+              ],
+              "items": false
+            },
+            "editor": { "const": "GPT 5.6 Sol: CPA" },
+            "fallbackModel": { "const": "GPT 5.6 Sol: CPA" }
+          }
+        },
+        "parameters": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["temperature", "maxTokens", "timeoutMs", "retries", "sampleConcurrency", "fallbackAttempts"],
+          "properties": {
+            "temperature": { "type": "number", "minimum": 0, "maximum": 2 },
+            "maxTokens": { "const": 131072 },
+            "timeoutMs": { "const": 900000 },
+            "retries": { "type": "integer", "minimum": 0, "maximum": 10 },
+            "sampleConcurrency": { "const": 5 },
+            "fallbackAttempts": { "const": 1 }
+          }
+        },
+        "toolLimits": { "type": "object" },
+        "endpoint": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["baseUrl", "chatCompletionsPath", "apiKeyEnv"],
+          "properties": {
+            "baseUrl": { "type": "string", "format": "uri", "pattern": "^https?://" },
+            "chatCompletionsPath": { "type": "string", "minLength": 1, "pattern": "^/" },
+            "apiKeyEnv": { "const": "FSBP_EXPERIMENT_API_KEY" }
+          }
+        },
+        "conditions": {
+          "const": ["direct", "multi_raw", "multi_fsbp"]
+        }
+      }
+    },
+    "hashes": {
+      "type": "object",
+      "required": [
+        "configSha256",
+        "promptBundleSha256",
+        "modelSha256",
+        "parametersSha256",
+        "toolLimitsSha256",
+        "seedSha256",
+        "datasetsSha256",
+        "promptFilesSha256"
+      ],
+      "additionalProperties": { "$ref": "#/$defs/hash" }
+    },
+    "freezeManifestSha256": { "$ref": "#/$defs/hash" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "mode": { "const": "development" } }, "required": ["mode"] },
+      "then": {
+        "properties": {
+          "formalEligible": { "const": false },
+          "formalValidation": {
+            "properties": { "status": { "const": "not_evaluated_development_mode" } }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "mode": { "const": "formal" } }, "required": ["mode"] },
+      "then": {
+        "properties": {
+          "formalEligible": { "const": true },
+          "formalValidation": {
+            "properties": { "status": { "const": "passed" } }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+  }
+}

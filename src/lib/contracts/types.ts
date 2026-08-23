@@ -193,7 +193,6 @@ export interface ConfigSnapshot {
     name: string
     baseUrl: string
     chatCompletionsPath?: string
-    apiKey: string
     hasApiKey: boolean
     contextWindow: number | null
   }>
@@ -215,9 +214,11 @@ export interface ConfigSnapshot {
   orchestrationPolicy?: {
     teamPolicy: TeamPolicy
     reviewMode: ReviewMode
+    mainEditorRunMode?: import('./vnext').MainEditorRunMode
     maxAgentCalls: number
     candidateAnnotationMode?: import('./vnext').CandidateAnnotationMode
   }
+  preflight?: import('./vnext').SessionPreflightSnapshot
 }
 
 // ── Preset DB Row types ──────────────────────────────────────────

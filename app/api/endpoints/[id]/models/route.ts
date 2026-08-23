@@ -7,6 +7,7 @@ import {
   discoverEndpointModels,
   ModelDiscoveryError,
 } from '@/src/lib/llm/model-discovery'
+import { currentRuntimeEndpoint } from '@/src/lib/services/runtime-endpoint-credentials'
 
 export async function GET(
   _request: Request,
@@ -29,6 +30,7 @@ export async function GET(
       baseUrl: endpoint.base_url,
       chatCompletionsPath: endpoint.chat_completions_path,
       apiKey: endpoint.api_key,
+      resolveRuntimeEndpoint: () => currentRuntimeEndpoint(db, id),
     })
     return Response.json({
       endpointId: id,

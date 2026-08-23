@@ -6,7 +6,11 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { executeProgrammaticTool } from '../../src/lib/chat/program-tools'
+import {
+  createProgramCommandEnvironment,
+  createWindowsTaskkillSpec,
+  executeProgrammaticTool,
+} from '../../src/lib/chat/program-tools'
 
 let workDir: string
 let outsideDir: string
@@ -145,6 +149,36 @@ describe('file_edit', () => {
 })
 
 describe('run_command', () => {
+  it('uses a minimal environment without application or provider credentials', () => {
+    expect(createProgramCommandEnvironment({
+      PATH: 'bin',
+      TEMP: 'tmp',
+      AGENTIC_SECRET_KEY: 'desktop-secret',
+      OPENAI_API_KEY: 'provider-secret',
+      NEWAPI_KEY: 'provider-secret-2',
+      ANTHROPIC_AUTH_TOKEN: 'provider-token',
+      NODE_OPTIONS: '--require=unexpected.cjs',
+    })).toEqual({ PATH: 'bin', TEMP: 'tmp' })
+  })
+
+  it('resolves taskkill from System32 and gives it the same minimal environment', () => {
+    expect(createWindowsTaskkillSpec(4321, {
+      SystemRoot: 'C:\\Windows',
+      PATH: 'C:\\Windows\\System32',
+      TEMP: 'C:\\Temp',
+      AGENTIC_SECRET_KEY: 'desktop-secret',
+      OPENAI_API_KEY: 'provider-secret',
+    })).toEqual({
+      command: 'C:\\Windows\\System32\\taskkill.exe',
+      args: ['/pid', '4321', '/t', '/f'],
+      env: {
+        SystemRoot: 'C:\\Windows',
+        PATH: 'C:\\Windows\\System32',
+        TEMP: 'C:\\Temp',
+      },
+    })
+  })
+
   it('returns stdout for a successful command', async () => {
     const r = await executeProgrammaticTool('run_command', { command: 'node -p 6*7' })
     expect(r.ok).toBe(true)

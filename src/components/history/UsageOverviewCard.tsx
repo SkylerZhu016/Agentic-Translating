@@ -2,30 +2,17 @@
 
 import { useEffect, useState } from 'react'
 import { Badge, Card, Spinner } from '@/src/components/ui'
+import { useI18n, type MessageKey } from '@/src/i18n'
 import type {
   LlmAnalyticsOverview,
   LlmUsageSource,
 } from '@/src/lib/contracts/llm-call-records'
 
-const countFormatter = new Intl.NumberFormat('zh-CN')
-const decimalFormatter = new Intl.NumberFormat('zh-CN', {
-  maximumFractionDigits: 1,
-})
-const amountFormatter = new Intl.NumberFormat('zh-CN', {
-  minimumFractionDigits: 2,
-  maximumFractionDigits: 8,
-})
-const usageSourceLabel: Record<LlmUsageSource, string> = {
-  provider: '供应商返回',
-  estimated: '本地估算',
-  unknown: '未知',
-}
-
-function formatDuration(value: number | null) {
-  if (value === null) return '暂无数据'
-  if (value >= 1_000) return `${decimalFormatter.format(value / 1_000)} 秒`
-  return `${decimalFormatter.format(value)} ms`
-}
+const USAGE_SOURCE_KEYS = {
+  provider: 'usage.source.provider',
+  estimated: 'usage.source.estimated',
+  unknown: 'usage.source.unknown',
+} as const satisfies Record<LlmUsageSource, MessageKey>
 
 function Metric({
   label,
@@ -46,6 +33,7 @@ function Metric({
 }
 
 export function UsageOverviewCard() {
+  const { t, formatCurrency, formatDuration, formatNumber } = useI18n()
   const [overview, setOverview] = useState<LlmAnalyticsOverview | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -59,13 +47,13 @@ export function UsageOverviewCard() {
           cache: 'no-store',
           signal: controller.signal,
         })
-        if (!response.ok) throw new Error('运行账本暂时无法读取')
+        if (!response.ok) throw new Error(t('usage.error.read'))
 
         const payload = await response.json() as LlmAnalyticsOverview
         setOverview(payload)
       } catch (loadError) {
         if (controller.signal.aborted) return
-        setError(loadError instanceof Error ? loadError.message : '运行账本加载失败')
+        setError(loadError instanceof Error ? loadError.message : t('usage.error.load'))
       } finally {
         if (!controller.signal.aborted) setLoading(false)
       }
@@ -73,21 +61,28 @@ export function UsageOverviewCard() {
 
     void loadOverview()
     return () => controller.abort()
-  }, [])
+  }, [t])
 
   const totalTokens = overview == null
     ? 0
     : overview.usage.inputTokens + overview.usage.outputTokens + overview.usage.reasoningTokens
   const usageCoverage = overview?.usage.bySource
     .filter((bucket) => bucket.callCount > 0)
-    .map((bucket) => `${usageSourceLabel[bucket.source]} ${countFormatter.format(bucket.callCount)} 次`)
+    .map((bucket) => t('usage.sourceCalls', {
+      source: t(USAGE_SOURCE_KEYS[bucket.source]),
+      count: formatNumber(bucket.callCount),
+    }))
     .join(' · ')
 
   return (
     <Card
-      overline="Usage"
-      title="真实运行账本"
-      actions={overview != null ? <Badge variant="outline">总调用 {countFormatter.format(overview.calls.total)}</Badge> : undefined}
+      overline={t('usage.overline')}
+      title={t('usage.title')}
+      actions={overview != null ? (
+        <Badge variant="outline">
+          {t('usage.totalCallsBadge', { count: formatNumber(overview.calls.total) })}
+        </Badge>
+      ) : undefined}
       testId="usage-overview-card"
     >
       {loading ? (
@@ -99,43 +94,60 @@ export function UsageOverviewCard() {
           role="alert"
           className="rounded-sm border border-cinnabar/30 bg-cinnabar/5 px-4 py-4 text-sm leading-6 text-cinnabar"
         >
-          {error}。此面板错误不影响历史会话列表。
+          {t('usage.errorNonBlocking', { error })}
         </div>
       ) : overview != null ? (
         <div className="space-y-4">
           {overview.calls.total === 0 && (
             <div className="rounded-sm border border-dashed border-line-2 bg-paper/60 px-4 py-5 text-center text-sm leading-6 text-ink-4">
-              尚无模型调用记录。空账本是正常状态，完成一次模型调用后会在这里汇总。
+              {t('usage.empty')}
             </div>
           )}
 
           <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-            <Metric label="总调用" value={countFormatter.format(overview.calls.total)} />
-            <Metric label="完成" value={countFormatter.format(overview.calls.complete)} />
+            <Metric label={t('usage.metric.total')} value={formatNumber(overview.calls.total)} />
+            <Metric label={t('usage.metric.complete')} value={formatNumber(overview.calls.complete)} />
             <Metric
-              label="失败"
-              value={countFormatter.format(overview.calls.failed)}
-              detail={overview.calls.cancelled > 0 ? `另有 ${countFormatter.format(overview.calls.cancelled)} 次取消` : undefined}
+              label={t('usage.metric.failed')}
+              value={formatNumber(overview.calls.failed)}
+              detail={overview.calls.cancelled > 0
+                ? t('usage.metric.cancelled', { count: formatNumber(overview.calls.cancelled) })
+                : undefined}
             />
             <Metric
-              label="已知 Token 用量"
-              value={countFormatter.format(totalTokens)}
-              detail={`输入 ${countFormatter.format(overview.usage.inputTokens)} · 输出 ${countFormatter.format(overview.usage.outputTokens)} · 推理 ${countFormatter.format(overview.usage.reasoningTokens)}${usageCoverage ? `；来源：${usageCoverage}` : ''}`}
+              label={t('usage.metric.tokens')}
+              value={formatNumber(totalTokens)}
+              detail={t('usage.metric.tokenDetail', {
+                input: formatNumber(overview.usage.inputTokens),
+                output: formatNumber(overview.usage.outputTokens),
+                reasoning: formatNumber(overview.usage.reasoningTokens),
+                coverage: usageCoverage ? t('usage.metric.coverage', { sources: usageCoverage }) : '',
+              })}
             />
-            <Metric label="平均首包" value={formatDuration(overview.timing.averageFirstByteMs)} />
-            <Metric label="平均耗时" value={formatDuration(overview.timing.averageLatencyMs)} />
+            <Metric
+              label={t('usage.metric.firstByte')}
+              value={overview.timing.averageFirstByteMs == null
+                ? t('usage.noData')
+                : formatDuration(overview.timing.averageFirstByteMs)}
+            />
+            <Metric
+              label={t('usage.metric.latency')}
+              value={overview.timing.averageLatencyMs == null
+                ? t('usage.noData')
+                : formatDuration(overview.timing.averageLatencyMs)}
+            />
           </div>
 
           <div className="rounded-sm border border-line bg-paper/55 px-3 py-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <p className="text-xs font-medium tracking-wide text-ink-3">费用记录</p>
+              <p className="text-xs font-medium tracking-wide text-ink-3">{t('usage.cost.title')}</p>
               <Badge variant="subtle">
-                未知费用调用数 {countFormatter.format(overview.costs.unknownCallCount)}
+                {t('usage.cost.unknown', { count: formatNumber(overview.costs.unknownCallCount) })}
               </Badge>
             </div>
 
             {overview.costs.known.length === 0 ? (
-              <p className="mt-3 text-sm text-ink-4">暂无已知费用数据。</p>
+              <p className="mt-3 text-sm text-ink-4">{t('usage.cost.empty')}</p>
             ) : (
               <ul className="mt-3 divide-y divide-line">
                 {overview.costs.known.map((cost) => (
@@ -145,14 +157,18 @@ export function UsageOverviewCard() {
                   >
                     <div className="flex items-center gap-2">
                       <Badge variant={cost.source === 'provider' ? 'outline' : 'subtle'}>
-                        {cost.source === 'provider' ? '供应商返回' : '本地估算'}
+                        {t(USAGE_SOURCE_KEYS[cost.source])}
                       </Badge>
                       <span className="font-mono text-xs text-ink-3">{cost.currency}</span>
                     </div>
                     <p className="text-sm tabular-nums text-ink">
-                      {cost.currency} {amountFormatter.format(cost.amount)}
+                      {formatCurrency(cost.amount, cost.currency, {
+                        currencyDisplay: 'code',
+                        minimumFractionDigits: 2,
+                        maximumFractionDigits: 8,
+                      })}
                       <span className="ml-2 text-xs text-ink-4">
-                        {countFormatter.format(cost.callCount)} 次调用
+                        {t('usage.cost.calls', { count: formatNumber(cost.callCount) })}
                       </span>
                     </p>
                   </li>
@@ -161,7 +177,7 @@ export function UsageOverviewCard() {
             )}
 
             <p className="mt-3 border-t border-line pt-3 text-xs leading-5 text-ink-4">
-              费用仅来自供应商返回值或本地价格快照估算；未知表示没有可核验的费用数据。此处是运行记录，不是供应商账单。
+              {t('usage.cost.note')}
             </p>
           </div>
         </div>

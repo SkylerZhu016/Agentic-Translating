@@ -12,6 +12,10 @@ import {
   SessionIdempotencyConflictError,
 } from '@/src/lib/services/session-service'
 import {
+  SessionPreflightError,
+  toSessionPreflightDto,
+} from '@/src/lib/services/session-preflight'
+import {
   SourceRequiredError,
 } from '@/src/lib/guards'
 import { sessionCreateSchema } from '@/src/lib/contracts/schemas'
@@ -83,6 +87,7 @@ export function createHandlers(db: Database.Database) {
                 allowedAgentVariantIds:
                   parsed.data.allowedAgentVariantIds ?? [],
                 reviewMode: parsed.data.reviewMode,
+                mainEditorRunMode: parsed.data.mainEditorRunMode,
                 promptBundleRevisionId:
                   parsed.data.promptBundleRevisionId ?? null,
                 constraints: parsed.data.constraints,
@@ -93,7 +98,19 @@ export function createHandlers(db: Database.Database) {
         } catch {
           // Legacy test databases do not contain vNext draft tables.
         }
-        return NextResponse.json(toPublicSessionDto(session), { status: 200 })
+        const publicSession = toPublicSessionDto(session)
+        const preflight = (
+          publicSession.public_config_snapshot as {
+            preflight?: Parameters<typeof toSessionPreflightDto>[0]
+          } | null
+        )?.preflight
+        return NextResponse.json(
+          {
+            ...publicSession,
+            preflight: preflight ? toSessionPreflightDto(preflight) : null,
+          },
+          { status: 200 },
+        )
       } catch (err) {
         if (err instanceof NoAgentsConfiguredError) {
           return NextResponse.json(
@@ -117,6 +134,18 @@ export function createHandlers(db: Database.Database) {
           return NextResponse.json(
             { error: err.code, message: err.message },
             { status: 409 },
+          )
+        }
+        if (err instanceof SessionPreflightError) {
+          return NextResponse.json(
+            {
+              error: err.code,
+              message: err.message,
+              params: err.params,
+              actions: err.actions,
+              preflight: toSessionPreflightDto(err.preflight),
+            },
+            { status: 422 },
           )
         }
         if (err instanceof ProjectRepositoryError) {

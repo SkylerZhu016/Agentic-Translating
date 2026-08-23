@@ -4,6 +4,7 @@ import { NextResponse } from 'next/server'
 import { getDb } from '@/src/lib/db'
 import { migrate } from '@/src/lib/db/migrate'
 import { restartVNextSession } from '@/src/lib/orchestration/vnext-runner'
+import { sessionPreflightErrorDto } from '@/src/lib/services/session-preflight'
 
 export async function POST(
   _request: Request,
@@ -15,6 +16,12 @@ export async function POST(
   try {
     return NextResponse.json(restartVNextSession(db, id), { status: 202 })
   } catch (error) {
+    const preflightError = sessionPreflightErrorDto(error)
+    if (preflightError) {
+      return NextResponse.json(preflightError.body, {
+        status: preflightError.status,
+      })
+    }
     const message = error instanceof Error ? error.message : String(error)
     return NextResponse.json(
       { error: message },

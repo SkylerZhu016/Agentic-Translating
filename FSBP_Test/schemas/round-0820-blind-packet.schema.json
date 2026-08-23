@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentic-translating.local/schemas/round-0820-blind-packet.schema.json",
+  "title": "Round 0820 Anonymous Review Packet",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "roundId",
+    "namespace",
+    "packetId",
+    "kind",
+    "createdAt",
+    "runId",
+    "freezeManifestSha256",
+    "blindKeySha256",
+    "randomizationSeedSha256",
+    "rubric",
+    "blinding",
+    "items",
+    "systemFailures",
+    "counts",
+    "packetHash"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "1.0.0" },
+    "roundId": { "const": "round-0820" },
+    "namespace": { "const": "fsbp" },
+    "packetId": { "type": "string", "minLength": 1 },
+    "kind": { "enum": ["quality", "isolation"] },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "runId": { "type": "string", "minLength": 1 },
+    "freezeManifestSha256": { "$ref": "#/$defs/hash" },
+    "blindKeySha256": { "$ref": "#/$defs/hash" },
+    "randomizationSeedSha256": { "$ref": "#/$defs/hash" },
+    "externalBaseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["inputFileSha256", "outputFileSha256", "recordCount"],
+      "properties": {
+        "inputFileSha256": { "$ref": "#/$defs/hash" },
+        "outputFileSha256": { "$ref": "#/$defs/hash" },
+        "recordCount": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "rubric": { "type": "object" },
+    "blinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hidden", "candidateLabels"],
+      "properties": {
+        "hidden": { "const": ["condition", "model", "run_order", "annotation"] },
+        "candidateLabels": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": { "pattern": "^[A-C]$" }
+        }
+      }
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["itemId", "direction", "category", "sourceText", "taskBrief", "candidates"],
+        "properties": {
+          "itemId": { "type": "string", "pattern": "^[a-f0-9]{20}$" },
+          "direction": { "enum": ["en_to_zh", "zh_to_en"] },
+          "category": { "type": ["string", "null"] },
+          "sourceText": { "type": "string", "minLength": 1 },
+          "taskBrief": { "type": "string" },
+          "targetedError": { "type": ["string", "null"] },
+          "errorEvidence": { "type": ["string", "null"] },
+          "candidates": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 3,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["label", "text"],
+              "properties": {
+                "label": { "pattern": "^[A-C]$" },
+                "text": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "systemFailures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["itemId", "sampleId", "failureCount", "reasonCodes"],
+        "properties": {
+          "itemId": { "type": "string" },
+          "sampleId": { "type": "string" },
+          "failureCount": { "type": "integer", "minimum": 1 },
+          "reasonCodes": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["eligible", "systemFailures", "total"],
+      "properties": {
+        "eligible": { "type": "integer", "minimum": 0 },
+        "systemFailures": { "type": "integer", "minimum": 0 },
+        "total": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "packetHash": { "$ref": "#/$defs/hash" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "kind": { "const": "quality" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "required": ["externalBaseline"],
+        "properties": {
+          "rubric": {
+            "type": "object",
+            "required": ["scoreRange", "weightedTotalRange", "weightedTotalFormula"],
+            "properties": {
+              "scoreRange": { "$ref": "#/$defs/qualityScoreRange" },
+              "weightedTotalRange": { "$ref": "#/$defs/weightedTotalRange" },
+              "weightedTotalFormula": {
+                "const": "10 * sum(score_i * weight_i) / sum(applicable_weight_i)"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "qualityScoreRange": {
+      "type": "array",
+      "prefixItems": [{ "const": 1 }, { "const": 10 }],
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "weightedTotalRange": {
+      "type": "array",
+      "prefixItems": [{ "const": 10 }, { "const": 100 }],
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+  },
+  "description": "Corrected schema: six 1–10 quality dimensions produce a weighted total in [10, 100]."
+}

@@ -8,7 +8,6 @@
 
 import { getDb } from '@/src/lib/db';
 import { createRepositories } from '@/src/lib/db/repositories';
-import { createSessionService } from '@/src/lib/services/session-service';
 import { runFanOut, type AgentRuntime, type FanOutCallbacks } from '@/src/lib/orchestration/fanout';
 import { chatCompletion } from '@/src/lib/llm/client';
 import {
@@ -24,6 +23,17 @@ import {
   serializeExecutionDiagnosticError,
   type ExecutionDiagnosticErrorDto,
 } from '@/src/lib/security/diagnostic-error';
+import {
+  createPreflightedLlmCaller,
+  ensureStoredSessionPreflight,
+  resolvePreflightOutputLimit,
+  sessionPreflightErrorDto,
+} from '@/src/lib/services/session-preflight';
+import {
+  currentRuntimeEndpoint,
+  resolveRuntimeEndpoint,
+  runtimeEndpointCredentialErrorDto,
+} from '@/src/lib/services/runtime-endpoint-credentials';
 
 export async function POST(
   request: Request,
@@ -33,7 +43,6 @@ export async function POST(
 
   const db = getDb();
   const repos = createRepositories(db);
-  const service = createSessionService(db, repos);
 
   // ── Guard: session exists ──────────────────────────────────────
   const session = repos.sessions.getById(id);
@@ -53,7 +62,18 @@ export async function POST(
   }
 
   // ── Guard: snapshot agents ≥ 1 & agent_key present ────────────
-  const config: ConfigSnapshot = service.snapshotConfig(session.config_snapshot);
+  let config: ConfigSnapshot;
+  try {
+    config = ensureStoredSessionPreflight(db, session) as unknown as ConfigSnapshot;
+  } catch (error) {
+    const preflightError = sessionPreflightErrorDto(error);
+    if (preflightError) {
+      return Response.json(preflightError.body, {
+        status: preflightError.status,
+      });
+    }
+    throw error;
+  }
   if (!config.agents || config.agents.length === 0) {
     return Response.json(
       { error: 'No translator agents configured in session snapshot' },
@@ -68,15 +88,29 @@ export async function POST(
       { status: 400 },
     );
   }
+  const targetVariant = config.agentVariantSnapshots?.find(
+    (candidate) =>
+      candidate.id === targetAgent.name ||
+      candidate.catalogName === targetAgent.name,
+  );
 
   // ── Guard: endpoint configured ────────────────────────────────
-  const endpointConfig =
-    config.endpoints?.find(
-      (endpoint) => endpoint.id === targetAgent.endpoint_id,
-    ) ?? config.endpoint;
-  if (!endpointConfig) {
+  let endpointConfig: ReturnType<typeof resolveRuntimeEndpoint>;
+  try {
+    endpointConfig = resolveRuntimeEndpoint(db, config, targetAgent.endpoint_id);
+  } catch (error) {
+    const credentialError = runtimeEndpointCredentialErrorDto(error);
+    if (credentialError) {
+      return Response.json(credentialError.body, {
+        status: credentialError.status,
+      });
+    }
     return Response.json(
-      { error: 'No API endpoint configured in session snapshot' },
+      {
+        error: error instanceof Error
+          ? error.message
+          : 'No API endpoint configured in session snapshot',
+      },
       { status: 400 },
     );
   }
@@ -93,21 +127,67 @@ export async function POST(
     source_text: session.source_text,
   });
 
+  const bindingRole = targetVariant
+    ? `worker:${targetVariant.id}`
+    : `worker:${targetAgent.name}`;
+  const maxTokens = resolvePreflightOutputLimit(
+    config.preflight!,
+    {
+      stage: 'candidate_generation',
+      bindingRole,
+      endpointId: endpointConfig.id,
+      model: targetAgent.model,
+      fallbackOutputTokens:
+        config.modelBindings?.defaultWorker.maxOutputTokens,
+    },
+  );
+  const frozenStage = config.preflight!.stages.find(
+    (stage) =>
+      stage.stage === 'candidate_generation' &&
+      stage.bindingRole === bindingRole &&
+      stage.endpointId === endpointConfig.id &&
+      stage.model === targetAgent.model,
+  );
   const singleAgent: AgentRuntime = {
     agentKey: targetAgent.name,
     name: targetAgent.name,
     endpoint: {
-      baseUrl: endpointConfig.base_url,
-      chatCompletionsPath:
-        endpointConfig.chat_completions_path ?? '/v1/chat/completions',
-      apiKey: endpointConfig.api_key,
+      baseUrl: endpointConfig.baseUrl,
+      chatCompletionsPath: endpointConfig.chatCompletionsPath,
+      apiKey: endpointConfig.apiKey,
     },
     model: targetAgent.model,
+    maxTokens,
     messages: [
       { role: system.role, content: system.content },
       { role: user.role, content: user.content },
     ],
   };
+  const preflightedChatCompletion = createPreflightedLlmCaller(
+    (endpoint, llmRequest) => chatCompletion(
+      {
+        ...endpoint,
+        resolveRuntimeEndpoint: () =>
+          currentRuntimeEndpoint(db, endpointConfig.id),
+      },
+      llmRequest,
+    ),
+    (_endpoint, llmRequest) => {
+      if (llmRequest.messages !== singleAgent.messages) {
+        throw new Error('Physical preflight identity is unavailable for retry call.');
+      }
+      return {
+        attemptKey: `retry:${targetAgent.name}`,
+        stage: 'candidate_generation',
+        bindingRole,
+        endpointId: endpointConfig.id,
+        model: targetAgent.model,
+        contextWindow:
+          frozenStage?.contextWindowTokens ?? endpointConfig.contextWindow,
+        maxOutputTokens: maxTokens,
+      };
+    },
+  );
 
   // ── Mark result as streaming ───────────────────────────────────
   let trRow = repos.translationResults.getBySessionAndAgent(id, agentKey);
@@ -192,10 +272,15 @@ export async function POST(
       };
 
       try {
-        const summary = await runFanOut([singleAgent], callbacks, chatCompletion, {
+        const summary = await runFanOut(
+          [singleAgent],
+          callbacks,
+          preflightedChatCompletion,
+          {
           signal: controller.signal,
           sessionId: id,
-        });
+          },
+        );
 
         // ── Persist result to DB ─────────────────────────────────
         const result = summary.results[0];

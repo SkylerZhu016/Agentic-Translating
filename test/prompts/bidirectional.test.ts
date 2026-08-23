@@ -68,7 +68,9 @@ describe('bidirectional built-in catalog', () => {
 
   it('gives each translating role detailed focus, examples, checks, and final annotation rules', () => {
     for (const variant of BUILTIN_AGENT_VARIANTS) {
-      expect(variant.promptVersion).toBe(17)
+      expect(variant.promptVersion).toBe(
+        variant.archetypeId === 'poetry-form' ? 18 : 17,
+      )
 
       if (variant.archetypeId === 'cultural-context') {
         expect(variant.rolePrompt.length).toBeGreaterThan(600)
@@ -145,7 +147,7 @@ describe('bidirectional built-in catalog', () => {
         /最后一条独立|final standalone/,
       )
       expect(bundle.assemblePrompt).toMatch(/最后一条独立|final standalone/)
-      expect(bundle.version).toBe(21)
+      expect(bundle.version).toBe(22)
       expect(bundle.editingPrompt).toMatch(/Requirement and audit closure|要求与审查闭环/)
       expect(bundle.workerBasePrompt).toMatch(
         /explicit requirement|用户明确提出的要求/,
@@ -190,6 +192,31 @@ describe('bidirectional built-in catalog', () => {
     expect(enToZh.assemblePrompt).not.toContain('逐行列出每个句末字')
     expect(zhToEn.assemblePrompt).toContain('Private final poetry check')
     expect(zhToEn.assemblePrompt).not.toContain('List the stressed vowel')
+  })
+
+  it('uses a conservative poetry gate in both directions and in final assembly', () => {
+    const enToZh = BUILTIN_DIRECTION_BUNDLES.find(
+      (bundle) => bundle.direction === 'en_to_zh',
+    )!
+    const zhToEn = BUILTIN_DIRECTION_BUNDLES.find(
+      (bundle) => bundle.direction === 'zh_to_en',
+    )!
+    const poetryVariants = BUILTIN_AGENT_VARIANTS.filter(
+      (variant) => variant.archetypeId === 'poetry-form',
+    )
+
+    expect(poetryVariants.find((variant) => variant.direction === 'en_to_zh')!
+      .rolePrompt).toMatch(/不得为押韵增添含义[\s\S]+强行倒装[\s\S]+回退到保守忠实底稿/)
+    expect(poetryVariants.find((variant) => variant.direction === 'zh_to_en')!
+      .rolePrompt).toMatch(/Never add meaning[\s\S]+force inversion[\s\S]+conservative faithful baseline/)
+    expect(enToZh.orchestratePrompt).toContain(
+      '英诗中译优先保留反复、问句、象征关系和朗读节奏',
+    )
+    expect(zhToEn.orchestratePrompt).toContain(
+      'Chinese poetry translated into English, prefer compression, image juxtaposition, parallel movement',
+    )
+    expect(enToZh.assemblePrompt).toMatch(/最小编辑[\s\S]+不得整篇自由重写/)
+    expect(zhToEn.assemblePrompt).toMatch(/minimal-edit pass[\s\S]+not permission to rewrite the whole poem/)
   })
 
   it('keeps locked evaluation examples and the banned Chinese contrast pattern out of production prompts', () => {

@@ -24,21 +24,25 @@ import { StageOutputPanel } from './StageOutputPanel'
 import { Badge, Button, Modal, Spinner } from '@/src/components/ui'
 import { parseSemanticAgentOutput } from '@/src/lib/protocol/semantic-output'
 import type { CandidateAnnotationMode } from '@/src/lib/contracts/vnext'
+import { useI18n } from '@/src/i18n/LocaleProvider'
+import { localizeDiagnosticError } from '@/src/i18n/diagnostic'
+import type { Translator } from '@/src/i18n/types'
+import { localizedStageMeta } from './localized-stage'
 
 type StreamTextMap = Record<Stage, string>
 type NoteMap = Partial<Record<Stage, string | null>>
 
 const EMPTY_STREAM: StreamTextMap = { review: '', filter: '', orchestrate: '', assemble: '' }
 
-function readableWorkflowError(error: string) {
+function readableWorkflowError(error: string, t: Translator) {
   if (/504 Gateway Time-?out/i.test(error)) {
-    return '上游网关超时（HTTP 504）：模型在网关时限内没有返回可处理数据。已完成候选仍会保留；可以更换主 Agent 模型后，按当前配置继续统筹。'
+    return t('coordinator.error.gatewayTimeout')
   }
   if (/fetch failed/i.test(error)) {
-    return '无法连接上游模型服务。已完成候选仍会保留，可以稍后继续统筹。'
+    return t('coordinator.error.fetchFailed')
   }
   if (/<(?:!doctype|html|head|body)\b/i.test(error)) {
-    return '上游服务返回了网页错误，未产生有效模型结果。已完成候选仍会保留。'
+    return t('coordinator.error.htmlResponse')
   }
   return error
 }
@@ -70,6 +74,7 @@ function AutomaticWorkflowProgress({
   onRegenerateCurrent: () => void
   onRestart: () => void
 }) {
+  const { t } = useI18n()
   const snapshot = JSON.parse(data.session.config_snapshot) as {
     orchestrationPolicy?: { reviewMode?: 'main_editor' | 'four_stage' }
     agentVariantSnapshots?: Array<{
@@ -161,43 +166,43 @@ function AutomaticWorkflowProgress({
           snapshot.agentVariantSnapshots?.find(
             (variant) => variant.id === call.agentVariantId,
           )?.catalogName ?? call.agentVariantId,
-        reason: call.selectionReason ?? '主 Agent 结合任务特征选择',
+        reason: call.selectionReason ?? t('coordinator.team.defaultReason'),
       }))
     } catch {
       return []
     }
   })()
   const preAnalysisStep = {
-    label: '双模型意象分析',
+    label: t('coordinator.step.context'),
     complete: contextSettled && completedContext > 0,
     failed: contextSettled && completedContext === 0,
   }
   const candidateStep = {
-    label: '候选 Agent 执行',
+    label: t('coordinator.step.candidates'),
     complete: translationsSettled && completedTranslations >= 2,
     failed: translationsSettled && completedTranslations < 2,
   }
   const mainSteps = [
     preAnalysisStep,
     {
-      label: '主 Agent 组队',
+      label: t('coordinator.step.team'),
       complete: translationInvocations.length > 0,
       showTeamDecision: true,
     },
     candidateStep,
     {
-      label: '证据化初稿',
+      label: t('coordinator.step.draft'),
       complete: data.versions.length > 0,
     },
     {
-      label: '正式提交',
+      label: t('coordinator.step.submit'),
       complete: data.finalVersion != null,
     },
   ]
   const fourSteps = STAGES.map((meta) => {
     const row = data.stages.find((item) => item.stage === meta.key)
     return {
-      label: meta.label,
+      label: localizedStageMeta(meta.key, t).label,
       complete: row?.status === 'complete',
       failed: row?.status === 'failed',
       row,
@@ -211,7 +216,7 @@ function AutomaticWorkflowProgress({
   return (
     <div className="space-y-3">
       <div className="rounded-sm border border-line bg-paper/55 px-3 py-2 text-xs leading-5 text-ink-3">
-        默认自动执行；你可以暂停接管、重刷候选，再基于最新候选重新生成初稿。
+        {t('coordinator.auto.description')}
       </div>
       <div className="flex flex-wrap gap-2">
         {runActive && (
@@ -221,7 +226,9 @@ function AutomaticWorkflowProgress({
             disabled={action != null}
             onClick={onPause}
           >
-            {action === 'pause' ? <><Spinner size="sm" /> 暂停中</> : '暂停自动成稿'}
+            {action === 'pause'
+              ? <><Spinner size="sm" /> {t('coordinator.action.pausing')}</>
+              : t('coordinator.action.pause')}
           </Button>
         )}
         {canContinue && (
@@ -232,10 +239,10 @@ function AutomaticWorkflowProgress({
               onClick={onContinue}
             >
               {action === 'continue'
-                ? <><Spinner size="sm" /> 恢复中</>
+                ? <><Spinner size="sm" /> {t('coordinator.action.resuming')}</>
                 : continueFromCandidates
-                  ? '按冻结配置继续统筹'
-                  : '从检查点继续运行'}
+                  ? t('coordinator.action.continueFrozen')
+                  : t('coordinator.action.continueCheckpoint')}
             </Button>
             {continueFromCandidates && (
               <Button
@@ -243,11 +250,11 @@ function AutomaticWorkflowProgress({
                 variant="outline"
                 disabled={action != null}
                 onClick={onContinueCurrent}
-                title="保留原文、任务要求和全部候选，只使用配置页当前的主 Agent 端点与模型重新统筹"
+                title={t('coordinator.action.continueCurrentTitle')}
               >
                 {action === 'continue-current'
-                  ? <><Spinner size="sm" /> 恢复中</>
-                  : '按当前主 Agent 配置继续'}
+                  ? <><Spinner size="sm" /> {t('coordinator.action.resuming')}</>
+                  : t('coordinator.action.continueCurrent')}
               </Button>
             )}
           </>
@@ -255,7 +262,7 @@ function AutomaticWorkflowProgress({
         {canRegenerate && (
           <div className="flex flex-wrap items-center gap-2 rounded-sm border border-line bg-paper/55 px-2 py-1.5">
             <label className="flex items-center gap-2 text-xs text-ink-3">
-              重刷时的候选上下文
+              {t('coordinator.regenerate.context')}
               <select
                 value={regenerationAnnotationMode}
                 disabled={action != null}
@@ -266,8 +273,8 @@ function AutomaticWorkflowProgress({
                 }
                 className="h-8 rounded-sm border border-line-2 bg-paper-raise px-2 text-xs text-ink"
               >
-                <option value="body_only">仅正文，隔离注释</option>
-                <option value="body_and_annotation">正文与译者注释</option>
+                <option value="body_only">{t('coordinator.regenerate.bodyOnly')}</option>
+                <option value="body_and_annotation">{t('coordinator.regenerate.withAnnotation')}</option>
               </select>
             </label>
             <Button
@@ -277,19 +284,19 @@ function AutomaticWorkflowProgress({
               onClick={onRegenerate}
             >
               {action === 'regenerate'
-                ? <><Spinner size="sm" /> 重刷中</>
-                : '按冻结配置重刷'}
+                ? <><Spinner size="sm" /> {t('coordinator.regenerate.running')}</>
+                : t('coordinator.regenerate.frozen')}
             </Button>
             <Button
               size="sm"
               variant="outline"
               disabled={action != null}
               onClick={onRegenerateCurrent}
-              title="复用现有候选，使用配置页当前的四阶段提示词包、端点与六角色模型分工重新成稿"
+              title={t('coordinator.regenerate.currentTitle')}
             >
               {action === 'regenerate-current'
-                ? <><Spinner size="sm" /> 重刷中</>
-                : '按当前配置重刷'}
+                ? <><Spinner size="sm" /> {t('coordinator.regenerate.running')}</>
+                : t('coordinator.regenerate.current')}
             </Button>
           </div>
         )}
@@ -298,18 +305,20 @@ function AutomaticWorkflowProgress({
           variant="ghost"
           disabled={action != null || runActive}
           onClick={onRestart}
-          title={runActive ? '请先暂停当前运行' : undefined}
+          title={runActive ? t('coordinator.restart.pauseFirst') : undefined}
         >
-          {action === 'restart' ? <><Spinner size="sm" /> 重启中</> : '重新运行任务'}
+          {action === 'restart'
+            ? <><Spinner size="sm" /> {t('coordinator.restart.running')}</>
+            : t('coordinator.restart.action')}
         </Button>
       </div>
       {data.runControl?.candidates_stale === 1 && (
         <p className="rounded-sm border border-amber/40 bg-amber/5 px-3 py-2 text-xs leading-5 text-ink-2">
-          候选结果已更新，当前最终译文基于旧候选。请重刷证据化初稿。
+          {t('coordinator.candidatesStale')}
         </p>
       )}
       {actionError && (
-        <p className="rounded-sm border border-cinnabar/40 bg-cinnabar/5 px-3 py-2 text-xs text-cinnabar">
+        <p role="alert" className="rounded-sm border border-cinnabar/40 bg-cinnabar/5 px-3 py-2 text-xs text-cinnabar">
           {actionError}
         </p>
       )}
@@ -337,18 +346,18 @@ function AutomaticWorkflowProgress({
                   variant={step.complete ? 'outline' : failed ? 'subtle' : 'subtle'}
                 >
                   {step.complete
-                    ? '完成'
+                    ? t('stage.status.complete')
                     : failed
-                      ? '失败'
+                      ? t('stage.status.failed')
                       : running && latestRun?.status === 'running'
-                        ? '运行中'
-                        : '等待'}
+                        ? t('stage.status.running')
+                        : t('coordinator.status.waiting')}
                 </Badge>
               </div>
               {stageRow?.raw_output && (
                 <details className="mt-2">
                   <summary className="cursor-pointer text-xs text-ink-3">
-                    查看阶段输出
+                    {t('coordinator.output.open')}
                   </summary>
                   <p className="mt-2 whitespace-pre-wrap text-xs leading-5 text-ink-2">
                     {parseSemanticAgentOutput(stageRow.raw_output).body}
@@ -360,7 +369,7 @@ function AutomaticWorkflowProgress({
                 teamDecision.length > 0 && (
                   <details className="mt-2">
                     <summary className="cursor-pointer text-xs text-ink-3">
-                      查看选角结果与理由
+                      {t('coordinator.team.open')}
                     </summary>
                     <ul className="mt-2 space-y-2">
                       {teamDecision.map((item) => (
@@ -388,7 +397,7 @@ function AutomaticWorkflowProgress({
       </ol>
       {latestRun?.error && (
         <p className="rounded-sm border border-cinnabar/40 bg-cinnabar/5 px-3 py-2 text-xs text-cinnabar">
-          {readableWorkflowError(latestRun.error)}
+          {readableWorkflowError(latestRun.error, t)}
         </p>
       )}
     </div>
@@ -396,6 +405,7 @@ function AutomaticWorkflowProgress({
 }
 
 export function CoordinatorPanel() {
+  const { t } = useI18n()
   const { data, sessionId, refresh } = useSessionFull()
   const router = useRouter()
   const [runningStage, setRunningStage] = useState<Stage | null>(null)
@@ -467,7 +477,13 @@ export function CoordinatorPanel() {
         error?: string
         sessionId?: string
       }
-      if (!response.ok) throw new Error(payload.error ?? '操作失败')
+      if (!response.ok) {
+        throw new Error(localizeDiagnosticError(
+          t,
+          payload.error,
+          t('coordinator.error.action'),
+        ))
+      }
       if (action === 'restart' && payload.sessionId) {
         router.push(`/?session=${encodeURIComponent(payload.sessionId)}`)
         return
@@ -487,6 +503,7 @@ export function CoordinatorPanel() {
     router,
     sessionId,
     workflowAction,
+    t,
   ])
 
   // 仅在「本次运行后达成全部完成」时滚动+提示（挂载即完成不打扰）
@@ -521,6 +538,14 @@ export function CoordinatorPanel() {
         onDelta: (s, content) =>
           setStreamText((prev) => ({ ...prev, [s]: prev[s] + content })),
         onError: (s, message) => setNotes((prev) => ({ ...prev, [s]: message })),
+        messages: {
+          network: t('stage.error.network'),
+          request: (status) => t('stage.error.request', { status }),
+          stage: t('stage.error.run'),
+          connection: t('stage.error.connection'),
+        },
+        localizeError: (value, fallback) =>
+          localizeDiagnosticError(t, value, fallback),
       })
 
       // 服务端为准：重取全量会话（含 stale 级联与 assemble 产生的新版本）
@@ -528,18 +553,18 @@ export function CoordinatorPanel() {
       emitSessionChanged(sessionId)
       setRunningStage(null)
     },
-    [sessionId, runningStage, stageRows, sessionState, refresh],
+    [sessionId, runningStage, stageRows, sessionState, refresh, t],
   )
 
   // 全部完成 → 滚动到最终文本区 + 对话提示
   useEffect(() => {
     if (!allComplete || !justRanRef.current) return
     justRanRef.current = false
-    setCompletionNotice('四阶段全部完成——可开始对话修改')
+    setCompletionNotice(t('coordinator.complete'))
     document
       .querySelector('[data-testid="final-text"]')
       ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-  }, [allComplete])
+  }, [allComplete, t])
 
   if (data && isVNext) {
     return (
@@ -562,14 +587,14 @@ export function CoordinatorPanel() {
         <Modal
           open={restartConfirmOpen}
           onClose={() => setRestartConfirmOpen(false)}
-          title="重新运行整个任务？"
+          title={t('coordinator.restart.title')}
           footer={
             <>
               <Button
                 variant="ghost"
                 onClick={() => setRestartConfirmOpen(false)}
               >
-                取消
+                {t('common.cancel')}
               </Button>
               <Button
                 onClick={() => {
@@ -577,14 +602,13 @@ export function CoordinatorPanel() {
                   void postWorkflowAction('restart')
                 }}
               >
-                新建会话并重跑
+                {t('coordinator.restart.confirm')}
               </Button>
             </>
           }
         >
           <p className="text-sm leading-6 text-ink-2">
-            当前会话和全部版本会保留在历史中。系统将复制冻结的任务配置，
-            新建一个会话，并从意象分析与动态选角开始完整运行。
+            {t('coordinator.restart.description')}
           </p>
         </Modal>
       </>
@@ -614,12 +638,12 @@ export function CoordinatorPanel() {
       {/* 无会话 / 翻译未就绪引导 */}
       {!data && (
         <p className="rounded-sm border border-dashed border-line-2 bg-paper/60 px-4 py-4 text-center text-xs leading-5 text-ink-4">
-          暂无会话——请先在左侧粘贴原文并开始翻译
+          {t('coordinator.noSession')}
         </p>
       )}
       {data && (sessionState === 'draft' || sessionState === 'translating') && (
         <p className="rounded-sm border border-dashed border-line-2 bg-paper/60 px-4 py-3 text-center text-xs text-ink-4">
-          翻译进行中，完成后各阶段将解锁……
+          {t('coordinator.translationRunning')}
         </p>
       )}
 

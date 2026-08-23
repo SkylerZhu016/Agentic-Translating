@@ -66,6 +66,9 @@ export const sessionCreateSchema = z.object({
   targetLang: z.string().min(1).optional(),
   taskBrief: z.string().default(''),
   reviewMode: z.enum(['main_editor', 'four_stage']).default('main_editor'),
+  mainEditorRunMode: z
+    .enum(['fixed_pipeline', 'tool_enabled'])
+    .default('fixed_pipeline'),
   presetRevisionId: z.string().min(1).nullable().optional(),
   promptBundleRevisionId: z.string().min(1).nullable().optional(),
   projectId: z.string().uuid().nullable().optional(),

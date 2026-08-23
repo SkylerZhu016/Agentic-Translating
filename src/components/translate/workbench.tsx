@@ -17,8 +17,10 @@ import {
 } from '@/src/components/coordinator'
 import { EditorSection } from '@/src/components/editor/EditorSection'
 import { TranslatePanel } from './translate-panel'
+import { useI18n } from '@/src/i18n/LocaleProvider'
 
 export function Workbench() {
+  const { t } = useI18n()
   // 全部 Agent 完成 → 统筹 stepper 亮起（可进入）
   const [translateReady, setTranslateReady] = useState(false)
 
@@ -26,9 +28,9 @@ export function Workbench() {
     <SessionWorkspaceProvider>
     <div className="mx-auto max-w-7xl px-4 py-6 sm:px-6">
       <PageHeader
-        overline="Workbench"
-        title="工作台"
-        description="面向高难文本的多方案翻译决策台：独立候选、分歧审议、证据化取舍与可回溯修改。"
+        overline={t('workbench.overline')}
+        title={t('workbench.title')}
+        description={t('workbench.description')}
       />
 
       {/* 三栏响应式骨架：移动端单列，lg 起 7/5 双列两行 */}
@@ -38,8 +40,8 @@ export function Workbench() {
 
         {/* 右：统筹 stepper + 阶段输出面板（任务 23 完整实现；翻译就绪时亮起） */}
         <Card
-          overline="Coordination"
-          title="统筹阶段"
+          overline={t('workbench.coordination.overline')}
+          title={t('workbench.coordination.title')}
           className={[
             'lg:col-span-5 transition-shadow duration-300',
             translateReady ? 'ring-1 ring-pine/30' : '',
@@ -48,7 +50,7 @@ export function Workbench() {
             translateReady ? (
               <span className="inline-flex items-center gap-1.5 text-[0.6875rem] font-medium leading-4 tracking-wide text-pine">
                 <span className="h-1.5 w-1.5 animate-breathe rounded-full bg-pine" aria-hidden />
-                就绪
+                {t('workbench.ready')}
               </span>
             ) : undefined
           }

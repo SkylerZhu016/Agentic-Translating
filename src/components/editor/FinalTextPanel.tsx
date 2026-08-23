@@ -11,6 +11,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { TID } from '@/src/lib/testids'
 import { EditPopover, type PopoverAnchor } from './EditPopover'
 import type { SelectionSnapshot } from './types'
+import { useI18n } from '@/src/i18n/LocaleProvider'
 
 export interface FinalTextPanelProps {
   /** 当前最新版本全文（空串 → 占位提示） */
@@ -54,6 +55,7 @@ function readSelection(container: HTMLElement): { snapshot: SelectionSnapshot; r
 }
 
 export function FinalTextPanel({ text, emptyHint, readonly, busy = false, highlight, onSubmitEdit }: FinalTextPanelProps) {
+  const { t } = useI18n()
   const containerRef = useRef<HTMLDivElement>(null)
   const markRef = useRef<HTMLSpanElement>(null)
   const rangeRef = useRef<Range | null>(null)
@@ -145,7 +147,7 @@ export function FinalTextPanel({ text, emptyHint, readonly, busy = false, highli
     if (text.length === 0) {
       return (
         <span className="text-ink-4">
-          {emptyHint ?? '最终译文将在工作流正式提交后显示。'}
+          {emptyHint ?? t('editor.final.defaultEmpty')}
         </span>
       )
     }
@@ -172,7 +174,7 @@ export function FinalTextPanel({ text, emptyHint, readonly, busy = false, highli
             <rect x="5" y="11" width="14" height="9" rx="1.5" />
             <path d="M8 11V7a4 4 0 0 1 8 0v4" />
           </svg>
-          统筹中 · 只读
+          {t('editor.final.readonly')}
         </div>
       )}
 
@@ -181,6 +183,8 @@ export function FinalTextPanel({ text, emptyHint, readonly, busy = false, highli
         data-testid={TID.edit.finalText}
         data-readonly={readonly ? 'true' : 'false'}
         aria-readonly={readonly}
+        aria-label={t('editor.final.title')}
+        tabIndex={readonly ? undefined : 0}
         onMouseUp={inspectSelection}
         onKeyUp={(e) => {
           if (e.shiftKey || e.key === 'Shift') inspectSelection()
@@ -200,6 +204,7 @@ export function FinalTextPanel({ text, emptyHint, readonly, busy = false, highli
           busy={busy}
           onSubmit={submitEdit}
           onClose={closePopover}
+          returnFocusRef={containerRef}
         />
       )}
     </div>

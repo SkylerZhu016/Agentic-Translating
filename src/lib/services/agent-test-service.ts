@@ -3,6 +3,7 @@ import { chatCompletion, isAsyncIterable } from '../llm/client'
 import { parseSemanticAgentOutput } from '../protocol/semantic-output'
 import { resolveCompletionTokenBudget } from '../guards/tokens'
 import { beginBestEffortLlmCall } from './llm-call-ledger'
+import { currentRuntimeEndpoint } from './runtime-endpoint-credentials'
 
 export interface AgentTestPrompt {
   promptLanguage: 'zh' | 'en'
@@ -74,6 +75,14 @@ export async function runIndependentAgentTest(input: {
         baseUrl: input.endpoint.baseUrl,
         chatCompletionsPath: input.endpoint.chatCompletionsPath,
         apiKey: input.endpoint.apiKey,
+        ...(input.ledger
+          ? {
+              resolveRuntimeEndpoint: () => currentRuntimeEndpoint(
+                input.ledger!.db,
+                input.ledger!.endpointId,
+              ),
+            }
+          : {}),
       },
       {
         model: input.model,

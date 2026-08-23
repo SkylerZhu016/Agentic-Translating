@@ -3,8 +3,10 @@
 import { useEffect, useState } from 'react'
 import { Badge, Button, Card } from '@/src/components/ui'
 import type { NotifyFn } from './shared'
+import { useI18n } from '@/src/i18n'
 
 export function DirectionSettingsCard({ notify }: { notify: NotifyFn }) {
+  const { t } = useI18n()
   const [suppressed, setSuppressed] = useState(false)
   const [saving, setSaving] = useState(false)
   const [desktop, setDesktop] = useState(false)
@@ -33,12 +35,12 @@ export function DirectionSettingsCard({ notify }: { notify: NotifyFn }) {
           value: '0',
         }),
       })
-      if (!response.ok) throw new Error('设置保存失败')
+      if (!response.ok) throw new Error(t('directionSettings.error.save'))
       setSuppressed(false)
-      notify('方向切换提示已恢复', { tone: 'inverted' })
+      notify(t('directionSettings.restored'), { tone: 'inverted' })
     } catch (error) {
-      notify('保存失败', {
-        message: error instanceof Error ? error.message : '请稍后重试',
+      notify(t('config.error.save'), {
+        message: error instanceof Error ? error.message : t('config.error.tryLater'),
       })
     } finally {
       setSaving(false)
@@ -47,17 +49,20 @@ export function DirectionSettingsCard({ notify }: { notify: NotifyFn }) {
 
   return (
     <Card
-      overline="Workspace"
-      title="方向切换"
+      overline={t('directionSettings.overline')}
+      title={t('directionSettings.title')}
       actions={
         <Badge variant={suppressed ? 'subtle' : 'outline'}>
-          {suppressed ? '提示已关闭' : '提示已启用'}
+          {suppressed ? t('directionSettings.suppressed') : t('directionSettings.enabled')}
         </Badge>
       }
     >
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <p className="max-w-xl text-sm leading-6 text-ink-3">
-          切换英译中与中译英会离开当前会话，但不会取消服务端正在执行的任务。
+      <div
+        data-testid="direction-settings-actions"
+        className="flex w-full min-w-0 max-w-full flex-wrap items-center gap-3 sm:justify-between"
+      >
+        <p className="w-full min-w-0 max-w-xl text-sm leading-6 text-ink-3 sm:w-auto sm:flex-1">
+          {t('directionSettings.description')}
         </p>
         <Button
           variant="outline"
@@ -65,7 +70,7 @@ export function DirectionSettingsCard({ notify }: { notify: NotifyFn }) {
           disabled={!suppressed || saving}
           onClick={() => void restoreWarning()}
         >
-          恢复方向切换提示
+          {t('directionSettings.restore')}
         </Button>
         {desktop && (
           <>
@@ -74,14 +79,14 @@ export function DirectionSettingsCard({ notify }: { notify: NotifyFn }) {
               size="sm"
               onClick={() => void window.agenticDesktop?.openDataDirectory()}
             >
-              打开数据目录
+              {t('directionSettings.openData')}
             </Button>
             <Button
               variant="outline"
               size="sm"
               onClick={() => void window.agenticDesktop?.openDiagnosticLogs()}
             >
-              打开诊断日志
+              {t('directionSettings.openLogs')}
             </Button>
           </>
         )}

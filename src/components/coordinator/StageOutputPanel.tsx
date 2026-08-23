@@ -12,8 +12,11 @@
 import type { Stage, StageOutputRow } from '@/src/lib/contracts/types'
 import { TID } from '@/src/lib/testids'
 import { Badge, Button, Spinner } from '@/src/components/ui'
-import { STAGE_INDEX, STAGES, type StageStatus } from './stage-meta'
+import { STAGE_INDEX, type StageStatus } from './stage-meta'
 import { parseSemanticAgentOutput } from '@/src/lib/protocol/semantic-output'
+import { useI18n } from '@/src/i18n/LocaleProvider'
+import { localizedStageMeta, localizedStageStatus } from './localized-stage'
+import { localizeDiagnosticError } from '@/src/i18n/diagnostic'
 
 export interface StageOutputPanelProps {
   stage: Stage
@@ -25,14 +28,6 @@ export interface StageOutputPanelProps {
   onRun: (stage: Stage) => void
 }
 
-const STAGE_STATUS_LABEL: Record<StageStatus, string> = {
-  pending: '尚未运行',
-  running: '运行中',
-  complete: '完成',
-  failed: '失败',
-  stale: '已过期',
-}
-
 export function StageOutputPanel({
   stage,
   row,
@@ -41,7 +36,11 @@ export function StageOutputPanel({
   canRun,
   onRun,
 }: StageOutputPanelProps) {
-  const meta = STAGES[STAGE_INDEX[stage]]
+  const { t } = useI18n()
+  const meta = localizedStageMeta(stage, t)
+  const localizedError = row?.error
+    ? localizeDiagnosticError(t, row.error, t('stage.error.run'))
+    : null
   const status: StageStatus = running ? 'running' : (row?.status ?? 'pending')
   const isStreamingStage = stage === 'orchestrate' || stage === 'assemble'
 
@@ -49,7 +48,7 @@ export function StageOutputPanel({
     <section
       data-stage={stage}
       data-testid={TID.stage.outputPanel}
-      aria-label={`${meta.label}阶段输出`}
+      aria-label={t('stage.output.aria', { stage: meta.label })}
       className="rounded-sm border border-line bg-paper-raise/70 px-4 py-3"
     >
       {/* 面板头：阶段名 + 状态 */}
@@ -58,20 +57,20 @@ export function StageOutputPanel({
           {String(STAGE_INDEX[stage] + 1).padStart(2, '0')} · {meta.label}
         </p>
         <span className="flex items-center gap-1.5">
-          {status === 'complete' && <Badge className="bg-pine text-paper">完成</Badge>}
-          {status === 'failed' && <Badge className="bg-cinnabar text-paper">失败</Badge>}
+          {status === 'complete' && <Badge className="bg-pine text-paper">{t('stage.status.complete')}</Badge>}
+          {status === 'failed' && <Badge className="bg-cinnabar text-paper">{t('stage.status.failed')}</Badge>}
           {status === 'stale' && (
             <Badge
               variant="outline"
-              title="上游已重跑，需重新运行"
+              title={t('stage.stale.title')}
               className="border-amber/60 text-amber"
             >
-              已过期
+              {t('stage.status.stale')}
             </Badge>
           )}
           {status === 'running' && (
             <Badge variant="subtle">
-              <Spinner size="sm" /> {STAGE_STATUS_LABEL.running}
+              <Spinner size="sm" /> {localizedStageStatus('running', t)}
             </Badge>
           )}
         </span>
@@ -80,7 +79,7 @@ export function StageOutputPanel({
       {/* stale 提醒条：内容保持可见（R3），仅提示需重跑 */}
       {status === 'stale' && (
         <p className="mt-2 rounded-xs border border-amber/40 bg-amber/10 px-2.5 py-1.5 text-xs text-amber">
-          此结果已过期——上游已重跑，需重新运行本阶段
+          {t('stage.output.stale')}
         </p>
       )}
 
@@ -98,32 +97,32 @@ export function StageOutputPanel({
                 </pre>
               ) : (
                 <p className="flex items-center gap-2 text-xs text-ink-3">
-                  <Spinner size="sm" /> 统筹 Agent 正在{meta.label}……
+                  <Spinner size="sm" /> {t('stage.output.streaming', { stage: meta.label })}
                 </p>
               )}
             </div>
           ) : (
             <p className="flex items-center gap-2 py-3 text-xs text-ink-3">
-              <Spinner size="sm" /> 统筹 Agent 正在{meta.label}译文，请稍候……
+              <Spinner size="sm" /> {t('stage.output.processing', { stage: meta.label })}
             </p>
           ))}
 
         {/* 失败：错误详情 + 解析细节折叠 + 重跑 */}
         {status === 'failed' && (
           <div className="rounded-xs border border-cinnabar/40 bg-cinnabar/5 px-3 py-2.5">
-            <p className="text-xs font-medium text-cinnabar">本阶段运行失败</p>
-            {row?.error && (
-              <p className="mt-1 text-xs leading-5 text-cinnabar/90">{row.error}</p>
+            <p className="text-xs font-medium text-cinnabar">{t('stage.output.failed')}</p>
+            {localizedError && (
+              <p className="mt-1 text-xs leading-5 text-cinnabar/90">{localizedError}</p>
             )}
             {(row?.error || row?.raw_output) && (
               <details className="mt-2">
                 <summary className="cursor-pointer select-none text-xs text-ink-3 hover:text-ink-2">
-                  解析细节 / 原始输出
+                  {t('stage.output.rawDetails')}
                 </summary>
                 <div className="mt-1.5 space-y-1.5">
-                  {row?.error && (
+                  {localizedError && (
                     <pre className="max-h-32 overflow-auto whitespace-pre-wrap rounded-xs bg-paper px-2 py-1.5 font-mono text-[0.6875rem] leading-4 text-cinnabar/80">
-                      {row.error}
+                      {localizedError}
                     </pre>
                   )}
                   {row?.raw_output && (
@@ -141,7 +140,7 @@ export function StageOutputPanel({
               onClick={() => onRun(stage)}
               className="mt-2.5 border-cinnabar/50 text-cinnabar hover:bg-cinnabar/10"
             >
-              重跑本阶段
+              {t('stage.output.rerun')}
             </Button>
           </div>
         )}
@@ -153,7 +152,7 @@ export function StageOutputPanel({
 
         {/* 未运行占位 */}
         {status === 'pending' && (
-          <p className="py-2 text-xs text-ink-4">尚未运行——{meta.hint}</p>
+          <p className="py-2 text-xs text-ink-4">{t('stage.output.pending', { hint: meta.hint })}</p>
         )}
       </div>
     </section>
@@ -179,7 +178,8 @@ function StageStructuredBody({ stage, row }: { stage: Stage; row: StageOutputRow
 }
 
 function UnparsedFallback({ raw }: { raw: string | null }) {
-  if (!raw) return <p className="py-1 text-xs text-ink-4">输出为空</p>
+  const { t } = useI18n()
+  if (!raw) return <p className="py-1 text-xs text-ink-4">{t('stage.output.empty')}</p>
   return (
     <pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded-xs bg-paper px-2.5 py-2 font-mono text-[0.6875rem] leading-4 text-ink-3">
       {raw}

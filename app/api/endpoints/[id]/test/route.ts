@@ -9,6 +9,11 @@ import {
   isAsyncIterable,
   LLMError,
 } from '@/src/lib/llm/client'
+import { currentRuntimeEndpoint } from '@/src/lib/services/runtime-endpoint-credentials'
+import {
+  logSafeDiagnostic,
+  publicDiagnosticError,
+} from '@/src/lib/security/diagnostic-error'
 
 const bodySchema = z.object({ model: z.string().min(1) })
 
@@ -33,6 +38,7 @@ export async function POST(
         chatCompletionsPath:
           endpoint.chat_completions_path ?? '/v1/chat/completions',
         apiKey: endpoint.api_key,
+        resolveRuntimeEndpoint: () => currentRuntimeEndpoint(db, id),
       },
       {
         model: body.data.model,
@@ -53,21 +59,22 @@ export async function POST(
       response: result.content,
     })
   } catch (error) {
-    const diagnosticId = crypto.randomUUID()
+    const diagnostic = publicDiagnosticError('endpoint_test_failed')
+    // Reduce the exception to an allowlisted structural code before logging.
+    // Upstream bodies/messages can reflect Authorization, URLs, and prompts.
+    const safeCause = error instanceof LLMError
+      ? { code: error.code }
+      : { code: 'unexpected_error' }
+    logSafeDiagnostic({
+      scope: 'endpoint.test',
+      diagnosticId: diagnostic.diagnosticId,
+      cause: safeCause,
+    })
     return Response.json(
       {
-        error: error instanceof Error ? error.message : String(error),
-        diagnosticId,
+        ...diagnostic,
         phase: 'chat_completions',
         elapsedMs: Math.round(performance.now() - started),
-        model: body.data.model,
-        ...(error instanceof LLMError
-          ? {
-              code: error.code,
-              status: error.status ?? null,
-              retryable: error.retryable,
-            }
-          : {}),
       },
       { status: 502 },
     )

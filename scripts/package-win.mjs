@@ -26,6 +26,10 @@ const buildEnvironment = {
   ELECTRON_CACHE: path.join(root, '.omo', 'electron-cache'),
   ELECTRON_BUILDER_CACHE: path.join(root, '.omo', 'electron-builder-cache'),
 }
+delete buildEnvironment.AGENTIC_NEXT_DIST_DIR
+delete buildEnvironment.AGENTIC_NEXT_DEV_SERVER
+delete buildEnvironment.E2E_TEST
+delete buildEnvironment.ELECTRON_RUN_AS_NODE
 
 if (!output.startsWith(expectedOutputPrefix)) {
   throw new Error(`Refusing to replace build output outside the project: ${output}`)

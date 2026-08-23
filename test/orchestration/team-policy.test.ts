@@ -1,21 +1,26 @@
 import { describe, expect, it } from 'vitest'
-import { inferRequiredDynamicArchetypes } from '../../src/lib/orchestration/vnext-runner'
+import { BUILTIN_AGENT_VARIANTS } from '../../src/lib/prompts/bidirectional'
+import {
+  buildDynamicFallbackTeam,
+  inferRequiredDynamicArchetypes,
+  poetryPlanningEnabled,
+} from '../../src/lib/orchestration/vnext-runner'
 
 describe('dynamic team policy', () => {
-  it('keeps only the safety pair for continuously typeset classical Chinese verse', () => {
+  it('always keeps fidelity, naturalness, and form in competition for classical Chinese verse', () => {
     expect(
       inferRequiredDynamicArchetypes(
         '相见时难别亦难，东风无力百花残。春蚕到死丝方尽，蜡炬成灰泪始干。晓镜但愁云鬓改，夜吟应觉月光寒。蓬山此去无多路，青鸟殷勤为探看。',
       ),
-    ).toEqual(['semantic-fidelity', 'poetry-form'])
+    ).toEqual(['semantic-fidelity', 'target-naturalness', 'poetry-form'])
   })
 
-  it('keeps only the safety pair for a lineated English poem', () => {
+  it('always keeps fidelity, naturalness, and form in competition for lineated English poetry', () => {
     expect(
       inferRequiredDynamicArchetypes(
         'One line\nA second line\nA third line\nA fourth line',
       ),
-    ).toEqual(['semantic-fidelity', 'poetry-form'])
+    ).toEqual(['semantic-fidelity', 'target-naturalness', 'poetry-form'])
   })
 
   it('keeps the general fallback pair for ordinary prose', () => {
@@ -31,7 +36,7 @@ describe('dynamic team policy', () => {
         '',
         { poetryMode: 'on' },
       ),
-    ).toEqual(['semantic-fidelity', 'poetry-form'])
+    ).toEqual(['semantic-fidelity', 'target-naturalness', 'poetry-form'])
     expect(
       inferRequiredDynamicArchetypes(
         'Line one\nLine two\nLine three\nLine four',
@@ -39,5 +44,32 @@ describe('dynamic team policy', () => {
         { poetryMode: 'off' },
       ),
     ).toEqual(['semantic-fidelity', 'target-naturalness'])
+  })
+
+  it('repairs the invalid-tool fallback into a three-role poetry team that enables planning', () => {
+    const allowed = BUILTIN_AGENT_VARIANTS.filter(
+      (variant) => variant.direction === 'en_to_zh',
+    )
+    const enforced = buildDynamicFallbackTeam(
+      {
+        id: 'poetry-fallback',
+        source_text: 'One line\nTwo lines\nThree lines\nFour lines',
+        source_lang: 'English',
+        target_lang: 'Chinese',
+        state: 'draft',
+        task_brief: 'Translate this poem.',
+        config_snapshot: '{}',
+      },
+      allowed,
+      { poetryMode: 'on' },
+    )
+    const archetypeIds = enforced.map((item) => item.variant.archetypeId)
+
+    expect(archetypeIds).toEqual([
+      'semantic-fidelity',
+      'target-naturalness',
+      'poetry-form',
+    ])
+    expect(poetryPlanningEnabled({ isPoetry: true }, archetypeIds)).toBe(true)
   })
 })

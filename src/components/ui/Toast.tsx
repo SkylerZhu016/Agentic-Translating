@@ -1,4 +1,7 @@
+'use client'
+
 import type { HTMLAttributes, ReactNode } from 'react'
+import { useI18n } from '@/src/i18n/LocaleProvider'
 
 // ---------------------------------------------------------------------------
 // Toast — 呈现型通知条（无全局状态；挂载/堆叠由使用方负责）
@@ -35,6 +38,7 @@ export function Toast({
   className = '',
   ...rest
 }: ToastProps) {
+  const { t } = useI18n()
   return (
     <div
       role="status"
@@ -58,7 +62,7 @@ export function Toast({
       {onClose != null && (
         <button
           type="button"
-          aria-label="关闭通知"
+          aria-label={t('ui.toast.close')}
           onClick={onClose}
           className={tone === 'inverted' ? 'shrink-0 text-paper/70 hover:text-paper' : 'shrink-0 text-ink-3 hover:text-ink'}
         >

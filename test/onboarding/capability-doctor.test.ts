@@ -11,6 +11,7 @@ import {
 } from '../../src/lib/llm/client'
 import { runEndpointCapabilityCheck } from '../../src/lib/onboarding/capability-doctor'
 import { createOnboardingRepository } from '../../src/lib/onboarding/repository'
+import type { discoverEndpointModels } from '../../src/lib/llm/model-discovery'
 
 const databases: Database.Database[] = []
 
@@ -98,7 +99,7 @@ describe('endpoint capability doctor', () => {
     )
 
     expect(profile.models.supported).toBe(false)
-    expect(profile.models.error).toContain('[REDACTED]')
+    expect(profile.models.error).toBe('probe_failed')
     expect(profile.models.error).not.toContain('capability-secret')
     expect(profile.chat).toEqual({ supported: true, error: null })
     expect(profile.usage).toEqual({ supported: true, error: null })
@@ -424,5 +425,121 @@ describe('endpoint capability doctor', () => {
     expect(profile.streaming.supported).toBe(true)
     expect(profile.tools.supported).toBe(true)
     expect(completionCall).toBe(3)
+  })
+
+  it('re-reads the complete live endpoint across discovery and all three probes', async () => {
+    const { db, endpointId } = setupEndpoint('key-1')
+    const repositories = createRepositories(db)
+    const observed: Array<{ baseUrl: string; path?: string | null; key: string }> = []
+    const rotate = (index: number) => {
+      const current = repositories.endpoints.getById(endpointId)!
+      repositories.endpoints.update({
+        id: endpointId,
+        name: current.name,
+        base_url: `https://provider-${index}.test`,
+        chat_completions_path: `/v${index}/chat/completions`,
+        api_key: `key-${index}`,
+        context_window: current.context_window ?? null,
+      })
+    }
+    let completionCall = 0
+    const complete = vi.fn(async (
+      endpoint: {
+        resolveRuntimeEndpoint?: () => {
+          baseUrl: string
+          chatCompletionsPath?: string | null
+          apiKey: string
+        }
+      },
+      request: ChatCompletionRequest,
+    ) => {
+      const live = endpoint.resolveRuntimeEndpoint!()
+      observed.push({
+        baseUrl: live.baseUrl,
+        path: live.chatCompletionsPath,
+        key: live.apiKey,
+      })
+      completionCall += 1
+      if (completionCall < 3) rotate(completionCall + 2)
+      if (completionCall === 1) return { content: 'OK' }
+      if (completionCall === 2) {
+        request.onActivity?.()
+        return doneStream('sse')
+      }
+      return {
+        content: '',
+        toolCalls: [
+          { id: 'call-rotation', name: 'capability_probe', arguments: '{}' },
+        ],
+      }
+    })
+
+    const profile = await runEndpointCapabilityCheck(db, endpointId, {}, {
+      discoverModels: vi.fn(async (endpoint) => {
+        const live = endpoint.resolveRuntimeEndpoint!()
+        observed.push({
+          baseUrl: live.baseUrl,
+          path: live.chatCompletionsPath,
+          key: live.apiKey,
+        })
+        rotate(2)
+        return [{ id: 'model-a', ownedBy: null }]
+      }),
+      complete: complete as unknown as typeof chatCompletion,
+      createDiagnosticId: () => '09c952e7-2691-486e-8a19-9c35b79f0407',
+    })
+
+    expect(profile.chat.supported).toBe(true)
+    expect(profile.streaming.supported).toBe(true)
+    expect(profile.tools.supported).toBe(true)
+    expect(observed).toEqual([
+      { baseUrl: 'https://provider.test', path: '/v1/chat/completions', key: 'key-1' },
+      { baseUrl: 'https://provider-2.test', path: '/v2/chat/completions', key: 'key-2' },
+      { baseUrl: 'https://provider-3.test', path: '/v3/chat/completions', key: 'key-3' },
+      { baseUrl: 'https://provider-4.test', path: '/v4/chat/completions', key: 'key-4' },
+    ])
+  })
+
+  it('blocks every remaining probe immediately after the live endpoint is deleted', async () => {
+    const { db, endpointId } = setupEndpoint()
+    const complete = vi.fn(async (endpoint: {
+      resolveRuntimeEndpoint?: () => unknown
+    }) => {
+      endpoint.resolveRuntimeEndpoint!()
+      return { content: 'must-not-complete' }
+    })
+    const run = runEndpointCapabilityCheck(db, endpointId, {}, {
+      discoverModels: vi.fn(async (endpoint) => {
+        endpoint.resolveRuntimeEndpoint!()
+        db.prepare('DELETE FROM endpoints WHERE id=?').run(endpointId)
+        return [{ id: 'model-a', ownedBy: null }]
+      }),
+      complete: complete as unknown as typeof chatCompletion,
+      createDiagnosticId: () => 'd36ed5c7-651d-4fd2-985f-975eb9b62457',
+    })
+
+    await expect(run).rejects.toMatchObject({ code: 'runtime_endpoint_deleted' })
+    expect(complete).toHaveBeenCalledTimes(1)
+  })
+
+  it('blocks model discovery when the endpoint becomes disabled before its fetch', async () => {
+    const { db, endpointId } = setupEndpoint()
+    db.exec('ALTER TABLE endpoints ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1')
+    const discoverModels = vi.fn(async (endpoint: {
+      resolveRuntimeEndpoint?: () => unknown
+    }) => {
+      db.prepare('UPDATE endpoints SET enabled=0 WHERE id=?').run(endpointId)
+      endpoint.resolveRuntimeEndpoint!()
+      return []
+    })
+    const complete = vi.fn()
+    const run = runEndpointCapabilityCheck(db, endpointId, {}, {
+      discoverModels: discoverModels as unknown as typeof discoverEndpointModels,
+      complete: complete as unknown as typeof chatCompletion,
+      createDiagnosticId: () => 'a8d83aa4-76ef-4ba4-8f3b-14804ff0c3a1',
+    })
+
+    await expect(run).rejects.toMatchObject({ code: 'runtime_endpoint_disabled' })
+    expect(complete).not.toHaveBeenCalled()
   })
 })

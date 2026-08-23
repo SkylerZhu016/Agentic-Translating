@@ -4,7 +4,7 @@
 
 面向高难文本的多方案翻译决策台，支持双向、多模型审议、证据化取舍与可复用的项目档案。
 
-**最新版本：[v0.1.2](https://github.com/SkylerZhu016/Agentic-Translating/releases/tag/v0.1.2)**——提供 Windows 安装版和便携版，其他系统可从源码自行构建。更新内容见[发行日志](releases/0.1.2.md)。
+**最新版本：[v0.2.0](https://github.com/SkylerZhu016/Agentic-Translating/releases/tag/v0.2.0)**——提供 Windows 安装版和便携版，其他系统可从源码自行构建。更新内容见[发行日志](releases/0.2.0.md)。
 
 它和通用编码 Agent 的核心区别在于，不是把翻译当作另一种编码任务来处理，而是让多个角色共同面对同一个开放问题。不同候选版本之间的分歧会作为可比较的证据保留下来，由主 Agent 决定调用哪些视角、怎样审议和融合，最终通过可追溯的文本操作生成定稿。
 
@@ -85,10 +85,10 @@ Agent 可以自由表达：
 
 ## 桌面与自部署
 
-普通 Windows 用户可直接从 [v0.1.2 Release](https://github.com/SkylerZhu016/Agentic-Translating/releases/tag/v0.1.2) 下载：
+普通 Windows 用户可直接从 [v0.2.0 Release](https://github.com/SkylerZhu016/Agentic-Translating/releases/tag/v0.2.0) 下载：
 
-- `Agentic Translating-0.1.2-setup-x64.exe`——推荐使用的安装版；
-- `Agentic Translating-0.1.2-portable-x64.exe`——无需安装的便携版。
+- `Agentic Translating-0.2.0-setup-x64.exe`——推荐使用的安装版；
+- `Agentic Translating-0.2.0-portable-x64.exe`——无需安装的便携版。
 
 首次启动会创建本地应用数据；覆盖升级不会删除翻译历史或用户自定义 Agent。删除端点前，程序现在会展示其当前与历史引用，并可仅解除活动绑定，不删除 Agent 定义。
 
@@ -97,6 +97,8 @@ Windows 打包：
 ```bash
 npm run package:win
 ```
+
+源码开发时，运行 `npm run desktop` 会直接启动 Electron 和由它托管的 Next.js 开发服务，无需预先构建，缓存写入 `.next-electron-dev`。普通 `npm run dev` 使用独立的 `.next-web-dev`，两者不会争用同一目录。如需检查生产 standalone 产物，请先运行 `npm run build:standalone`，再运行 `npm run desktop:preview`；预览命令不会隐式构建，缺少 `.next/standalone/server.js` 时会给出可操作提示。
 
 产物位于 `dist-electron/` 目录，同时生成 NSIS 安装版和便携版。桌面版数据存储在 Electron 的 `userData` 目录，密钥由 `safeStorage` 封装的本地主密钥保护。
 
@@ -152,13 +154,15 @@ npm run harness -- list --base=http://127.0.0.1:3000
 
 内置能力集中在通用高难翻译与诗歌相关任务，其他领域可以由用户增加自定义 Agent 和提示词包。批量输入目前支持 UTF-8 `.txt` 和 `.md`。EPUB 支持明确延期：后续应评估成熟且许可证合适的解析与回写方案，不从零重做完整格式处理。
 
-0.1.2 已通过 911 项 Vitest 检查、TypeScript 校验、standalone 生产启动冒烟，以及 21 条当前 Playwright 流程；另有 13 条旧手动工作流夹具因已被 v3 编排取代而明确跳过。这些工程验证不等同于“FSBP 已在正式未见集上证明翻译质量优于直译”。
+0.2.0 已通过 119 个文件中的 1,180 项 Vitest 检查、TypeScript 校验、migration 18 standalone 生产启动冒烟，以及覆盖双向草稿与响应式国际化的 17 条浏览器流程；Electron 源码开发版和生产预览版还完成了首次启动、持久化、弹窗、窄屏、历史页与导出入口验收。这些工程验证不会把开发批次改写成正式未见实验，也不能把总体差异归因给某个单独组件。
 
 ## 开发命令
 
 | 命令 | 说明 |
 |---|---|
 | `npm run dev` | 启动开发服务器 |
+| `npm run desktop` | 启动源码桌面端及其托管的 Next.js 开发服务 |
+| `npm run desktop:preview` | 打开已有的 `.next/standalone` 桌面预览，不会隐式构建 |
 | `npm run typecheck` | TypeScript 类型检查 |
 | `npm test` | 运行 Vitest 测试 |
 | `npm run build` | Next.js 生产构建 |

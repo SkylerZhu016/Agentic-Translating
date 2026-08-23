@@ -13,6 +13,12 @@ import type {
 import type { Endpoint } from './api'
 import { ModelPicker } from './ModelPicker'
 import type { NotifyFn } from './shared'
+import {
+  localizeDiagnosticError,
+  useI18n,
+  type MessageKey,
+  type Translator,
+} from '@/src/i18n'
 
 interface CapabilityResult {
   supported: boolean
@@ -55,28 +61,18 @@ interface OnboardingStatus {
 
 type WorkflowLevel = 'quick' | 'balanced' | 'deep'
 
-const LEVEL_META: Record<
-  WorkflowLevel,
-  {
-    label: string
-    description: string
-    archetypes: string[] | 'all'
-    teamPolicy: TeamPolicy
-    reviewMode: ReviewMode
-    maxAgentCalls: number
-  }
-> = {
+const LEVEL_META = {
   quick: {
-    label: '快速',
-    description: '两个互补候选，适合先判断文本是否需要深度审议。',
+    labelKey: 'doctor.level.quick',
+    descriptionKey: 'doctor.level.quickDescription',
     archetypes: ['semantic-fidelity', 'target-naturalness'],
     teamPolicy: 'fixed',
     reviewMode: 'main_editor',
     maxAgentCalls: 2,
   },
   balanced: {
-    label: '均衡',
-    description: '动态选择最多五个角色，兼顾质量、速度与费用。',
+    labelKey: 'doctor.level.balanced',
+    descriptionKey: 'doctor.level.balancedDescription',
     archetypes: [
       'semantic-fidelity',
       'target-naturalness',
@@ -91,45 +87,59 @@ const LEVEL_META: Record<
     maxAgentCalls: 5,
   },
   deep: {
-    label: '深度',
-    description: '开放全部角色并使用经典四阶段，适合高难文本。',
+    labelKey: 'doctor.level.deep',
+    descriptionKey: 'doctor.level.deepDescription',
     archetypes: 'all',
     teamPolicy: 'dynamic',
     reviewMode: 'four_stage',
     maxAgentCalls: 10,
   },
-}
+} as const satisfies Record<
+  WorkflowLevel,
+  {
+    labelKey: MessageKey
+    descriptionKey: MessageKey
+    archetypes: readonly string[] | 'all'
+    teamPolicy: TeamPolicy
+    reviewMode: ReviewMode
+    maxAgentCalls: number
+  }
+>
 
-const CAPABILITY_LABELS: Array<{
+const CAPABILITY_LABELS = [
+  { key: 'models', labelKey: 'doctor.capability.models' },
+  { key: 'chat', labelKey: 'doctor.capability.chat' },
+  { key: 'streaming', labelKey: 'doctor.capability.streaming' },
+  { key: 'usage', labelKey: 'doctor.capability.usage' },
+  { key: 'tools', labelKey: 'doctor.capability.tools' },
+] as const satisfies ReadonlyArray<{
   key: 'models' | 'chat' | 'streaming' | 'usage' | 'tools'
-  label: string
-}> = [
-  { key: 'models', label: '模型列表' },
-  { key: 'chat', label: '普通响应' },
-  { key: 'streaming', label: '流式响应' },
-  { key: 'usage', label: 'Token 用量' },
-  { key: 'tools', label: '工具调用' },
-]
+  labelKey: MessageKey
+}>
 
-function endpointLocation(endpoint: Endpoint | undefined): string {
-  if (!endpoint) return '未知'
+function endpointLocation(endpoint: Endpoint | undefined, t: Translator): string {
+  if (!endpoint) return t('doctor.location.unknown')
   try {
     const host = new URL(endpoint.base_url).hostname.toLowerCase()
     if (host === 'localhost' || host === '127.0.0.1' || host === '::1') {
-      return '本机端点'
+      return t('doctor.location.local')
     }
-    return `远程端点 · ${host}`
+    return t('doctor.location.remote', { host })
   } catch {
-    return '地址待核验'
+    return t('doctor.location.unverified')
   }
 }
 
-async function readJson<T>(response: Response): Promise<T> {
+async function readJson<T>(response: Response, t: Translator): Promise<T> {
   const body = await response.json().catch(() => null) as
     | (T & { error?: string })
     | null
   if (!response.ok) {
-    throw new Error(body?.error ?? `请求失败（HTTP ${response.status}）`)
+    throw new Error(localizeDiagnosticError(
+      t,
+      body?.error,
+      t('doctor.error.request', { status: response.status }),
+    ))
   }
   return body as T
 }
@@ -142,6 +152,7 @@ export function OnboardingDoctor({
   notify: NotifyFn
 }) {
   const { direction } = useDirection()
+  const { t, formatDuration, formatNumber } = useI18n()
   const [status, setStatus] = useState<OnboardingStatus | null>(null)
   const [endpointId, setEndpointId] = useState<number | null>(null)
   const [model, setModel] = useState('')
@@ -159,6 +170,7 @@ export function OnboardingDoctor({
     try {
       const next = await readJson<OnboardingStatus>(
         await fetch('/api/onboarding/status', { cache: 'no-store' }),
+        t,
       )
       setStatus(next)
       setEndpointId((current) =>
@@ -169,13 +181,13 @@ export function OnboardingDoctor({
       )
       if (next.recommendedAction === 'none') setExpanded(false)
     } catch (error) {
-      notify('兼容性医生暂不可用', {
-        message: error instanceof Error ? error.message : '请稍后重试',
+      notify(t('doctor.unavailable'), {
+        message: error instanceof Error ? error.message : t('config.error.tryLater'),
       })
     } finally {
       setLoading(false)
     }
-  }, [endpoints, notify])
+  }, [endpoints, notify, t])
 
   useEffect(() => {
     void loadStatus()
@@ -204,21 +216,21 @@ export function OnboardingDoctor({
     const warnings: string[] = []
     if (!profile.streaming.supported) {
       warnings.push(
-        '该端点可以完成普通请求，但没有通过真实流式响应测试。运行时仍可使用，首屏反馈和长任务进度可能较慢。',
+        t('doctor.warning.streaming'),
       )
     }
     if (!profile.tools.supported) {
       warnings.push(
-        '该端点未通过工具调用测试。经典四阶段仍可使用；主 Agent 证据化编辑可能不可用。',
+        t('doctor.warning.tools'),
       )
     }
     if (!profile.usage.supported) {
       warnings.push(
-        '该端点没有返回标准 usage；只有具备可靠估算依据时才会显示本地估算，否则 token 与费用会保持未知。',
+        t('doctor.warning.usage'),
       )
     }
     return warnings.length > 0 ? warnings.join(' ') : null
-  }, [profile])
+  }, [profile, t])
 
   async function runDoctor() {
     if (!endpointId) return
@@ -231,6 +243,7 @@ export function OnboardingDoctor({
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(model.trim() ? { model: model.trim() } : {}),
         }),
+        t,
       )
       setProfile(checked)
       if (!model && checked.testedModel) setModel(checked.testedModel)
@@ -243,12 +256,13 @@ export function OnboardingDoctor({
             selectedEndpointId: endpointId,
           }),
         }),
+        t,
       )
       setStatus(nextStatus)
-      notify('兼容性检查已完成', { tone: 'inverted' })
+      notify(t('doctor.check.complete'), { tone: 'inverted' })
     } catch (error) {
-      notify('兼容性检查失败', {
-        message: error instanceof Error ? error.message : '请重试',
+      notify(t('doctor.check.failed'), {
+        message: error instanceof Error ? error.message : t('config.error.tryLater'),
       })
     } finally {
       setChecking(false)
@@ -262,9 +276,11 @@ export function OnboardingDoctor({
       const [catalogue, bundle] = await Promise.all([
         readJson<{ variants: AgentDirectionVariant[] }>(
           await fetch(`/api/agent-catalog?direction=${direction}`),
+          t,
         ),
         readJson<DirectionPromptBundle>(
           await fetch(`/api/direction-prompt-bundles?direction=${direction}`),
+          t,
         ),
       ])
       const meta = LEVEL_META[level]
@@ -272,10 +288,12 @@ export function OnboardingDoctor({
         (variant) =>
           variant.enabled &&
           (meta.archetypes === 'all' ||
-            meta.archetypes.includes(variant.archetypeId)),
+            meta.archetypes.some(
+              (archetypeId) => archetypeId === variant.archetypeId,
+            )),
       )
       if (variants.length < 2) {
-        throw new Error('当前方向没有足够的可用 Agent，至少需要两个不同角色。')
+        throw new Error(t('doctor.workflow.notEnoughAgents'))
       }
       const binding: ModelBinding = {
         endpointId,
@@ -287,6 +305,7 @@ export function OnboardingDoctor({
           ? 'four_stage'
           : meta.reviewMode
       const contract = {
+        // These labels are prompt-contract values and remain stable across UI locales.
         sourceLang: direction === 'en_to_zh' ? '英文' : '中文',
         targetLang: direction === 'en_to_zh' ? '中文' : '英文',
         taskBriefTemplate: '',
@@ -316,12 +335,15 @@ export function OnboardingDoctor({
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            name: `我的${meta.label}工作流`,
-            description: `由兼容性医生根据 ${selectedEndpoint?.name ?? '当前端点'} 生成，可继续编辑和创建 revision。`,
+            name: t('doctor.workflow.name', { level: t(meta.labelKey) }),
+            description: t('doctor.workflow.description', {
+              endpoint: selectedEndpoint?.name ?? t('doctor.workflow.currentEndpoint'),
+            }),
             direction,
             contract,
           }),
         }),
+        t,
       )
       await readJson(
         await fetch(`/api/model-profiles/${direction}`, {
@@ -337,6 +359,7 @@ export function OnboardingDoctor({
             editingAgent: binding,
           }),
         }),
+        t,
       )
       const completedAt = new Date().toISOString()
       const generatedPresetRevisionIds = Array.from(
@@ -356,16 +379,17 @@ export function OnboardingDoctor({
             generatedPresetRevisionIds,
           }),
         }),
+        t,
       )
       setStatus(next)
       setExpanded(false)
-      notify(`${meta.label}工作流已创建`, {
+      notify(t('doctor.workflow.created', { level: t(meta.labelKey) }), {
         tone: 'inverted',
-        message: '它属于你的普通预设，可随时修改、复制或创建新 revision。',
+        message: t('doctor.workflow.createdDetail'),
       })
     } catch (error) {
-      notify('创建工作流失败', {
-        message: error instanceof Error ? error.message : '请重试',
+      notify(t('doctor.workflow.createFailed'), {
+        message: error instanceof Error ? error.message : t('config.error.tryLater'),
       })
     } finally {
       setCreating(false)
@@ -380,12 +404,13 @@ export function OnboardingDoctor({
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ dismissedAt: new Date().toISOString() }),
         }),
+        t,
       )
       setStatus(next)
       setExpanded(false)
     } catch (error) {
-      notify('暂时无法保存设置', {
-        message: error instanceof Error ? error.message : '请重试',
+      notify(t('doctor.settings.failed'), {
+        message: error instanceof Error ? error.message : t('config.error.tryLater'),
       })
     }
   }
@@ -393,8 +418,8 @@ export function OnboardingDoctor({
   return (
     <Card
       id="compatibility-doctor"
-      overline="First Run"
-      title="首次运行与兼容性医生"
+      overline={t('doctor.overline')}
+      title={t('doctor.title')}
       actions={
         status?.state.completedAt || status?.state.dismissedAt ? (
           <Button
@@ -402,7 +427,7 @@ export function OnboardingDoctor({
             variant="ghost"
             onClick={() => setExpanded((current) => !current)}
           >
-            {expanded ? '收起' : '重新检查'}
+            {expanded ? t('doctor.collapse') : t('doctor.recheck')}
           </Button>
         ) : undefined
       }
@@ -415,29 +440,32 @@ export function OnboardingDoctor({
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <p className="text-sm font-medium text-ink">
-              {status?.state.completedAt ? '首次工作流已经就绪' : '已跳过首次引导'}
+              {status?.state.completedAt ? t('doctor.ready') : t('doctor.dismissed')}
             </p>
             <p className="mt-1 text-xs leading-5 text-ink-3">
               {profile
-                ? `${profile.testedModel || '当前模型'} · ${endpointLocation(selectedEndpoint)}`
-                : '可以随时重新检查端点能力。'}
+                ? t('doctor.summary', {
+                    model: profile.testedModel || t('doctor.currentModel'),
+                    location: endpointLocation(selectedEndpoint, t),
+                  })
+                : t('doctor.recheckHint')}
             </p>
           </div>
           <Badge variant="outline">
-            {status?.hasRunnableConfig ? '配置可运行' : '仍需配置'}
+            {status?.hasRunnableConfig ? t('doctor.runnable') : t('doctor.needsConfig')}
           </Badge>
         </div>
       ) : (
         <div className="space-y-5">
-          <section>
+          <section className="compatibility-endpoint-section">
             <div className="mb-2 flex items-center gap-2">
-              <Badge variant="solid">1</Badge>
-              <p className="text-sm font-medium text-ink">选择模型端点</p>
+              <Badge variant="solid">{formatNumber(1)}</Badge>
+              <p className="text-sm font-medium text-ink">{t('doctor.step.endpoint')}</p>
             </div>
             {endpoints.length === 0 ? (
               <div className="rounded-sm border border-dashed border-line-2 bg-paper/60 px-4 py-4">
                 <p className="text-sm leading-6 text-ink-3">
-                  先在下方添加一个本地、云端或 OpenAI 兼容端点。保存后回到这里继续检查。
+                  {t('doctor.endpoint.empty')}
                 </p>
                 <Button
                   className="mt-3"
@@ -449,20 +477,23 @@ export function OnboardingDoctor({
                       ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
                   }
                 >
-                  前往添加端点
+                  {t('doctor.endpoint.add')}
                 </Button>
               </div>
             ) : (
-              <div className="grid gap-2 sm:grid-cols-[minmax(10rem,0.8fr)_minmax(16rem,1.2fr)]">
+              <div
+                data-testid="compatibility-model-fields"
+                className="compatibility-endpoint-grid grid min-w-0 max-w-full gap-2 sm:grid-cols-[minmax(10rem,0.8fr)_minmax(16rem,1.2fr)]"
+              >
                 <select
                   value={endpointId ?? ''}
-                  aria-label="兼容性检查端点"
+                  aria-label={t('doctor.endpoint.aria')}
                   onChange={(event) =>
                     setEndpointId(Number(event.target.value) || null)
                   }
-                  className="h-9 rounded-sm border border-line-2 bg-paper-raise px-2 text-sm text-ink"
+                  className="h-9 min-w-0 max-w-full rounded-sm border border-line-2 bg-paper-raise px-2 text-sm text-ink"
                 >
-                  <option value="">选择端点</option>
+                  <option value="">{t('doctor.endpoint.select')}</option>
                   {endpoints.map((endpoint) => (
                     <option key={endpoint.id} value={endpoint.id}>
                       {endpoint.name}
@@ -476,14 +507,16 @@ export function OnboardingDoctor({
                     setModel(nextModel)
                     if (nextModel !== profile?.testedModel) setProfile(null)
                   }}
-                  emptyLabel="选择用于兼容性检查的模型"
-                  ariaLabel="兼容性检查模型"
+                  emptyLabel={t('doctor.model.select')}
+                  ariaLabel={t('doctor.model.aria')}
                 />
               </div>
             )}
             {selectedEndpoint && (
               <p className="mt-2 text-xs leading-5 text-ink-4">
-                {endpointLocation(selectedEndpoint)}。配置与历史保存在本机；运行远程模型时，任务内容会发送至该端点。
+                {t('doctor.endpoint.privacy', {
+                  location: endpointLocation(selectedEndpoint, t),
+                })}
               </p>
             )}
           </section>
@@ -491,8 +524,8 @@ export function OnboardingDoctor({
           <section className="border-t border-line pt-4">
             <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
               <div className="flex items-center gap-2">
-                <Badge variant="solid">2</Badge>
-                <p className="text-sm font-medium text-ink">分项检查兼容能力</p>
+                <Badge variant="solid">{formatNumber(2)}</Badge>
+                <p className="text-sm font-medium text-ink">{t('doctor.step.capabilities')}</p>
               </div>
               <Button
                 size="sm"
@@ -501,38 +534,52 @@ export function OnboardingDoctor({
                 onClick={() => void runDoctor()}
               >
                 {checking && <Spinner size="sm" />}
-                {profile ? '重新检查' : '开始检查'}
+                {profile ? t('doctor.recheck') : t('doctor.check.start')}
               </Button>
             </div>
             {profile ? (
               <div className="space-y-2">
                 <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
-                  {CAPABILITY_LABELS.map(({ key, label }) => {
+                  {CAPABILITY_LABELS.map(({ key, labelKey }) => {
                     const result = profile[key]
                     return (
                       <div
                         key={key}
                         className="rounded-sm border border-line bg-paper/55 px-2 py-2 text-center"
-                        title={result.error ?? undefined}
+                        title={
+                          result.error
+                            ? localizeDiagnosticError(
+                                t,
+                                result.error,
+                                t('doctor.capability.failed'),
+                              )
+                            : undefined
+                        }
                       >
-                        <p className="text-xs text-ink-3">{label}</p>
+                        <p className="text-xs text-ink-3">{t(labelKey)}</p>
                         <p
                           className={`mt-1 text-xs font-medium ${
                             result.supported ? 'text-pine' : 'text-cinnabar'
                           }`}
                         >
-                          {result.supported ? '可用' : '未通过'}
+                          {result.supported
+                            ? t('doctor.capability.available')
+                            : t('doctor.capability.failed')}
                         </p>
                       </div>
                     )
                   })}
                 </div>
                 <p className="text-xs leading-5 text-ink-4">
-                  测试模型：{profile.testedModel || '未能自动选择'}
+                  {t('doctor.result.model', {
+                    model: profile.testedModel || t('doctor.result.noAutoModel'),
+                  })}
                   {profile.firstByteMs != null
-                    ? ` · 首包约 ${profile.firstByteMs} ms`
+                    ? t('doctor.result.firstByte', {
+                        duration: formatDuration(profile.firstByteMs),
+                      })
                     : ''}
-                  {' · '}诊断 ID：{profile.diagnosticId}
+                  {t('doctor.result.diagnostic', { id: profile.diagnosticId })}
                 </p>
                 {modeWarning && (
                   <p className="rounded-sm border border-amber/35 bg-amber/5 px-3 py-2 text-xs leading-5 text-ink-2">
@@ -542,15 +589,15 @@ export function OnboardingDoctor({
               </div>
             ) : (
               <p className="text-xs leading-5 text-ink-4">
-                检查会使用很小的输出预算，分别验证各项能力；某一项失败不会抹掉其他结果。
+                {t('doctor.check.hint')}
               </p>
             )}
           </section>
 
           <section className="border-t border-line pt-4">
             <div className="mb-2 flex items-center gap-2">
-              <Badge variant="solid">3</Badge>
-              <p className="text-sm font-medium text-ink">创建你的第一份工作流</p>
+              <Badge variant="solid">{formatNumber(3)}</Badge>
+              <p className="text-sm font-medium text-ink">{t('doctor.step.workflow')}</p>
             </div>
             <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
               {(Object.keys(LEVEL_META) as WorkflowLevel[]).map((item) => {
@@ -571,20 +618,23 @@ export function OnboardingDoctor({
                     ].join(' ')}
                   >
                     <span className="block text-sm font-medium text-ink">
-                      {meta.label}
+                      {t(meta.labelKey)}
                     </span>
                     <span className="mt-1 block text-xs leading-5 text-ink-3">
-                      {meta.description}
+                      {t(meta.descriptionKey)}
                     </span>
                   </button>
                 )
               })}
             </div>
-            <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
-              <p className="text-xs leading-5 text-ink-4">
-                生成后属于你的普通预设；可以继续修改、复制、软删除和创建 revision。
+            <div className="mt-3 flex w-full min-w-0 max-w-full flex-wrap items-center gap-2 sm:justify-between">
+              <p className="w-full min-w-0 text-xs leading-5 text-ink-4 sm:w-auto sm:flex-1">
+                {t('doctor.workflow.hint')}
               </p>
-              <div className="flex gap-2">
+              <div
+                data-testid="first-run-workflow-actions"
+                className="flex w-full min-w-0 max-w-full flex-wrap gap-2 sm:w-auto sm:justify-end"
+              >
                 {!status?.state.completedAt && !status?.state.dismissedAt && (
                   <Button
                     size="sm"
@@ -592,7 +642,7 @@ export function OnboardingDoctor({
                     disabled={creating || checking}
                     onClick={() => void dismiss()}
                   >
-                    暂时跳过
+                    {t('doctor.dismiss')}
                   </Button>
                 )}
                 <Button
@@ -606,7 +656,7 @@ export function OnboardingDoctor({
                   onClick={() => void generateWorkflow()}
                 >
                   {creating && <Spinner size="sm" />}
-                  创建{LEVEL_META[level].label}工作流
+                  {t('doctor.workflow.create', { level: t(LEVEL_META[level].labelKey) })}
                 </Button>
               </div>
             </div>

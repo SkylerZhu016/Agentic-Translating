@@ -17,6 +17,10 @@ const draftSchema = z.object({
   selectedPresetRevisionId: z.string().min(1).nullable(),
   allowedAgentVariantIds: z.array(z.string().min(1)),
   reviewMode: z.enum(['main_editor', 'four_stage']),
+  mainEditorRunMode: z
+    .enum(['fixed_pipeline', 'tool_enabled'])
+    .optional()
+    .default('fixed_pipeline'),
   promptBundleRevisionId: z.string().min(1).nullable().optional(),
   constraints: translationConstraintsSchema.default({}),
 })

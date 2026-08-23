@@ -24,6 +24,11 @@ import {
   splitEndpointAddress,
 } from '@/src/lib/llm/endpoint-url'
 import { ModelPicker } from './ModelPicker'
+import {
+  localizeDiagnosticError,
+  useI18n,
+  type Translator,
+} from '@/src/i18n'
 
 const ENDPOINT_PRESETS = [
   { name: 'OpenAI', base_url: 'https://api.openai.com', path: '/v1/chat/completions' },
@@ -82,40 +87,42 @@ export interface EndpointReferenceDisplayGroup {
 /** Converts the API's numeric-only summary into the labels used by the modal. */
 export function endpointReferenceDisplayGroups(
   summary: EndpointReferenceSummary,
+  t?: Translator,
 ): EndpointReferenceDisplayGroup[] {
   const active: EndpointReferenceDisplayItem[] = [
-    { key: 'legacyAgents', label: '旧版翻译 Agent', count: summary.active.legacyAgents },
-    { key: 'vnextAgentOverrides', label: 'vNext Agent 单独覆盖', count: summary.active.vnextAgentOverrides },
-    { key: 'coordinatorBindings', label: '当前统筹与对话绑定', count: summary.active.coordinatorBindings },
-    { key: 'legacyPresetAgents', label: '旧版预设 Agent', count: summary.active.legacyPresetAgents },
+    { key: 'legacyAgents', label: t?.('endpoint.ref.legacyAgents') ?? '旧版翻译 Agent', count: summary.active.legacyAgents },
+    { key: 'vnextAgentOverrides', label: t?.('endpoint.ref.vnextAgentOverrides') ?? 'vNext Agent 单独覆盖', count: summary.active.vnextAgentOverrides },
+    { key: 'coordinatorBindings', label: t?.('endpoint.ref.coordinatorBindings') ?? '当前统筹与对话绑定', count: summary.active.coordinatorBindings },
+    { key: 'legacyPresetAgents', label: t?.('endpoint.ref.legacyPresetAgents') ?? '旧版预设 Agent', count: summary.active.legacyPresetAgents },
     {
       key: 'legacyPresetCoordinatorBindings',
-      label: '旧版预设统筹绑定',
+      label: t?.('endpoint.ref.legacyPresetCoordinator') ?? '旧版预设统筹绑定',
       count: summary.active.legacyPresetCoordinatorBindings,
     },
-    { key: 'modelProfileBindings', label: '默认模型分工', count: summary.active.modelProfileBindings },
-    { key: 'onboardingSelection', label: '首次运行向导选择', count: summary.active.onboardingSelection },
-    { key: 'capabilityProfiles', label: '兼容性检查缓存', count: summary.active.capabilityProfiles },
+    { key: 'modelProfileBindings', label: t?.('endpoint.ref.modelProfileBindings') ?? '默认模型分工', count: summary.active.modelProfileBindings },
+    { key: 'onboardingSelection', label: t?.('endpoint.ref.onboardingSelection') ?? '首次运行向导选择', count: summary.active.onboardingSelection },
+    { key: 'capabilityProfiles', label: t?.('endpoint.ref.capabilityProfiles') ?? '兼容性检查缓存', count: summary.active.capabilityProfiles },
   ].filter((item) => item.count > 0)
   const historical: EndpointReferenceDisplayItem[] = [
-    { key: 'sessions', label: '历史会话', count: summary.historical.sessions },
+    { key: 'sessions', label: t?.('endpoint.ref.sessions') ?? '历史会话', count: summary.historical.sessions },
     {
       key: 'workflowPresetRevisions',
-      label: '工作流预设 revision',
+      label: t?.('endpoint.ref.workflowRevisions') ?? '工作流预设 revision',
       count: summary.historical.workflowPresetRevisions,
     },
-    { key: 'batchJobs', label: '批量任务快照', count: summary.historical.batchJobs },
-    { key: 'agentInvocations', label: 'Agent 调用记录', count: summary.historical.agentInvocations },
-    { key: 'llmCalls', label: '模型调用账本', count: summary.historical.llmCalls },
+    { key: 'batchJobs', label: t?.('endpoint.ref.batchJobs') ?? '批量任务快照', count: summary.historical.batchJobs },
+    { key: 'agentInvocations', label: t?.('endpoint.ref.agentInvocations') ?? 'Agent 调用记录', count: summary.historical.agentInvocations },
+    { key: 'llmCalls', label: t?.('endpoint.ref.llmCalls') ?? '模型调用账本', count: summary.historical.llmCalls },
   ].filter((item) => item.count > 0)
 
   return [
-    { title: '当前配置引用', items: active },
-    { title: '历史记录引用', items: historical },
+    { title: t?.('endpoint.ref.active') ?? '当前配置引用', items: active },
+    { title: t?.('endpoint.ref.historical') ?? '历史记录引用', items: historical },
   ].filter((group) => group.items.length > 0)
 }
 
 export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelProps) {
+  const { t, formatDuration, formatNumber } = useI18n()
   // ── 表单（Modal）状态 ──
   const [formOpen, setFormOpen] = useState(false)
   const [editing, setEditing] = useState<Endpoint | null>(null)
@@ -173,15 +180,15 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
 
   async function save() {
     const next: FormErrors = {}
-    if (name.trim().length === 0) next.name = '请输入名称'
+    if (name.trim().length === 0) next.name = t('endpoint.error.name')
     const url = baseUrl.trim()
     if (url.length === 0) {
-      next.base_url = '请输入 Base URL'
+      next.base_url = t('endpoint.error.baseUrl')
     } else {
       try {
         new URL(url)
       } catch {
-        next.base_url = '请输入合法的 URL，如 http://localhost:11434/v1'
+        next.base_url = t('endpoint.error.invalidUrl')
       }
     }
     setErrors(next)
@@ -197,7 +204,7 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
           api_key: apiKey,
           context_window: contextWindow ? Number(contextWindow) : null,
         })
-        notify('端点已更新', { tone: 'inverted' })
+        notify(t('endpoint.updated'), { tone: 'inverted' })
       } else {
         await configApi.createEndpoint({
           name: name.trim(),
@@ -206,12 +213,16 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
           api_key: apiKey,
           context_window: contextWindow ? Number(contextWindow) : null,
         })
-        notify('端点已添加', { tone: 'inverted' })
+        notify(t('endpoint.added'), { tone: 'inverted' })
       }
       setFormOpen(false)
       await onChanged()
     } catch (e) {
-      notify('保存失败', { message: isApiError(e) ? e.message : '网络错误，请重试' })
+      notify(t('config.error.save'), {
+        message: isApiError(e)
+          ? localizeDiagnosticError(t, e.payload, t('config.error.tryLater'))
+          : t('config.error.networkRetry'),
+      })
     } finally {
       setSaving(false)
     }
@@ -234,14 +245,20 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
       }
       if (!response.ok) {
         throw new Error(
-          `${payload.error ?? '测试失败'}${
-            payload.diagnosticId ? `（诊断 ID：${payload.diagnosticId}）` : ''
+          `${localizeDiagnosticError(
+            t,
+            payload.error,
+            t('endpoint.test.failed'),
+          )}${
+            payload.diagnosticId ? t('modelPicker.diagnostic', { id: payload.diagnosticId }) : ''
           }`,
         )
       }
-      setTestStatus(`连接成功 · ${payload.latencyMs ?? 0} ms`)
+      setTestStatus(t('endpoint.test.success', {
+        latency: formatDuration(payload.latencyMs ?? 0),
+      }))
     } catch (error) {
-      setTestStatus(error instanceof Error ? error.message : '测试失败')
+      setTestStatus(error instanceof Error ? error.message : t('endpoint.test.failed'))
     } finally {
       setTesting(false)
     }
@@ -262,7 +279,7 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
     setDeleting(true)
     try {
       await configApi.deleteEndpoint(deleteTarget.id)
-      notify(`端点「${deleteTarget.name}」已删除`, { tone: 'inverted' })
+      notify(t('endpoint.deleted', { name: deleteTarget.name }), { tone: 'inverted' })
       closeDelete()
       await onChanged()
     } catch (e) {
@@ -285,7 +302,11 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
           })
         }
       } else {
-        notify('删除失败', { message: isApiError(e) ? e.message : '网络错误，请重试' })
+        notify(t('endpoint.delete.failed'), {
+          message: isApiError(e)
+            ? localizeDiagnosticError(t, e.payload, t('config.error.tryLater'))
+            : t('config.error.networkRetry'),
+        })
       }
     } finally {
       setDeleting(false)
@@ -297,26 +318,30 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
     setDeleting(true)
     try {
       await configApi.deleteEndpoint(deleteTarget.id, { force: true })
-      notify(`端点「${deleteTarget.name}」已删除`, { tone: 'inverted' })
+      notify(t('endpoint.deleted', { name: deleteTarget.name }), { tone: 'inverted' })
       closeDelete()
       await onChanged()
     } catch (e) {
-      notify('删除失败', { message: isApiError(e) ? e.message : '网络错误，请重试' })
+      notify(t('endpoint.delete.failed'), {
+        message: isApiError(e)
+          ? localizeDiagnosticError(t, e.payload, t('config.error.tryLater'))
+          : t('config.error.networkRetry'),
+      })
     } finally {
       setDeleting(false)
     }
   }
 
-  const referenceGroups = deleteRefs ? endpointReferenceDisplayGroups(deleteRefs) : []
+  const referenceGroups = deleteRefs ? endpointReferenceDisplayGroups(deleteRefs, t) : []
 
   return (
     <Card
-      overline="Endpoints"
-      title="端点"
+      overline={t('endpoint.overline')}
+      title={t('endpoint.title')}
       actions={
         endpoints.length > 0 ? (
           <Button variant="outline" size="sm" testId={TID.endpoint.addButton} onClick={openCreate}>
-            添加端点
+            {t('endpoint.add')}
           </Button>
         ) : undefined
       }
@@ -324,7 +349,7 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
       {endpoints.length === 0 ? (
         <div className="rounded-sm border border-dashed border-line-2 bg-paper/60 px-4 py-8 text-center">
           <p className="text-sm leading-6 text-ink-3">
-            尚未添加端点。端点是 OpenAI 兼容的模型服务地址（Base URL + API Key）。
+            {t('endpoint.empty')}
           </p>
           <Button
             variant="outline"
@@ -333,7 +358,7 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
             onClick={openCreate}
             className="mt-3"
           >
-            添加端点
+            {t('endpoint.add')}
           </Button>
         </div>
       ) : (
@@ -349,7 +374,7 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
                   <div className="flex items-center gap-2">
                     <p className="truncate text-sm font-medium text-ink">{ep.name}</p>
                     <Badge variant={ep.has_api_key ? 'outline' : 'subtle'}>
-                      {ep.has_api_key ? '已设置 Key' : '未设置 Key'}
+                      {ep.has_api_key ? t('endpoint.key.set') : t('endpoint.key.unset')}
                     </Badge>
                   </div>
                   <p className="mt-0.5 break-all font-mono text-xs leading-5 text-ink-3">
@@ -358,10 +383,10 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
                   </p>
                 </div>
                 <Button variant="ghost" size="sm" onClick={() => openEdit(ep)}>
-                  编辑
+                  {t('endpoint.edit')}
                 </Button>
                 <Button variant="ghost" size="sm" onClick={() => requestDelete(ep)}>
-                  删除
+                  {t('config.action.delete')}
                 </Button>
               </li>
             )
@@ -373,11 +398,11 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
       <Modal
         open={formOpen}
         onClose={() => setFormOpen(false)}
-        title={editing ? '编辑端点' : '添加端点'}
+        title={editing ? t('endpoint.form.edit') : t('endpoint.add')}
         footer={
           <>
             <Button variant="ghost" size="sm" onClick={() => setFormOpen(false)}>
-              取消
+              {t('config.action.cancel')}
             </Button>
             <Button
               size="sm"
@@ -386,7 +411,7 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
               disabled={saving}
             >
               {saving && <Spinner size="sm" />}
-              保存
+              {t('config.action.save')}
             </Button>
           </>
         }
@@ -401,7 +426,7 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
         >
           {editing == null && (
             <div>
-              <span className="mb-1.5 block text-xs font-medium text-ink-2">预设</span>
+              <span className="mb-1.5 block text-xs font-medium text-ink-2">{t('endpoint.preset')}</span>
               <div className="flex flex-wrap gap-1.5">
                 {ENDPOINT_PRESETS.map((p) => (
                   <Button
@@ -415,17 +440,17 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
                 ))}
               </div>
               <p className="mt-1 text-xs leading-5 text-ink-4">
-                点击自动填入 Base URL 占位，可按需修改。
+                {t('endpoint.preset.hint')}
               </p>
             </div>
           )}
 
-          <Field label="名称" error={errors.name}>
+          <Field label={t('endpoint.name')} error={errors.name}>
             <Input
               testId={TID.endpoint.nameInput}
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder="如 OpenAI 主账号"
+              placeholder={t('endpoint.name.placeholder')}
             />
           </Field>
 
@@ -453,14 +478,14 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
           </Field>
 
           <Field
-            label="请求路径"
+            label={t('endpoint.requestPath')}
             hint={
               baseUrl
-                ? `最终请求地址：${resolveChatCompletionsUrl({
+                ? t('endpoint.requestUrl', { url: resolveChatCompletionsUrl({
                     baseUrl,
                     chatCompletionsPath: chatPath,
-                  })}`
-                : '默认 /v1/chat/completions；也可直接粘贴完整 Chat Completions URL。'
+                  }) })
+                : t('endpoint.requestPath.hint')
             }
           >
             <Input
@@ -472,17 +497,17 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
           </Field>
           {editing && (
             <div className="rounded-sm border border-line bg-paper/55 px-3 py-3">
-              <p className="text-xs font-medium text-ink-2">模型列表与连接测试</p>
+              <p className="text-xs font-medium text-ink-2">{t('endpoint.models.title')}</p>
               <p className="mb-2 mt-1 text-xs leading-5 text-ink-4">
-                通过服务端读取此端点的 /models；API Key 不会进入浏览器。
+                {t('endpoint.models.description')}
               </p>
               <div className="space-y-2">
                 <ModelPicker
                   endpointId={editing.id}
                   value={testModel}
                   onChange={setTestModel}
-                  emptyLabel="选择用于测试的模型"
-                  ariaLabel="端点测试模型"
+                  emptyLabel={t('endpoint.test.model')}
+                  ariaLabel={t('endpoint.test.modelAria')}
                 />
                 <Button
                   size="sm"
@@ -490,25 +515,25 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
                   disabled={testing || !testModel.trim()}
                   onClick={() => void testEndpoint()}
                 >
-                  {testing && <Spinner size="sm" />}测试
+                  {testing && <Spinner size="sm" />}{t('endpoint.test.action')}
                 </Button>
               </div>
               {testStatus && (
-                <p className="mt-2 text-xs leading-5 text-ink-3">{testStatus}</p>
+                <p aria-live="polite" className="mt-2 text-xs leading-5 text-ink-3">{testStatus}</p>
               )}
             </div>
           )}
 
           <Field
-            label="上下文上限"
-            hint="可选。填写模型上下文窗口 token 数；超限时会明确报错，不静默裁剪。"
+            label={t('endpoint.contextWindow')}
+            hint={t('endpoint.contextWindow.hint')}
           >
             <Input
               type="number"
               min={1}
               value={contextWindow}
               onChange={(event) => setContextWindow(event.target.value)}
-              placeholder="例如 128000"
+              placeholder={t('endpoint.contextWindow.placeholder')}
             />
           </Field>
 
@@ -516,8 +541,8 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
             label="API Key"
             hint={
               editing?.has_api_key
-                ? '已安全保存。留空表示保留现有 Key；输入新值才会替换。'
-                : '本地加密保存且不会返回浏览器。可留空（如本机 Ollama）。'
+                ? t('endpoint.key.savedHint')
+                : t('endpoint.key.localHint')
             }
           >
             <div className="relative">
@@ -532,11 +557,11 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
               />
               <button
                 type="button"
-                aria-label={showKey ? '隐藏 API Key' : '显示 API Key'}
+                aria-label={showKey ? t('endpoint.key.hideAria') : t('endpoint.key.showAria')}
                 onClick={() => setShowKey((v) => !v)}
                 className="absolute right-1 top-1/2 h-7 -translate-y-1/2 rounded-sm px-2 text-xs text-ink-3 transition-colors hover:bg-paper-sink hover:text-ink"
               >
-                {showKey ? '隐藏' : '显示'}
+                {showKey ? t('endpoint.key.hide') : t('endpoint.key.show')}
               </button>
             </div>
           </Field>
@@ -549,22 +574,22 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
       <Modal
         open={deleteTarget != null}
         onClose={closeDelete}
-        title={deleteRefs == null ? '删除端点' : '确认解绑并删除'}
+        title={deleteRefs == null ? t('endpoint.delete.title') : t('endpoint.delete.forceTitle')}
         footer={
           deleteRefs == null ? (
             <>
               <Button variant="ghost" size="sm" onClick={closeDelete}>
-                取消
+                {t('config.action.cancel')}
               </Button>
               <Button size="sm" onClick={() => void confirmDelete()} disabled={deleting}>
                 {deleting && <Spinner size="sm" />}
-                检查引用并删除
+                {t('endpoint.delete.inspect')}
               </Button>
             </>
           ) : (
             <>
               <Button variant="ghost" size="sm" onClick={closeDelete}>
-                取消
+                {t('config.action.cancel')}
               </Button>
               <Button
                 size="sm"
@@ -572,7 +597,7 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
                 disabled={deleting}
               >
                 {deleting && <Spinner size="sm" />}
-                解绑所有引用并删除
+                {t('endpoint.delete.force')}
               </Button>
             </>
           )
@@ -580,18 +605,15 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
       >
         {deleteTarget != null && deleteRefs == null && (
           <div className="text-sm leading-6 text-ink-2">
-            <p>
-              确定删除端点「{deleteTarget.name}」吗？系统会先检查全部引用；没有引用时直接删除，
-              有引用时会展示影响范围并再次确认。
-            </p>
+            <p>{t('endpoint.delete.description', { name: deleteTarget.name })}</p>
           </div>
         )}
         {deleteTarget != null && deleteRefs != null && (
           <div className="space-y-4 text-sm leading-6 text-ink-2">
-            <p>
-              检测到 {deleteRefs.totalActive} 处当前配置引用和 {deleteRefs.totalHistorical}{' '}
-              处历史记录引用。确认后，系统会在同一事务中解除当前绑定并删除端点。
-            </p>
+            <p>{t('endpoint.delete.impact', {
+              active: formatNumber(deleteRefs.totalActive),
+              historical: formatNumber(deleteRefs.totalHistorical),
+            })}</p>
             <div className="space-y-3 rounded-sm border border-line bg-paper/55 px-3 py-3">
               {referenceGroups.map((group) => (
                 <div key={group.title}>
@@ -600,7 +622,7 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
                     {group.items.map((item) => (
                       <li key={item.key} className="flex items-center justify-between gap-4">
                         <span>{item.label}</span>
-                        <Badge variant="subtle">{item.count}</Badge>
+                        <Badge variant="subtle">{formatNumber(item.count)}</Badge>
                       </li>
                     ))}
                   </ul>
@@ -608,11 +630,10 @@ export function EndpointPanel({ endpoints, notify, onChanged }: EndpointPanelPro
               ))}
             </div>
             <p className="text-xs leading-5 text-ink-3">
-              Agent、提示词、模型名称、预设内容和冻结历史都会保留；当前配置中的端点引用会置空，
-              之后可重新绑定。兼容性检查缓存会随端点移除，历史会话、调用记录和模型调用账本不会被改写。
+              {t('endpoint.delete.preserve')}
             </p>
             <p className="text-xs leading-5 text-ink-4">
-              端点地址与本地保存的凭据将被删除。此操作不可撤销。
+              {t('endpoint.delete.irreversible')}
             </p>
           </div>
         )}

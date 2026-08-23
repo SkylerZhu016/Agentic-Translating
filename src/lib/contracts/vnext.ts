@@ -8,6 +8,7 @@ export type AgentCategory =
   | 'adversarial'
 
 export type ReviewMode = 'main_editor' | 'four_stage'
+export type MainEditorRunMode = 'fixed_pipeline' | 'tool_enabled'
 export type TeamPolicy = 'fixed' | 'dynamic'
 export type CandidateAnnotationMode = 'body_only' | 'body_and_annotation'
 export type PoetryMode = 'auto' | 'on' | 'off'
@@ -28,6 +29,76 @@ export interface ModelBinding {
   endpointId: number | null
   model: string
   contextWindow?: number | null
+  /** Optional provider/model output ceiling used by the paid-call preflight. */
+  maxOutputTokens?: number | null
+}
+
+export type SessionPreflightBranch = 'fixed' | 'dynamic'
+export type SessionPreflightStatus = 'pass' | 'blocked'
+
+export interface SessionPreflightAssumption {
+  code:
+    | 'context_window_defaulted'
+    | 'max_output_tokens_defaulted'
+    | 'dynamic_team_all_variants_checked'
+    | 'candidate_output_reserved'
+    | 'legacy_v2_chat_compatibility'
+    | 'bounded_tool_loop_reserved'
+    | 'tool_transcript_growth_reserved'
+    | 'child_review_calls_reserved'
+  bindingRole: string | null
+  endpointId: number | null
+  value: number | string
+}
+
+export interface SessionPreflightFailure {
+  code: 'preflight_context_exceeded' | 'preflight_binding_missing'
+  stage: string
+  bindingRole: string
+  endpointId: number | null
+  model: string
+  params: Record<string, number | string | null>
+  actions: string[]
+}
+
+export interface SessionPreflightStageEstimate {
+  stage: string
+  bindingRole: string
+  endpointId: number | null
+  model: string
+  callsWorstCase: number
+  /** Input estimate for each physical call when a bounded loop grows its transcript. */
+  estimatedInputTokensByCall?: number[]
+  /** Reserved transcript growth added before each subsequent physical call. */
+  transcriptGrowthTokensPerRound?: number
+  estimatedInputTokens: number
+  reservedOutputTokens: number
+  safetyMarginTokens: number
+  contextWindowTokens: number
+  totalReservedTokens: number
+  fits: boolean
+}
+
+export interface SessionPreflightSnapshot {
+  version: 1
+  estimator: 'cjk_1_other_chars_div_4_v1'
+  defaultsVersion: 'session_preflight_defaults_v2'
+  status: SessionPreflightStatus
+  branch: SessionPreflightBranch
+  reviewMode: ReviewMode
+  mainEditorRunMode?: MainEditorRunMode
+  sourceTokens: number
+  taskBriefTokens: number
+  projectContextTokens: number
+  candidateCountWorstCase: number
+  stages: SessionPreflightStageEstimate[]
+  assumptions: SessionPreflightAssumption[]
+  failures: SessionPreflightFailure[]
+  estimatedTotalCallTokens: number
+  compatibility?: {
+    kind: 'legacy_v2_chat'
+    version: 1
+  }
 }
 
 export interface AgentArchetype {
@@ -94,6 +165,7 @@ export interface WorkflowPresetContract {
   taskBriefTemplate: string
   teamPolicy: TeamPolicy
   reviewMode: ReviewMode
+  mainEditorRunMode?: MainEditorRunMode
   candidateAnnotationMode?: CandidateAnnotationMode
   agentVariantIds: string[]
   agentVariantSnapshots: AgentDirectionVariant[]
@@ -139,6 +211,7 @@ export interface WorkspaceDraft {
   selectedPresetRevisionId: string | null
   allowedAgentVariantIds: string[]
   reviewMode: ReviewMode
+  mainEditorRunMode?: MainEditorRunMode
   promptBundleRevisionId?: string | null
   constraints: TranslationConstraints
   updatedAt: string
@@ -159,16 +232,12 @@ export interface SafeEndpointSnapshot {
   contextWindow: number | null
 }
 
-export interface PrivateEndpointSnapshot extends SafeEndpointSnapshot {
-  apiKey: string
-}
-
 export interface ConfigSnapshotVNext {
   version: 3
   direction: TranslationDirection
   promptBundleSnapshot: DirectionPromptBundle
   agentVariantSnapshots: AgentDirectionVariant[]
-  endpointSnapshots: PrivateEndpointSnapshot[]
+  endpointSnapshots: SafeEndpointSnapshot[]
   modelBindings: {
     defaultWorker: ModelBinding
     mainAgent: ModelBinding
@@ -187,9 +256,11 @@ export interface ConfigSnapshotVNext {
   orchestrationPolicy: {
     teamPolicy: TeamPolicy
     reviewMode: ReviewMode
+    mainEditorRunMode?: MainEditorRunMode
     maxAgentCalls: number
     candidateAnnotationMode?: CandidateAnnotationMode
   }
+  preflight?: SessionPreflightSnapshot
 }
 
 export interface PublicConfigSnapshotVNext

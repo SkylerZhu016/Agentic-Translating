@@ -2,6 +2,11 @@
 
 import { useEffect, useMemo, useState } from 'react'
 import { Button, Input, Spinner } from '@/src/components/ui'
+import {
+  localizeDiagnosticError,
+  useI18n,
+  type Translator,
+} from '@/src/i18n'
 
 export interface ModelOption {
   id: string
@@ -17,7 +22,7 @@ interface ModelsPayload {
 const modelCache = new Map<number, ModelOption[]>()
 const pendingRequests = new Map<number, Promise<ModelOption[]>>()
 
-async function fetchModels(endpointId: number, force = false) {
+async function fetchModels(endpointId: number, t: Translator, force = false) {
   if (!force) {
     const cached = modelCache.get(endpointId)
     if (cached) return cached
@@ -31,8 +36,12 @@ async function fetchModels(endpointId: number, force = false) {
     const payload = await response.json().catch(() => null) as ModelsPayload | null
     if (!response.ok) {
       throw new Error(
-        `${payload?.error ?? '读取模型列表失败'}${
-          payload?.diagnosticId ? `（诊断 ID：${payload.diagnosticId}）` : ''
+        `${localizeDiagnosticError(
+          t,
+          payload?.error,
+          t('modelPicker.error.load'),
+        )}${
+          payload?.diagnosticId ? t('modelPicker.diagnostic', { id: payload.diagnosticId }) : ''
         }`,
       )
     }
@@ -51,8 +60,8 @@ export function ModelPicker({
   endpointId,
   value,
   onChange,
-  emptyLabel = '选择模型',
-  ariaLabel = '模型',
+  emptyLabel,
+  ariaLabel,
   allowEmpty = true,
   disabled = false,
 }: {
@@ -64,6 +73,9 @@ export function ModelPicker({
   allowEmpty?: boolean
   disabled?: boolean
 }) {
+  const { t } = useI18n()
+  const resolvedEmptyLabel = emptyLabel ?? t('modelPicker.empty')
+  const resolvedAriaLabel = ariaLabel ?? t('modelPicker.aria')
   const [models, setModels] = useState<ModelOption[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -74,11 +86,11 @@ export function ModelPicker({
     setLoading(true)
     setError('')
     try {
-      setModels(await fetchModels(endpointId, force))
+      setModels(await fetchModels(endpointId, t, force))
     } catch (loadError) {
       setModels([])
       setError(
-        loadError instanceof Error ? loadError.message : '读取模型列表失败',
+        loadError instanceof Error ? loadError.message : t('modelPicker.error.load'),
       )
     } finally {
       setLoading(false)
@@ -107,8 +119,8 @@ export function ModelPicker({
           <Input
             value={value}
             onChange={(event) => onChange(event.target.value)}
-            placeholder="手动输入模型 ID"
-            aria-label={ariaLabel}
+            placeholder={t('modelPicker.manual.placeholder')}
+            aria-label={resolvedAriaLabel}
             disabled={disabled}
           />
           <Button
@@ -117,11 +129,11 @@ export function ModelPicker({
             variant="ghost"
             onClick={() => setManual(false)}
           >
-            返回列表
+            {t('modelPicker.back')}
           </Button>
         </div>
         <p className="min-h-4 text-[11px] leading-4 text-ink-4">
-          仅在提供商未实现 /models 或模型未公开列出时使用。
+          {t('modelPicker.manual.hint')}
         </p>
       </div>
     )
@@ -134,13 +146,13 @@ export function ModelPicker({
           <select
             value={value}
             onChange={(event) => onChange(event.target.value)}
-            aria-label={ariaLabel}
+            aria-label={resolvedAriaLabel}
             disabled={disabled || !endpointId || loading}
             className="h-9 w-full rounded-sm border border-line-2 bg-paper-raise px-2 pr-8 text-sm text-ink disabled:cursor-not-allowed disabled:opacity-60"
           >
-            {allowEmpty && <option value="">{emptyLabel}</option>}
+            {allowEmpty && <option value="">{resolvedEmptyLabel}</option>}
             {hasCurrentValue && (
-              <option value={value}>{value}（当前配置，列表中未返回）</option>
+              <option value={value}>{t('modelPicker.currentMissing', { model: value })}</option>
             )}
             {models.map((model) => (
               <option key={model.id} value={model.id}>
@@ -160,9 +172,9 @@ export function ModelPicker({
           variant="ghost"
           disabled={!endpointId || loading}
           onClick={() => void load(true)}
-          title="重新读取模型列表"
+          title={t('modelPicker.refresh.title')}
         >
-          刷新
+          {t('modelPicker.refresh')}
         </Button>
         <Button
           type="button"
@@ -170,19 +182,19 @@ export function ModelPicker({
           variant="ghost"
           onClick={() => setManual(true)}
         >
-          手动
+          {t('modelPicker.manual')}
         </Button>
       </div>
       <div className="min-h-4 text-[11px] leading-4">
-        {!endpointId && <p className="text-ink-4">请先选择端点。</p>}
+        {!endpointId && <p className="text-ink-4">{t('modelPicker.selectEndpoint')}</p>}
         {endpointId && !loading && !error && models.length === 0 && (
           <p className="text-ink-4">
-            端点没有返回可用模型，可以刷新或手动输入。
+            {t('modelPicker.none')}
           </p>
         )}
         {error && (
-          <p className="text-cinnabar">
-            {error}；仍可手动输入模型 ID。
+          <p role="alert" className="text-cinnabar">
+            {t('modelPicker.manualFallback', { error })}
           </p>
         )}
       </div>

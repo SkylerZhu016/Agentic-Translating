@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { migrate } from '../../src/lib/db/migrate'
 import {
   createProjectRepositories,
@@ -12,12 +12,35 @@ import {
   waitForVNextRunsToSettle,
 } from '../../src/lib/orchestration/vnext-runner'
 
+vi.mock('../../src/lib/llm/client', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/lib/llm/client')>()
+  return {
+    ...actual,
+    chatCompletion: vi.fn().mockResolvedValue({ content: 'Fixture output' }),
+  }
+})
+
 function frozenConfigSnapshot() {
   const binding = {
-    endpointId: null,
-    model: '',
-    contextWindow: null,
+    endpointId: 1,
+    model: 'fixture-model',
+    contextWindow: 128_000,
+    maxOutputTokens: 4_096,
   }
+  const variants = ['fixture-agent-a', 'fixture-agent-b'].map((id, index) => ({
+    id,
+    archetypeId: id,
+    direction: 'en_to_zh' as const,
+    catalogName: id,
+    catalogDescription: 'Runner context fixture',
+    rolePrompt: 'Translate faithfully.',
+    promptLanguage: 'en' as const,
+    promptVersion: 1,
+    enabled: true,
+    endpointOverrideId: null,
+    modelOverride: null,
+    sortOrder: index,
+  }))
   return {
     version: 3,
     direction: 'en_to_zh',
@@ -34,11 +57,23 @@ function frozenConfigSnapshot() {
       toolDescriptions: {},
       version: 1,
     },
-    agentVariantSnapshots: [],
-    endpointSnapshots: [],
+    agentVariantSnapshots: variants,
+    endpointSnapshots: [{
+      id: 1,
+      name: 'fixture',
+      baseUrl: 'https://fixture.invalid',
+      chatCompletionsPath: '/v1/chat/completions',
+      apiKey: 'fixture-secret',
+      hasApiKey: true,
+      contextWindow: 128_000,
+    }],
     modelBindings: {
       defaultWorker: binding,
       mainAgent: binding,
+      reviewAgent: binding,
+      filterAgent: binding,
+      orchestrateAgent: binding,
+      assembleAgent: binding,
       editingAgent: binding,
     },
     presetRevisionSnapshot: {
@@ -46,7 +81,7 @@ function frozenConfigSnapshot() {
       presetId: 'preset',
       revisionNo: 1,
       contract: {
-        agentVariantIds: ['missing-agent-a', 'missing-agent-b'],
+        agentVariantIds: variants.map((variant) => variant.id),
       },
       createdAt: '2026-08-11T00:00:00.000Z',
     },
@@ -118,6 +153,10 @@ describe('vNext runner frozen project context', () => {
     db = new Database(':memory:')
     db.pragma('foreign_keys = ON')
     migrate(db)
+    db.prepare(`
+      INSERT INTO endpoints (id, name, base_url, api_key)
+      VALUES (1, 'current-fixture', 'https://current.invalid', 'fixture-current-key')
+    `).run()
   })
 
   afterEach(async () => {
@@ -142,6 +181,11 @@ describe('vNext runner frozen project context', () => {
       createdAt: expect.any(String),
     })
     expect(restartedContext?.id).not.toBe(sourceContext.id)
+    const restartedSnapshot = db.prepare(
+      'SELECT config_snapshot FROM sessions WHERE id=?',
+    ).get(restarted.sessionId) as { config_snapshot: string }
+    expect(restartedSnapshot.config_snapshot).not.toContain('fixture-secret')
+    expect(restartedSnapshot.config_snapshot).not.toContain('apiKey')
     expect(
       db.prepare(`
         SELECT session_id FROM orchestration_runs WHERE id = ?

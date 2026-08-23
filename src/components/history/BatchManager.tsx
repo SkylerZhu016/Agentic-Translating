@@ -3,6 +3,11 @@
 import { useEffect, useRef, useState } from 'react'
 import { Badge, Button, Modal, Spinner } from '@/src/components/ui'
 import { useDirection } from '@/src/components/direction/DirectionProvider'
+import {
+  localizeDiagnosticError,
+  useI18n,
+  type MessageKey,
+} from '@/src/i18n'
 import type { WorkflowPreset, WorkflowPresetRevision } from '@/src/lib/contracts/vnext'
 
 interface BatchJobView {
@@ -24,8 +29,18 @@ interface PreparedFile {
   hadBom: boolean
 }
 
+const BATCH_STATUS_KEYS = {
+  queued: 'batch.status.queued',
+  running: 'batch.status.running',
+  paused: 'batch.status.paused',
+  failed: 'batch.status.failed',
+  completed: 'batch.status.completed',
+  cancelled: 'batch.status.cancelled',
+} as const satisfies Record<string, MessageKey>
+
 export function BatchManager() {
   const { direction } = useDirection()
+  const { t, formatNumber } = useI18n()
   const [jobs, setJobs] = useState<BatchJobView[]>([])
   const [presets, setPresets] = useState<WorkflowPreset[]>([])
   const [open, setOpen] = useState(false)
@@ -80,7 +95,7 @@ export function BatchManager() {
     if (!list) return
     setError(null)
     if (list.length > 500) {
-      setError('最多选择 500 个文件')
+      setError(t('batch.error.maxFiles', { count: formatNumber(500) }))
       return
     }
     const prepared: PreparedFile[] = []
@@ -91,7 +106,7 @@ export function BatchManager() {
           file.name
         if (!/\.(txt|md)$/i.test(relativePath)) continue
         if (file.size > 5 * 1024 * 1024) {
-          throw new Error(`文件超过 5 MiB：${relativePath}`)
+          throw new Error(t('batch.error.fileSize', { size: '5 MiB', path: relativePath }))
         }
         const bytes = new Uint8Array(await file.arrayBuffer())
         const hadBom =
@@ -103,7 +118,7 @@ export function BatchManager() {
         try {
           sourceText = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
         } catch {
-          throw new Error(`不是有效 UTF-8：${relativePath}`)
+          throw new Error(t('batch.error.invalidUtf8', { path: relativePath }))
         }
         prepared.push({
           relativePath: relativePath.replace(/\\/g, '/'),
@@ -112,10 +127,10 @@ export function BatchManager() {
           hadBom,
         })
       }
-      if (prepared.length === 0) throw new Error('未找到 TXT 或 Markdown 文件')
+      if (prepared.length === 0) throw new Error(t('batch.error.noFiles'))
       setFiles(prepared)
     } catch (prepareError) {
-      setError(prepareError instanceof Error ? prepareError.message : '文件读取失败')
+      setError(prepareError instanceof Error ? prepareError.message : t('batch.error.read'))
     }
   }
 
@@ -133,7 +148,7 @@ export function BatchManager() {
       return
     }
     if (result.files.length === 0) {
-      setError('未找到 TXT 或 Markdown 文件')
+      setError(t('batch.error.noFiles'))
       return
     }
     setFiles(result.files)
@@ -141,7 +156,7 @@ export function BatchManager() {
 
   async function create() {
     if (!name.trim() || !revisionId || files.length === 0) {
-      setError('请填写名称、选择预设并添加文件')
+      setError(t('batch.error.required'))
       return
     }
     setBusy(true)
@@ -161,7 +176,11 @@ export function BatchManager() {
         const payload = await response.json().catch(() => null) as {
           error?: string
         } | null
-        throw new Error(payload?.error ?? '创建失败')
+        throw new Error(localizeDiagnosticError(
+          t,
+          payload?.error,
+          t('batch.error.create'),
+        ))
       }
       setOpen(false)
       setName('')
@@ -170,7 +189,7 @@ export function BatchManager() {
       setFiles([])
       await load()
     } catch (createError) {
-      setError(createError instanceof Error ? createError.message : '创建失败')
+      setError(createError instanceof Error ? createError.message : t('batch.error.create'))
     } finally {
       setBusy(false)
     }
@@ -190,11 +209,11 @@ export function BatchManager() {
     try {
       const result = await bridge.exportBatch(id, true)
       if (result.outputDirectory) {
-        setExportMessage(`已导出至：${result.outputDirectory}`)
+        setExportMessage(t('batch.exported', { path: result.outputDirectory }))
       }
     } catch (exportError) {
       setExportMessage(
-        exportError instanceof Error ? exportError.message : '导出失败',
+        exportError instanceof Error ? exportError.message : t('batch.error.export'),
       )
     }
   }
@@ -203,7 +222,7 @@ export function BatchManager() {
     <div>
       <div className="mb-3 flex justify-end">
         <Button size="sm" variant="outline" onClick={() => setOpen(true)}>
-          新建批量任务
+          {t('batch.new')}
         </Button>
       </div>
       {exportMessage && (
@@ -213,7 +232,7 @@ export function BatchManager() {
       )}
       {jobs.length === 0 ? (
         <div className="rounded-sm border border-dashed border-line-2 p-8 text-center text-sm text-ink-4">
-          暂无批量任务。批量任务必须绑定一个冻结的用户预设 revision。
+          {t('batch.empty')}
         </div>
       ) : (
         <ol className="divide-y divide-line">
@@ -223,24 +242,33 @@ export function BatchManager() {
                 <div>
                   <div className="flex items-center gap-2">
                     <p className="text-sm font-medium text-ink">{job.name}</p>
-                    <Badge variant="subtle">{job.status}</Badge>
+                    <Badge variant="subtle">
+                      {job.status in BATCH_STATUS_KEYS
+                        ? t(BATCH_STATUS_KEYS[job.status as keyof typeof BATCH_STATUS_KEYS])
+                        : job.status}
+                    </Badge>
                   </div>
                   <p className="mt-1 text-xs text-ink-3">
-                    {job.completed_count}/{job.total_count} 完成 · {job.failed_count} 失败 · 并发 {job.concurrency}
+                    {t('batch.progress', {
+                      complete: formatNumber(job.completed_count),
+                      total: formatNumber(job.total_count),
+                      failed: formatNumber(job.failed_count),
+                      concurrency: formatNumber(job.concurrency),
+                    })}
                   </p>
                 </div>
                 <div className="flex flex-wrap gap-1">
                   {job.status === 'running' && (
-                    <Button variant="ghost" size="sm" onClick={() => void action(job.id, 'pause')}>暂停</Button>
+                    <Button variant="ghost" size="sm" onClick={() => void action(job.id, 'pause')}>{t('batch.action.pause')}</Button>
                   )}
                   {['paused', 'failed'].includes(job.status) && (
-                    <Button variant="ghost" size="sm" onClick={() => void action(job.id, 'resume')}>继续</Button>
+                    <Button variant="ghost" size="sm" onClick={() => void action(job.id, 'resume')}>{t('batch.action.resume')}</Button>
                   )}
                   {job.failed_count > 0 && (
-                    <Button variant="ghost" size="sm" onClick={() => void action(job.id, 'retry-failed')}>重试失败项</Button>
+                    <Button variant="ghost" size="sm" onClick={() => void action(job.id, 'retry-failed')}>{t('batch.action.retryFailed')}</Button>
                   )}
                   {!['completed', 'cancelled'].includes(job.status) && (
-                    <Button variant="ghost" size="sm" onClick={() => void action(job.id, 'cancel')}>取消</Button>
+                    <Button variant="ghost" size="sm" onClick={() => void action(job.id, 'cancel')}>{t('batch.action.cancel')}</Button>
                   )}
                   {desktop ? (
                     <Button
@@ -248,7 +276,7 @@ export function BatchManager() {
                       size="sm"
                       onClick={() => void exportBatch(job.id)}
                     >
-                      导出到文件夹
+                      {t('batch.action.exportFolder')}
                     </Button>
                   ) : (
                     <Button
@@ -256,7 +284,7 @@ export function BatchManager() {
                       variant="outline"
                       size="sm"
                     >
-                      导出 ZIP
+                      {t('batch.action.exportZip')}
                     </Button>
                   )}
                 </div>
@@ -269,12 +297,12 @@ export function BatchManager() {
       <Modal
         open={open}
         onClose={() => setOpen(false)}
-        title="新建批量任务"
+        title={t('batch.new')}
         footer={
           <>
-            <Button variant="ghost" size="sm" onClick={() => setOpen(false)}>取消</Button>
+            <Button variant="ghost" size="sm" onClick={() => setOpen(false)}>{t('common.cancel')}</Button>
             <Button size="sm" disabled={busy} onClick={() => void create()}>
-              {busy && <Spinner size="sm" />}创建并运行
+              {busy && <Spinner size="sm" />}{t('batch.create')}
             </Button>
           </>
         }
@@ -283,7 +311,8 @@ export function BatchManager() {
           <input
             value={name}
             onChange={(event) => setName(event.target.value)}
-            placeholder="批量任务名称"
+            placeholder={t('batch.name.placeholder')}
+            aria-label={t('batch.name.placeholder')}
             className="h-9 w-full rounded-sm border border-line-2 bg-paper-raise px-3 text-sm"
           />
           <select
@@ -291,15 +320,18 @@ export function BatchManager() {
             onChange={(event) => void selectPreset(event.target.value)}
             className="h-9 w-full rounded-sm border border-line-2 bg-paper-raise px-2 text-sm"
           >
-            <option value="">选择当前方向预设</option>
+            <option value="">{t('batch.preset.select')}</option>
             {presets.map((preset) => (
               <option key={preset.id} value={preset.id}>
-                {preset.name} · revision {preset.currentRevisionNo}
+                {t('batch.preset.revision', {
+                  name: preset.name,
+                  revision: formatNumber(preset.currentRevisionNo),
+                })}
               </option>
             ))}
           </select>
           <label className="block text-xs text-ink-3">
-            文件级并发：{concurrency}
+            {t('batch.concurrency', { count: formatNumber(concurrency) })}
             <input
               type="range"
               min={1}
@@ -317,20 +349,20 @@ export function BatchManager() {
                   variant="outline"
                   onClick={() => void prepareNativeFiles('files')}
                 >
-                  选择文件
+                  {t('batch.selectFiles')}
                 </Button>
                 <Button
                   size="sm"
                   variant="outline"
                   onClick={() => void prepareNativeFiles('folder')}
                 >
-                  选择文件夹
+                  {t('batch.selectFolder')}
                 </Button>
               </>
             ) : (
               <>
                 <label className="inline-flex h-8 cursor-pointer items-center rounded-sm border border-line-2 bg-paper-raise px-3 text-sm text-ink">
-                  选择文件
+                  {t('batch.selectFiles')}
                   <input
                     type="file"
                     multiple
@@ -340,7 +372,7 @@ export function BatchManager() {
                   />
                 </label>
                 <label className="inline-flex h-8 cursor-pointer items-center rounded-sm border border-line-2 bg-paper-raise px-3 text-sm text-ink">
-                  选择文件夹
+                  {t('batch.selectFolder')}
                   <input
                     ref={folderInput}
                     type="file"
@@ -352,10 +384,10 @@ export function BatchManager() {
               </>
             )}
             <span className="self-center text-xs text-ink-4">
-              已选择 {files.length} 个文件
+              {t('batch.selectedFiles', { count: formatNumber(files.length) })}
             </span>
           </div>
-          {error && <p className="text-sm text-cinnabar">{error}</p>}
+          {error && <p role="alert" className="text-sm text-cinnabar">{error}</p>}
         </div>
       </Modal>
     </div>

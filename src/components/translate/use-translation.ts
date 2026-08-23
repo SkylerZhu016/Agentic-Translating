@@ -18,12 +18,17 @@ import type { ConfigSnapshot, SessionRow } from '@/src/lib/contracts/types'
 import { emitSessionChanged } from '@/src/components/coordinator/session-bus'
 import type {
   BuiltinDirection,
+  MainEditorRunMode,
   ReviewMode,
   TranslationConstraints,
 } from '@/src/lib/contracts/vnext'
 import type { TranslationEvidenceReport } from '@/src/lib/evidence/checker'
 import { parseSemanticAgentOutput } from '@/src/lib/protocol/semantic-output'
 import type { SessionProjectContext } from '@/src/lib/contracts/projects'
+import type { SessionPreflightSnapshot } from '@/src/lib/contracts/vnext'
+import { useI18n } from '@/src/i18n/LocaleProvider'
+import { localizeDiagnosticError } from '@/src/i18n/diagnostic'
+import type { Translator } from '@/src/i18n/types'
 
 // ── Public types ────────────────────────────────────────────────
 
@@ -54,13 +59,12 @@ export interface LangPair {
   target: string
 }
 
-const DEFAULT_LANG_PAIR: LangPair = { source: '英文', target: '中文' }
-
 export interface StartTranslationInput {
   sourceText: string
   direction: BuiltinDirection
   taskBrief: string
   reviewMode: ReviewMode
+  mainEditorRunMode: MainEditorRunMode
   allowedAgentVariantIds: string[]
   constraints: TranslationConstraints
   presetRevisionId?: string | null
@@ -68,10 +72,18 @@ export interface StartTranslationInput {
   projectId?: string | null
 }
 
+interface CreateSessionErrorPayload {
+  error?: string
+  message?: string
+  actions?: string[]
+  preflight?: SessionPreflightSnapshot
+}
+
 export interface RestoredTranslationState {
   sourceText: string
   taskBrief: string
   reviewMode: ReviewMode
+  mainEditorRunMode: MainEditorRunMode
   selectedPresetRevisionId: string | null
   promptBundleRevisionId: string | null
   constraints: TranslationConstraints
@@ -94,15 +106,14 @@ interface RestorableInvocation {
   error: string | null
 }
 
-const INTERRUPTED_MESSAGE = '连接已中断'
-
 // ── SSE 消费（累积缓冲 + processedEventCount 跳过已处理事件） ────
 
 async function consumeSSE(
   response: Response,
   onEvent: (event: SSEEvent) => void,
+  missingStreamMessage: string,
 ): Promise<void> {
-  if (!response.body) throw new Error('响应不含事件流')
+  if (!response.body) throw new Error(missingStreamMessage)
 
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
@@ -128,10 +139,18 @@ async function consumeSSE(
 }
 
 /** 从失败响应中提炼错误文案（兼容 {error} 与 {error, message} 两种形状） */
-async function readErrorBody(response: Response, fallback: string): Promise<string> {
+async function readErrorBody(
+  response: Response,
+  fallback: string,
+  t: Translator,
+): Promise<string> {
   try {
     const body = (await response.json()) as { error?: string; message?: string } | null
-    return body?.message ?? body?.error ?? fallback
+    return localizeDiagnosticError(
+      t,
+      body?.error,
+      fallback,
+    )
   } catch {
     return fallback
   }
@@ -139,12 +158,34 @@ async function readErrorBody(response: Response, fallback: string): Promise<stri
 
 // ── Hook ────────────────────────────────────────────────────────
 
+/**
+ * Keep callback identity stable while always dispatching to the latest render.
+ * Consumers can use the result as an effect dependency without turning a
+ * display-only update (such as locale) into a data reload.
+ */
+function useLatestCallback<Args extends unknown[], Result>(
+  callback: (...args: Args) => Result,
+): (...args: Args) => Result {
+  const callbackRef = useRef(callback)
+  useEffect(() => {
+    callbackRef.current = callback
+  }, [callback])
+  return useCallback((...args: Args) => callbackRef.current(...args), [])
+}
+
 export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
+  const { t } = useI18n()
   const [configStatus, setConfigStatus] = useState<ConfigStatus>('loading')
   const [phase, setPhase] = useState<TranslatePhase>('idle')
   const [cards, setCards] = useState<AgentCardState[]>([])
   const [sessionId, setSessionId] = useState<string | null>(null)
-  const [langPair, setLangPair] = useState<LangPair>(DEFAULT_LANG_PAIR)
+  const [langPair, setLangPair] = useState<LangPair>(() => ({
+    source: t('language.english'),
+    target: t('language.chinese'),
+  }))
+  const [preflight, setPreflight] = useState<SessionPreflightSnapshot | null>(null)
+  const [preflightErrorCode, setPreflightErrorCode] = useState<string | null>(null)
+  const [preflightActions, setPreflightActions] = useState<string[]>([])
   const [globalError, setGlobalError] = useState<string | null>(null)
   const [retryingKey, setRetryingKey] = useState<string | null>(null)
 
@@ -161,12 +202,18 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
     setSessionId(null)
     setGlobalError(null)
     setRetryingKey(null)
+    setPreflight(null)
+    setPreflightErrorCode(null)
+    setPreflightActions([])
+  }, [direction])
+
+  useEffect(() => {
     setLangPair(
       direction === 'en_to_zh'
-        ? { source: '英文', target: '中文' }
-        : { source: '中文', target: '英文' },
+        ? { source: t('language.english'), target: t('language.chinese') }
+        : { source: t('language.chinese'), target: t('language.english') },
     )
-  }, [direction])
+  }, [direction, t])
 
   // 卸载：取消在飞 SSE（AbortController），此后一切 setState 静默
   useEffect(() => {
@@ -330,8 +377,11 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
           const invocationId = data.invocationId as string
           patchCard(invocationId, {
             status: 'error',
-            error:
-              typeof data.error === 'string' ? data.error : 'Agent 调用失败',
+            error: localizeDiagnosticError(
+              t,
+              data.error,
+              t('error.agent.callFailed'),
+            ),
           })
           break
         }
@@ -342,9 +392,11 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
         }
         case 'run.interrupted': {
           setPhase('done')
-          setGlobalError(
-            typeof data.error === 'string' ? data.error : '运行被中断',
-          )
+          setGlobalError(localizeDiagnosticError(
+            t,
+            data.error,
+            t('error.run.interrupted'),
+          ))
           emitSessionChanged()
           break
         }
@@ -393,7 +445,7 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
           const key = data.agent_key as string
           patchCard(key, {
             status: 'error',
-            error: typeof data.error === 'string' ? data.error : '未知错误',
+            error: localizeDiagnosticError(t, data.error, t('error.unknown')),
           })
           break
         }
@@ -404,21 +456,25 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
           break
         }
         case 'error': {
-          setGlobalError(typeof data.error === 'string' ? data.error : '翻译管道失败')
+          setGlobalError(localizeDiagnosticError(
+            t,
+            data.error,
+            t('error.pipeline.failed'),
+          ))
           break
         }
         // 'done' 由流收尾逻辑统一处理
       }
     },
-    [patchCard],
+    [patchCard, t],
   )
 
-  const restoreSession = useCallback(async (id: string) => {
+  const restoreSessionImpl = useCallback(async (id: string) => {
     setGlobalError(null)
     const response = await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
       cache: 'no-store',
     })
-    if (!response.ok) throw new Error('无法恢复历史会话')
+    if (!response.ok) throw new Error(t('error.session.restore'))
     const payload = await response.json() as {
       session: SessionRow
       projectContext?: SessionProjectContext | null
@@ -460,10 +516,11 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
       }
     }
     setSessionId(id)
-    setLangPair({
-      source: payload.session.source_lang,
-      target: payload.session.target_lang,
-    })
+    setLangPair(
+      direction === 'en_to_zh'
+        ? { source: t('language.english'), target: t('language.chinese') }
+        : { source: t('language.chinese'), target: t('language.english') },
+    )
     setCards(
       chains.map((chain) => {
         const invocation = chain.currentInvocation
@@ -499,7 +556,9 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
                 ? 'error'
                 : 'streaming',
           text: invocation.body_output ?? '',
-          error: invocation.error,
+          error: invocation.error
+            ? localizeDiagnosticError(t, invocation.error, t('error.unknown'))
+            : null,
           annotation: invocation.annotation_output,
           evidence: evidenceByInvocation.get(invocation.id) ?? null,
           attempts: chain.attempts,
@@ -519,6 +578,9 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
     } catch {
       snapshot = null
     }
+    setPreflight(snapshot?.version === 3 ? snapshot.preflight ?? null : null)
+    setPreflightErrorCode(null)
+    setPreflightActions([])
     setPhase(active ? 'streaming' : 'done')
     if (active) {
       const controller = new AbortController()
@@ -532,14 +594,14 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
           )
           if (!events.ok) {
             throw new Error(
-              await readErrorBody(events, '无法订阅会话事件'),
+              await readErrorBody(events, t('error.session.events'), t),
             )
           }
-          await consumeSSE(events, applyEvent)
+          await consumeSSE(events, applyEvent, t('error.stream.missing'))
         } catch (error) {
           if (!controller.signal.aborted && mountedRef.current) {
             setGlobalError(
-              error instanceof Error ? error.message : '会话事件连接已中断',
+              error instanceof Error ? error.message : t('error.session.eventsInterrupted'),
             )
           }
         }
@@ -549,6 +611,8 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
       sourceText: payload.session.source_text,
       taskBrief: payload.session.task_brief ?? '',
       reviewMode: payload.session.review_mode ?? 'main_editor',
+      mainEditorRunMode:
+        snapshot?.orchestrationPolicy?.mainEditorRunMode ?? 'fixed_pipeline',
       selectedPresetRevisionId: payload.session.preset_revision_id ?? null,
       promptBundleRevisionId: snapshot?.promptBundleRevisionId ?? null,
       constraints: snapshot?.constraints ?? {},
@@ -564,7 +628,8 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
       projectApprovedResourceCount:
         payload.projectContext?.resourceRevisionIds.length ?? null,
     } satisfies RestoredTranslationState
-  }, [applyEvent])
+  }, [applyEvent, direction, t])
+  const restoreSession = useLatestCallback(restoreSessionImpl)
 
   // ── 主流程：创建会话 → 触发翻译 SSE ────────────────────────────
   const start = useCallback(
@@ -576,6 +641,9 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
       setGlobalError(null)
       setCards([])
       setPhase('creating')
+      setPreflight(null)
+      setPreflightErrorCode(null)
+      setPreflightActions([])
 
       try {
         // 1. 创建会话（守卫在服务端：空原文/超长/无 Agent 均 400）
@@ -592,13 +660,51 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
           signal: controller.signal,
         })
         if (!createRes.ok) {
-          throw new Error(await readErrorBody(createRes, `创建会话失败（${createRes.status}）`))
+          let errorPayload: CreateSessionErrorPayload | null = null
+          try {
+            errorPayload = await createRes.json() as CreateSessionErrorPayload
+          } catch {
+            errorPayload = null
+          }
+          if (errorPayload?.preflight) {
+            setPreflight(errorPayload.preflight)
+            setPreflightErrorCode(errorPayload.error ?? null)
+            setPreflightActions(errorPayload.actions ?? [])
+          }
+          const preflightMessage =
+            errorPayload?.error === 'preflight_context_exceeded'
+              ? t('preflight.error.preflight_context_exceeded')
+              : errorPayload?.error === 'preflight_binding_missing'
+                ? t('preflight.error.preflight_binding_missing')
+                : errorPayload?.error === 'preflight_snapshot_upgrade_required'
+                  ? t('preflight.error.preflight_snapshot_upgrade_required')
+                  : errorPayload?.error === 'preflight_snapshot_changed'
+                    ? t('preflight.error.preflight_snapshot_changed')
+                    : null
+          throw new Error(
+            preflightMessage
+              ?? localizeDiagnosticError(
+                t,
+                errorPayload?.error,
+                t('error.session.create', { status: createRes.status }),
+              ),
+          )
         }
-        const session = (await createRes.json()) as SessionRow
+        const session = (await createRes.json()) as SessionRow & {
+          public_config_snapshot?: ConfigSnapshot
+        }
         clientRequestIdRef.current = null
 
         // 2. 从配置快照播种卡片（快照即权威：名称+模型+数量）
         const snapshot = JSON.parse(session.config_snapshot) as ConfigSnapshot
+        const publicSnapshot = session.public_config_snapshot
+        setPreflight(
+          publicSnapshot?.version === 3
+            ? publicSnapshot.preflight ?? null
+            : snapshot.version === 3
+              ? snapshot.preflight ?? null
+              : null,
+        )
         if (!mountedRef.current) return
         setSessionId(session.id)
         const sessionUrl = new URL(window.location.href)
@@ -631,7 +737,11 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
         )
         if (!runRes.ok) {
           throw new Error(
-            await readErrorBody(runRes, `启动翻译失败（${runRes.status}）`),
+            await readErrorBody(
+              runRes,
+              t('error.translation.start', { status: runRes.status }),
+              t,
+            ),
           )
         }
         const sseRes =
@@ -641,20 +751,24 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
               })
             : runRes
         if (!sseRes.ok) {
-          throw new Error(await readErrorBody(sseRes, `翻译请求失败（${sseRes.status}）`))
+          throw new Error(await readErrorBody(
+            sseRes,
+            t('error.translation.request', { status: sseRes.status }),
+            t,
+          ))
         }
-        await consumeSSE(sseRes, applyEvent)
+        await consumeSSE(sseRes, applyEvent, t('error.stream.missing'))
 
         // 4. 流正常关闭：仍未完结的卡片按断流处理（杀 mock 场景）
         if (!mountedRef.current) return
-        failInFlight(INTERRUPTED_MESSAGE)
+        failInFlight(t('error.connection.interrupted'))
       } catch (err) {
         if (controller.signal.aborted || !mountedRef.current) return
-        failInFlight(INTERRUPTED_MESSAGE)
+        failInFlight(t('error.connection.interrupted'))
         setGlobalError(err instanceof Error ? err.message : String(err))
       }
     },
-    [applyEvent, failInFlight],
+    [applyEvent, failInFlight, t],
   )
 
   // ── 单卡重试：仅该卡重置流式，其余卡片原样不动 ─────────────────
@@ -678,7 +792,11 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
           signal: controller.signal,
         })
         if (!res.ok) {
-          throw new Error(await readErrorBody(res, `重试请求失败（${res.status}）`))
+          throw new Error(await readErrorBody(
+            res,
+            t('error.retry.request', { status: res.status }),
+            t,
+          ))
         }
         const retryRun = await res.json() as {
           afterEventId: number
@@ -690,10 +808,14 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
         )
         if (!events.ok) {
           throw new Error(
-            await readErrorBody(events, `订阅重试事件失败（${events.status}）`),
+            await readErrorBody(
+              events,
+              t('error.retry.events', { status: events.status }),
+              t,
+            ),
           )
         }
-        await consumeSSE(events, applyEvent)
+        await consumeSSE(events, applyEvent, t('error.stream.missing'))
 
         if (!mountedRef.current) return
         // 流关闭后该卡仍在飞 → 断流
@@ -701,7 +823,7 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
           prev.map((c) =>
             (c.agentKey === agentKey || c.agentKey === retryRun.invocationId) &&
                 (c.status === 'streaming' || c.status === 'pending')
-              ? { ...c, status: 'error', error: INTERRUPTED_MESSAGE }
+              ? { ...c, status: 'error', error: t('error.connection.interrupted') }
               : c,
           ),
         )
@@ -710,7 +832,7 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
         setCards((prev) =>
           prev.map((c) =>
             c.agentKey === agentKey && (c.status === 'streaming' || c.status === 'pending')
-              ? { ...c, status: 'error', error: INTERRUPTED_MESSAGE }
+              ? { ...c, status: 'error', error: t('error.connection.interrupted') }
               : c,
           ),
         )
@@ -722,7 +844,7 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
         }
       }
     },
-    [sessionId, retryingKey, applyEvent, patchCard],
+    [sessionId, retryingKey, applyEvent, patchCard, t],
   )
 
   const retryAll = useCallback(
@@ -745,7 +867,11 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
         })
         if (!response.ok) {
           throw new Error(
-            await readErrorBody(response, `一键重试失败（${response.status}）`),
+            await readErrorBody(
+              response,
+              t('error.retry.all', { status: response.status }),
+              t,
+            ),
           )
         }
         const payload = (await response.json()) as {
@@ -758,8 +884,8 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
           `/api/sessions/${sessionId}/events?after=${after}`,
           { signal: controller.signal },
         )
-        if (!events.ok) throw new Error('无法订阅重试事件')
-        await consumeSSE(events, applyEvent)
+        if (!events.ok) throw new Error(t('error.retry.subscribe'))
+        await consumeSSE(events, applyEvent, t('error.stream.missing'))
         await restoreSession(sessionId)
       } catch (error) {
         if (!controller.signal.aborted) {
@@ -774,7 +900,7 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
         }
       }
     },
-    [applyEvent, restoreSession, retryingKey, sessionId],
+    [applyEvent, restoreSession, retryingKey, sessionId, t],
   )
 
   const dismissError = useCallback(() => setGlobalError(null), [])
@@ -804,6 +930,9 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
     langPair,
     globalError,
     retryingKey,
+    preflight,
+    preflightErrorCode,
+    preflightActions,
     busy,
     summary,
     allComplete,

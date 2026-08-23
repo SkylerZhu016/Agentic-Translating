@@ -12,6 +12,7 @@ import { findPingshuiGroups } from './pingshui-data'
 
 export interface EvidenceLine {
   lineNo: number
+  stanzaNo: number
   text: string
   measure: number
   ending: string
@@ -85,9 +86,29 @@ function numbers(text: string) {
   return text.match(/\d+(?:[.,]\d+)*/g) ?? []
 }
 
+function nonEmptyLinesWithStanzas(text: string) {
+  const rows: Array<{ text: string; stanzaNo: number }> = []
+  let stanzaNo = 1
+  let pendingStanzaBreak = false
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (!line) {
+      if (rows.length > 0) pendingStanzaBreak = true
+      continue
+    }
+    if (pendingStanzaBreak) {
+      stanzaNo += 1
+      pendingStanzaBreak = false
+    }
+    rows.push({ text: line, stanzaNo })
+  }
+  return rows
+}
+
 export function checkTranslationEvidence(input: {
   direction: TranslationDirection
   sourceText: string
+  taskBrief?: string
   translatedText: string
   constraints?: TranslationConstraints
   reportLanguage?: 'zh' | 'en'
@@ -96,16 +117,15 @@ export function checkTranslationEvidence(input: {
   const useEnglish =
     input.reportLanguage === 'en' ||
     (!input.reportLanguage && input.direction !== 'en_to_zh')
-  const nonEmpty = input.translatedText
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-  const lines = nonEmpty.map((line, index): EvidenceLine => {
+  const nonEmpty = nonEmptyLinesWithStanzas(input.translatedText)
+  const lines = nonEmpty.map((row, index): EvidenceLine => {
+    const line = row.text
     if (input.direction === 'en_to_zh') {
       const characters = Array.from(line.match(/[\p{Script=Han}]/gu) ?? [])
       const ending = characters.at(-1) ?? ''
       return {
         lineNo: index + 1,
+        stanzaNo: row.stanzaNo,
         text: line,
         measure: characters.length,
         ending,
@@ -121,6 +141,7 @@ export function checkTranslationEvidence(input: {
       )
       return {
         lineNo: index + 1,
+        stanzaNo: row.stanzaNo,
         text: line,
         measure: graphemes.length,
         ending: graphemes.at(-1) ?? '',
@@ -133,6 +154,7 @@ export function checkTranslationEvidence(input: {
     const ending = words.at(-1)?.replace(/[’]/g, "'") ?? ''
     return {
       lineNo: index + 1,
+      stanzaNo: row.stanzaNo,
       text: line,
       measure: words.length,
       ending,
@@ -212,7 +234,9 @@ export function checkTranslationEvidence(input: {
     }
   }
   const poetry = analyzePoetrySource({
+    direction: input.direction,
     sourceText: input.sourceText,
+    taskBrief: input.taskBrief,
     constraints,
   })
   if (poetry.isPoetry) {
@@ -245,6 +269,9 @@ export function checkTranslationEvidence(input: {
       }
     }
 
+    const enforceRhyme =
+      poetry.rhymeRequirement === 'explicit' ||
+      poetry.rhymeRequirement === 'source-stable'
     const schemeLabels = poetry.suggestedScheme
       .replace(/[^A-Za-z]/g, '')
       .slice(0, lines.length)
@@ -252,62 +279,67 @@ export function checkTranslationEvidence(input: {
     for (const lineNo of poetry.suggestedRhymeLines) {
       const label = schemeLabels[lineNo - 1]?.toUpperCase() || 'A'
       if (label === 'X') continue
-      labelledGroups.set(label, [
-        ...(labelledGroups.get(label) ?? []),
+      const stanzaNo = poetry.lines[lineNo - 1]?.stanzaNo ?? 1
+      const groupKey = constraints.rhymeChange === 'by_stanza'
+        ? `${stanzaNo}:${label}`
+        : label
+      labelledGroups.set(groupKey, [
+        ...(labelledGroups.get(groupKey) ?? []),
         lineNo,
       ])
     }
-    const requireOneRhyme =
-      constraints.rhymeChange === 'single' || poetry.stanzaCount <= 1
-    if (requireOneRhyme) {
-      for (const [label, lineNumbers] of labelledGroups) {
+    if (enforceRhyme) {
+      for (const [groupKey, lineNumbers] of labelledGroups) {
+        const label = groupKey.includes(':')
+          ? groupKey.slice(groupKey.indexOf(':') + 1)
+          : groupKey
         const rhymeLines = lineNumbers
           .map((lineNo) => lines[lineNo - 1])
           .filter((line): line is EvidenceLine => Boolean(line))
         if (rhymeLines.length < 2) continue
         if (input.direction === 'en_to_zh') {
-        const system = constraints.chineseRhymeSystem ?? 'mandarin'
-        const knownMandarin = rhymeLines
-          .map((line) => line.rhyme)
-          .filter((rhyme): rhyme is string => Boolean(rhyme))
-        const mandarinMatches =
-          knownMandarin.length === rhymeLines.length &&
-          new Set(knownMandarin).size === 1
-        const knownPingshui = rhymeLines.map((line) => line.pingshuiGroups)
-        const pingshuiMatches =
-          knownPingshui.every((groups) => groups.length > 0) &&
-          intersection(knownPingshui).length > 0
-        if (
-          (system === 'mandarin' || system === 'dual') &&
-          !mandarinMatches
-        ) {
-          rhymeWarnings.push(
+          const system = constraints.chineseRhymeSystem ?? 'mandarin'
+          const knownMandarin = rhymeLines
+            .map((line) => line.rhyme)
+            .filter((rhyme): rhyme is string => Boolean(rhyme))
+          const mandarinMatches =
+            knownMandarin.length === rhymeLines.length &&
+            new Set(knownMandarin).size === 1
+          const knownPingshui = rhymeLines.map((line) => line.pingshuiGroups)
+          const pingshuiMatches =
+            knownPingshui.every((groups) => groups.length > 0) &&
+            intersection(knownPingshui).length > 0
+          if (
+            (system === 'mandarin' || system === 'dual') &&
+            !mandarinMatches
+          ) {
+            rhymeWarnings.push(
               `普通话检查：${label} 韵位第 ${lineNumbers.join('、')} 行的韵母未保持一致。`,
-          )
-        }
-        if (
-          (system === 'pingshui' || system === 'dual') &&
-          !pingshuiMatches
-        ) {
-          rhymeWarnings.push(
+            )
+          }
+          if (
+            (system === 'pingshui' || system === 'dual') &&
+            !pingshuiMatches
+          ) {
+            rhymeWarnings.push(
               `平水韵检查：${label} 韵位第 ${lineNumbers.join('、')} 行未找到共同韵部，或存在未识别韵脚。`,
-          )
-        }
+            )
+          }
         } else if (
           input.direction === 'zh_to_en' &&
           constraints.englishRhymeMode === 'exact'
         ) {
-        const known = rhymeLines
-          .map((line) => line.rhyme)
-          .filter((rhyme): rhyme is string => Boolean(rhyme))
-        if (
-          known.length !== rhymeLines.length ||
-          new Set(known).size !== 1
-        ) {
-          rhymeWarnings.push(
+          const known = rhymeLines
+            .map((line) => line.rhyme)
+            .filter((rhyme): rhyme is string => Boolean(rhyme))
+          if (
+            known.length !== rhymeLines.length ||
+            new Set(known).size !== 1
+          ) {
+            rhymeWarnings.push(
               `Exact-rhyme check: ${label}-rhyme lines ${lineNumbers.join(', ')} do not share one known pronunciation signature.`,
-          )
-        }
+            )
+          }
         }
       }
     }

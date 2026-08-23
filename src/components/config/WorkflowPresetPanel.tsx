@@ -15,6 +15,7 @@ import type {
 import type { Endpoint } from './api'
 import type { NotifyFn } from './shared'
 import { ModelPicker } from './ModelPicker'
+import { useI18n, type MessageKey } from '@/src/i18n'
 
 type ExecutionRole =
   | 'mainAgent'
@@ -33,6 +34,15 @@ const EMPTY_EXECUTION_BINDINGS: Record<ExecutionRole, ModelBinding> = {
   editingAgent: { endpointId: null, model: '' },
 }
 
+const EXECUTION_ROLES = [
+  ['mainAgent', 'workflowPreset.role.main'],
+  ['reviewAgent', 'workflowPreset.role.review'],
+  ['filterAgent', 'workflowPreset.role.filter'],
+  ['orchestrateAgent', 'workflowPreset.role.orchestrate'],
+  ['assembleAgent', 'workflowPreset.role.assemble'],
+  ['editingAgent', 'workflowPreset.role.editing'],
+] as const satisfies ReadonlyArray<readonly [ExecutionRole, MessageKey]>
+
 export function WorkflowPresetPanel({
   endpoints,
   notify,
@@ -41,6 +51,7 @@ export function WorkflowPresetPanel({
   notify: NotifyFn
 }) {
   const { direction } = useDirection()
+  const { t, formatDate, formatNumber } = useI18n()
   const [presets, setPresets] = useState<WorkflowPreset[]>([])
   const [variants, setVariants] = useState<AgentDirectionVariant[]>([])
   const [open, setOpen] = useState(false)
@@ -104,7 +115,7 @@ export function WorkflowPresetPanel({
       ) ||
       selectedIds.length < 2
     ) {
-      notify('请配置候选模型、六个执行角色，并至少选择两个 Agent')
+      notify(t('workflowPreset.error.required'))
       return
     }
     const snapshots = selectedIds
@@ -131,6 +142,7 @@ export function WorkflowPresetPanel({
           description: description.trim(),
           direction,
           contract: {
+            // These labels are prompt-contract values and remain stable across UI locales.
             sourceLang: direction === 'en_to_zh' ? '英文' : '中文',
             targetLang: direction === 'en_to_zh' ? '中文' : '英文',
             taskBriefTemplate: taskBrief,
@@ -156,15 +168,7 @@ export function WorkflowPresetPanel({
         }),
       })
       if (!response.ok) {
-        const payload = await response.json().catch(() => null) as {
-          error?: string
-          details?: unknown
-        } | null
-        throw new Error(
-          payload
-            ? `${payload.error ?? '预设保存失败'}：${JSON.stringify(payload.details ?? {})}`
-            : '预设保存失败',
-        )
+        throw new Error(t('workflowPreset.error.save'))
       }
       setOpen(false)
       setName('')
@@ -175,11 +179,11 @@ export function WorkflowPresetPanel({
       setExecutionBindings({ ...EMPTY_EXECUTION_BINDINGS })
       setAnalysisModelA('')
       setAnalysisModelB('')
-      notify('工作流预设 revision 1 已创建', { tone: 'inverted' })
+      notify(t('workflowPreset.created'), { tone: 'inverted' })
       await load()
     } catch (error) {
-      notify('保存失败', {
-        message: error instanceof Error ? error.message : '请重试',
+      notify(t('config.error.save'), {
+        message: error instanceof Error ? error.message : t('config.error.tryLater'),
       })
     } finally {
       setSaving(false)
@@ -202,10 +206,10 @@ export function WorkflowPresetPanel({
       },
     )
     if (!response.ok) {
-      notify('恢复失败')
+      notify(t('workflowPreset.error.restore'))
       return
     }
-    notify('旧 revision 已恢复为新的当前 revision', { tone: 'inverted' })
+    notify(t('workflowPreset.restored'), { tone: 'inverted' })
     await inspect(details.preset)
     await load()
   }
@@ -214,24 +218,24 @@ export function WorkflowPresetPanel({
     const response = await fetch(`/api/workflow-presets/${encodeURIComponent(preset.id)}`, {
       method: 'DELETE',
     })
-    if (!response.ok) return notify('删除失败')
-    notify('预设已移入回收站', { tone: 'inverted' })
+    if (!response.ok) return notify(t('workflowPreset.error.delete'))
+    notify(t('workflowPreset.deleted'), { tone: 'inverted' })
     await load()
   }
 
   return (
     <Card
-      overline="Workflow Presets"
-      title="可复用工作流预设"
+      overline={t('workflowPreset.overline')}
+      title={t('workflowPreset.title')}
       actions={
         <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
-          新建预设
+          {t('workflowPreset.new')}
         </Button>
       }
     >
       {presets.length === 0 ? (
         <p className="rounded-sm border border-dashed border-line-2 p-5 text-center text-sm text-ink-4">
-          当前方向尚无用户预设。预设会冻结 Agent、提示词版本与模型绑定，适合批量任务。
+          {t('workflowPreset.empty')}
         </p>
       ) : (
         <ul className="divide-y divide-line">
@@ -240,24 +244,26 @@ export function WorkflowPresetPanel({
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
                   <p className="truncate text-sm font-medium text-ink">{preset.name}</p>
-                  <Badge variant="subtle">rev {preset.currentRevisionNo}</Badge>
+                  <Badge variant="subtle">
+                    {t('workflowPreset.revisionShort', { revision: formatNumber(preset.currentRevisionNo) })}
+                  </Badge>
                 </div>
                 <p className="mt-1 line-clamp-1 text-xs text-ink-3">
-                  {preset.description || '无说明'}
+                  {preset.description || t('workflowPreset.noDescription')}
                 </p>
               </div>
               <Button variant="ghost" size="sm" onClick={() => void inspect(preset)}>
-                revisions
+                {t('workflowPreset.revisions')}
               </Button>
               <Button
                 href={`/api/workflow-presets/${encodeURIComponent(preset.id)}/export`}
                 variant="ghost"
                 size="sm"
               >
-                导出
+                {t('workflowPreset.export')}
               </Button>
               <Button variant="ghost" size="sm" onClick={() => void remove(preset)}>
-                删除
+                {t('config.action.delete')}
               </Button>
             </li>
           ))}
@@ -267,28 +273,31 @@ export function WorkflowPresetPanel({
       <Modal
         open={open}
         onClose={() => setOpen(false)}
-        title="新建工作流预设"
+        title={t('workflowPreset.newTitle')}
         className="max-w-2xl"
         footer={
           <>
-            <Button variant="ghost" size="sm" onClick={() => setOpen(false)}>取消</Button>
+            <Button variant="ghost" size="sm" onClick={() => setOpen(false)}>{t('config.action.cancel')}</Button>
             <Button size="sm" disabled={saving} onClick={() => void create()}>
-              {saving && <Spinner size="sm" />}保存 revision 1
+              {saving && <Spinner size="sm" />}{t('workflowPreset.saveInitial')}
             </Button>
           </>
         }
       >
         <div className="space-y-4">
-          <Input value={name} onChange={(event) => setName(event.target.value)} placeholder="预设名称" />
-          <Input value={description} onChange={(event) => setDescription(event.target.value)} placeholder="说明" />
+          <Input value={name} onChange={(event) => setName(event.target.value)} placeholder={t('workflowPreset.name.placeholder')} />
+          <Input value={description} onChange={(event) => setDescription(event.target.value)} placeholder={t('workflowPreset.description.placeholder')} />
           <Textarea
             rows={3}
             value={taskBrief}
             onChange={(event) => setTaskBrief(event.target.value)}
-            placeholder="任务要求模板，可使用 {{file_name}} 与 {{relative_path}}"
+            placeholder={t('workflowPreset.taskBrief.placeholder', {
+              fileName: '{{file_name}}',
+              relativePath: '{{relative_path}}',
+            })}
           />
           <div className="space-y-3 rounded-sm border border-line p-3">
-            <p className="text-xs font-medium text-ink">模型分工</p>
+            <p className="text-xs font-medium text-ink">{t('workflowPreset.models.title')}</p>
             <select
               value={endpointId ?? ''}
               onChange={(event) => {
@@ -299,7 +308,7 @@ export function WorkflowPresetPanel({
               }}
               className="rounded-sm border border-line-2 bg-paper-raise px-2 py-2 text-sm"
             >
-              <option value="">选择端点</option>
+              <option value="">{t('workflowPreset.endpoint.select')}</option>
               {endpoints.map((endpoint) => (
                 <option key={endpoint.id} value={endpoint.id}>{endpoint.name}</option>
               ))}
@@ -309,35 +318,29 @@ export function WorkflowPresetPanel({
                 endpointId={endpointId}
                 value={model}
                 onChange={setModel}
-                emptyLabel="选择正式翻译模型"
-                ariaLabel="正式翻译模型"
+                emptyLabel={t('workflowPreset.model.worker')}
+                ariaLabel={t('workflowPreset.model.workerAria')}
               />
               <ModelPicker
                 endpointId={endpointId}
                 value={analysisModelA}
                 onChange={setAnalysisModelA}
-                emptyLabel="前置分析模型 A（可选）"
-                ariaLabel="前置分析模型 A"
+                emptyLabel={t('workflowPreset.model.analysisA')}
+                ariaLabel={t('workflowPreset.model.analysisA')}
               />
               <ModelPicker
                 endpointId={endpointId}
                 value={analysisModelB}
                 onChange={setAnalysisModelB}
-                emptyLabel="前置分析模型 B（可选）"
-                ariaLabel="前置分析模型 B"
+                emptyLabel={t('workflowPreset.model.analysisB')}
+                ariaLabel={t('workflowPreset.model.analysisB')}
               />
             </div>
             <div className="space-y-2 border-t border-line pt-3">
-              <p className="text-xs font-medium text-ink">六个执行角色</p>
-              {([
-                ['mainAgent', '主 Agent'],
-                ['reviewAgent', '审查'],
-                ['filterAgent', '筛选'],
-                ['orchestrateAgent', '编排'],
-                ['assembleAgent', '组装'],
-                ['editingAgent', '编辑 Agent'],
-              ] as const).map(([key, label]) => {
+              <p className="text-xs font-medium text-ink">{t('workflowPreset.roles.title')}</p>
+              {EXECUTION_ROLES.map(([key, labelKey]) => {
                 const role = executionBindings[key]
+                const label = t(labelKey)
                 return (
                   <div
                     key={key}
@@ -346,7 +349,7 @@ export function WorkflowPresetPanel({
                     <p className="pt-2 text-xs font-medium text-ink-2">{label}</p>
                     <select
                       value={role.endpointId ?? ''}
-                      aria-label={`${label}端点`}
+                      aria-label={t('workflowPreset.role.endpointAria', { role: label })}
                       onChange={(event) => {
                         const selectedEndpointId =
                           Number(event.target.value) || null
@@ -364,7 +367,7 @@ export function WorkflowPresetPanel({
                       }}
                       className="h-9 rounded-sm border border-line-2 bg-paper-raise px-2 text-sm"
                     >
-                      <option value="">选择端点</option>
+                      <option value="">{t('workflowPreset.endpoint.select')}</option>
                       {endpoints.map((endpoint) => (
                         <option key={endpoint.id} value={endpoint.id}>
                           {endpoint.name}
@@ -380,43 +383,43 @@ export function WorkflowPresetPanel({
                           [key]: { ...current[key], model: selectedModel },
                         }))
                       }
-                      emptyLabel={`选择${label}模型`}
-                      ariaLabel={`${label}模型`}
+                      emptyLabel={t('workflowPreset.role.modelSelect', { role: label })}
+                      ariaLabel={t('workflowPreset.role.modelAria', { role: label })}
                     />
                   </div>
                 )
               })}
             </div>
             <p className="text-xs leading-relaxed text-ink-4">
-              前置分析填写两个不同模型时会并行执行；候选翻译仍使用“正式翻译模型”。
+              {t('workflowPreset.analysis.hint')}
             </p>
           </div>
           <div className="grid grid-cols-2 gap-3">
             <label className="text-xs text-ink-3">
-              编队策略
+              {t('workflowPreset.teamPolicy')}
               <select
                 value={teamPolicy}
                 onChange={(event) => setTeamPolicy(event.target.value as TeamPolicy)}
                 className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-2 text-sm text-ink"
               >
-                <option value="fixed">固定编队（默认）</option>
-                <option value="dynamic">动态允许池</option>
+                <option value="fixed">{t('workflowPreset.teamPolicy.fixed')}</option>
+                <option value="dynamic">{t('workflowPreset.teamPolicy.dynamic')}</option>
               </select>
             </label>
             <label className="text-xs text-ink-3">
-              审议方式
+              {t('workflowPreset.reviewMode')}
               <select
                 value={reviewMode}
                 onChange={(event) => setReviewMode(event.target.value as ReviewMode)}
                 className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-2 text-sm text-ink"
               >
-                <option value="main_editor">主 Agent 编辑</option>
-                <option value="four_stage">经典四阶段</option>
+                <option value="main_editor">{t('workflowPreset.reviewMode.mainEditor')}</option>
+                <option value="four_stage">{t('workflowPreset.reviewMode.fourStage')}</option>
               </select>
             </label>
           </div>
           <label className="block text-xs text-ink-3">
-            审议阶段读取候选注释
+            {t('workflowPreset.annotationMode')}
             <select
               value={candidateAnnotationMode}
               onChange={(event) =>
@@ -426,11 +429,11 @@ export function WorkflowPresetPanel({
               }
               className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-2 text-sm text-ink"
             >
-              <option value="body_only">隔离注释，仅传候选正文</option>
-              <option value="body_and_annotation">正文与译者注释分别传入</option>
+              <option value="body_only">{t('workflowPreset.annotationMode.bodyOnly')}</option>
+              <option value="body_and_annotation">{t('workflowPreset.annotationMode.withAnnotation')}</option>
             </select>
             <span className="mt-1 block leading-5 text-ink-4">
-              隔离模式减少上下文并避免译者自我解释影响审议；传入模式会把注释标成可能有误的独立证据，仍不会混入译文正文。
+              {t('workflowPreset.annotationMode.hint')}
             </span>
           </label>
           <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
@@ -458,14 +461,16 @@ export function WorkflowPresetPanel({
       <Modal
         open={details != null}
         onClose={() => setDetails(null)}
-        title={details ? `${details.preset.name} · revisions` : ''}
+        title={details ? t('workflowPreset.detailsTitle', { name: details.preset.name }) : ''}
       >
         <ol className="divide-y divide-line">
           {details?.revisions.map((revision) => (
             <li key={revision.id} className="flex items-center justify-between gap-3 py-2">
               <div>
-                <p className="text-sm font-medium text-ink">revision {revision.revisionNo}</p>
-                <p className="text-xs text-ink-4">{revision.createdAt}</p>
+                <p className="text-sm font-medium text-ink">
+                  {t('workflowPreset.revision', { revision: formatNumber(revision.revisionNo) })}
+                </p>
+                <p className="text-xs text-ink-4">{formatDate(revision.createdAt, { dateStyle: 'medium', timeStyle: 'short' })}</p>
               </div>
               <Button
                 variant="ghost"
@@ -473,7 +478,7 @@ export function WorkflowPresetPanel({
                 disabled={revision.revisionNo === details.preset.currentRevisionNo}
                 onClick={() => void restore(revision.revisionNo)}
               >
-                恢复为新 revision
+                {t('workflowPreset.restoreAsNew')}
               </Button>
             </li>
           ))}

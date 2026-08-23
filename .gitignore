@@ -1,5 +1,7 @@
 node_modules/
 .next/
+.next-web-dev/
+.next-electron-dev/
 data/
 .omo/
 playwright-report/

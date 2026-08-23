@@ -4,6 +4,7 @@ import { NextResponse } from 'next/server'
 import { getDb } from '@/src/lib/db'
 import { migrate } from '@/src/lib/db/migrate'
 import { startVNextDraftRegeneration } from '@/src/lib/orchestration/vnext-runner'
+import { sessionPreflightErrorDto } from '@/src/lib/services/session-preflight'
 import { z } from 'zod'
 
 const bodySchema = z.object({
@@ -37,6 +38,12 @@ export async function POST(
       { status: 202 },
     )
   } catch (error) {
+    const preflightError = sessionPreflightErrorDto(error)
+    if (preflightError) {
+      return NextResponse.json(preflightError.body, {
+        status: preflightError.status,
+      })
+    }
     const message = error instanceof Error ? error.message : String(error)
     return NextResponse.json(
       { error: message },

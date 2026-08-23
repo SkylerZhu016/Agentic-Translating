@@ -11,6 +11,7 @@ import { Badge, Button, Card, Input, Modal, Spinner, Textarea } from '@/src/comp
 import { TID } from '@/src/lib/testids'
 import { configApi, isApiError, type Agent, type Endpoint } from './api'
 import { Field, Select, Toggle, type NotifyFn } from './shared'
+import { localizeDiagnosticError, useI18n } from '@/src/i18n'
 
 interface CardInitial {
   name: string
@@ -33,6 +34,7 @@ export interface AgentPanelProps {
 }
 
 export function AgentPanel({ agents, endpoints, notify, onChanged }: AgentPanelProps) {
+  const { t } = useI18n()
   const [drafts, setDrafts] = useState<Draft[]>([])
   const draftSeq = useRef(0)
   const [deleteTarget, setDeleteTarget] = useState<Agent | null>(null)
@@ -81,7 +83,11 @@ export function AgentPanel({ agents, endpoints, notify, onChanged }: AgentPanelP
       ])
       await onChanged()
     } catch (e) {
-      notify('排序失败', { message: isApiError(e) ? e.message : '网络错误，请重试' })
+      notify(t('legacy.agent.sortFailed'), {
+        message: isApiError(e)
+          ? localizeDiagnosticError(t, e.payload, t('config.error.tryLater'))
+          : t('config.error.networkRetry'),
+      })
     } finally {
       setMoving(false)
     }
@@ -92,11 +98,15 @@ export function AgentPanel({ agents, endpoints, notify, onChanged }: AgentPanelP
     setDeleting(true)
     try {
       await configApi.deleteAgent(deleteTarget.id)
-      notify(`Agent「${deleteTarget.name}」已删除`, { tone: 'inverted' })
+      notify(t('legacy.agent.deleted', { name: deleteTarget.name }), { tone: 'inverted' })
       setDeleteTarget(null)
       await onChanged()
     } catch (e) {
-      notify('删除失败', { message: isApiError(e) ? e.message : '网络错误，请重试' })
+      notify(t('legacy.agent.deleteFailed'), {
+        message: isApiError(e)
+          ? localizeDiagnosticError(t, e.payload, t('config.error.tryLater'))
+          : t('config.error.networkRetry'),
+      })
       setDeleteTarget(null)
     } finally {
       setDeleting(false)
@@ -105,8 +115,8 @@ export function AgentPanel({ agents, endpoints, notify, onChanged }: AgentPanelP
 
   return (
     <Card
-      overline="Agents"
-      title="翻译 Agent"
+      overline={t('legacy.agent.overline')}
+      title={t('legacy.agent.title')}
       actions={
         <Button
           variant="outline"
@@ -114,28 +124,28 @@ export function AgentPanel({ agents, endpoints, notify, onChanged }: AgentPanelP
           testId={TID.agent.addAgentButton}
           onClick={addDraft}
         >
-          添加 Agent
+          {t('legacy.agent.add')}
         </Button>
       }
     >
       {hasDuplicates && (
         <div className="mb-3 flex items-start gap-2 rounded-sm border border-dashed border-line-2 bg-paper-sink/60 px-3 py-2">
           <Badge variant="outline" className="mt-0.5 shrink-0">
-            提示
+            {t('legacy.agent.notice')}
           </Badge>
           <p className="text-xs leading-5 text-ink-2">
-            存在配置相同的 Agent：模型与提示词完全一致。仍可保存，但并行翻译将产出趋同的译稿。
+            {t('legacy.agent.duplicate')}
           </p>
         </div>
       )}
 
       {agents.length === 0 && drafts.length === 0 ? (
         <div className="rounded-sm border border-dashed border-line-2 bg-paper/60 px-4 py-8 text-center text-sm leading-6 text-ink-3">
-          尚未配置翻译 Agent。多名 Agent 将并行翻译同一原文，供统筹管道择优合成。
+          {t('legacy.agent.empty')}
           <br />
-          点击右上角「添加 Agent」开始配置。
+          {t('legacy.agent.emptyAction')}
           {endpoints.length === 0 && (
-            <span className="mt-1 block text-xs text-ink-4">（请先在上方添加端点）</span>
+            <span className="mt-1 block text-xs text-ink-4">{t('legacy.agent.addEndpointFirst')}</span>
           )}
         </div>
       ) : (
@@ -191,22 +201,22 @@ export function AgentPanel({ agents, endpoints, notify, onChanged }: AgentPanelP
       <Modal
         open={deleteTarget != null}
         onClose={() => setDeleteTarget(null)}
-        title="删除 Agent"
+        title={t('legacy.agent.deleteTitle')}
         footer={
           <>
             <Button variant="ghost" size="sm" onClick={() => setDeleteTarget(null)}>
-              取消
+              {t('common.cancel')}
             </Button>
             <Button size="sm" onClick={() => void confirmDelete()} disabled={deleting}>
               {deleting && <Spinner size="sm" />}
-              确认删除
+              {t('legacy.agent.deleteConfirm')}
             </Button>
           </>
         }
       >
         {deleteTarget != null && (
           <p className="text-sm leading-6 text-ink-2">
-            确定删除 Agent「{deleteTarget.name}」吗？历史会话不受影响（会话保存的是配置快照）。
+            {t('legacy.agent.deleteDescription', { name: deleteTarget.name })}
           </p>
         )}
       </Modal>
@@ -244,6 +254,7 @@ function AgentCardView({
   onRequestDelete,
   onSaved,
 }: AgentCardViewProps) {
+  const { t } = useI18n()
   const isDraft = agentId == null
   const [name, setName] = useState(initial.name)
   const [endpointId, setEndpointId] = useState<number | null>(initial.endpointId)
@@ -257,15 +268,19 @@ function AgentCardView({
   async function save() {
     // 客户端校验先行：错误可见且不发请求（QA negative）
     if (model.trim().length === 0) {
-      setError('模型名不能为空')
+      setError(t('legacy.agent.error.model'))
       return
     }
     if (endpointId == null) {
-      setError(endpoints.length === 0 ? '请先在上方添加端点' : '请选择端点')
+      setError(
+        endpoints.length === 0
+          ? t('legacy.agent.error.addEndpoint')
+          : t('legacy.agent.error.selectEndpoint'),
+      )
       return
     }
     if (name.trim().length === 0) {
-      setError('请输入名称')
+      setError(t('legacy.agent.error.name'))
       return
     }
     setError(null)
@@ -281,7 +296,7 @@ function AgentCardView({
     try {
       if (isDraft) {
         await configApi.createAgent(payload)
-        notify(`Agent「${payload.name}」已创建`, { tone: 'inverted' })
+        notify(t('legacy.agent.created', { name: payload.name }), { tone: 'inverted' })
       } else {
         await configApi.updateAgent(agentId, payload)
         setSavedTick(true)
@@ -289,7 +304,11 @@ function AgentCardView({
       }
       await onSaved()
     } catch (e) {
-      notify('保存失败', { message: isApiError(e) ? e.message : '网络错误，请重试' })
+      notify(t('config.error.save'), {
+        message: isApiError(e)
+          ? localizeDiagnosticError(t, e.payload, t('config.error.tryLater'))
+          : t('config.error.networkRetry'),
+      })
     } finally {
       setSaving(false)
     }
@@ -303,19 +322,19 @@ function AgentCardView({
       {/* 头部：名称 + 排序 + 删除 */}
       <div className="flex items-center gap-2">
         <Input
-          aria-label="Agent 名称"
+          aria-label={t('legacy.agent.nameAria')}
           value={name}
           onChange={(e) => setName(e.target.value)}
           className="h-8 max-w-44"
         />
-        {isDraft && <Badge variant="outline">未保存</Badge>}
+        {isDraft && <Badge variant="outline">{t('legacy.agent.unsaved')}</Badge>}
         <div className="flex-1" />
         {!isDraft && (
           <>
             <Button
               variant="ghost"
               size="sm"
-              aria-label="上移"
+              aria-label={t('legacy.agent.moveUp')}
               onClick={onMoveUp}
               disabled={!canMoveUp}
               className="px-2"
@@ -325,7 +344,7 @@ function AgentCardView({
             <Button
               variant="ghost"
               size="sm"
-              aria-label="下移"
+              aria-label={t('legacy.agent.moveDown')}
               onClick={onMoveDown}
               disabled={!canMoveDown}
               className="px-2"
@@ -335,22 +354,22 @@ function AgentCardView({
           </>
         )}
         <Button variant="ghost" size="sm" onClick={onRequestDelete}>
-          删除
+          {t('common.delete')}
         </Button>
       </div>
 
       {/* 端点 + 模型 */}
       <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
-        <Field label="端点">
+        <Field label={t('legacy.agent.endpoint')}>
           <Select
-            aria-label="选择端点"
+            aria-label={t('legacy.agent.endpointAria')}
             value={endpointId == null ? '' : String(endpointId)}
             onChange={(e) =>
               setEndpointId(e.target.value === '' ? null : Number(e.target.value))
             }
           >
-            {endpoints.length === 0 && <option value="">（尚无端点）</option>}
-            {endpointId == null && endpoints.length > 0 && <option value="">请选择…</option>}
+            {endpoints.length === 0 && <option value="">{t('legacy.agent.noEndpoint')}</option>}
+            {endpointId == null && endpoints.length > 0 && <option value="">{t('legacy.agent.selectEndpoint')}</option>}
             {endpoints.map((ep) => (
               <option key={ep.id} value={String(ep.id)}>
                 {ep.name}
@@ -358,7 +377,7 @@ function AgentCardView({
             ))}
           </Select>
         </Field>
-        <Field label="模型" error={error}>
+        <Field label={t('legacy.agent.model')} error={error}>
           <Input
             testId={TID.agent.modelInput}
             value={model}
@@ -366,7 +385,7 @@ function AgentCardView({
               setModel(e.target.value)
               if (error != null) setError(null)
             }}
-            placeholder="如 gpt-4o"
+            placeholder={t('legacy.agent.modelPlaceholder')}
             className="font-mono"
           />
         </Field>
@@ -379,32 +398,34 @@ function AgentCardView({
             testId={TID.agent.promptOverrideToggle}
             checked={overrideOn}
             onChange={setOverrideOn}
-            ariaLabel="覆盖全局默认提示词"
+            ariaLabel={t('legacy.agent.override')}
           />
-          <span className="text-xs text-ink-2">覆盖全局默认提示词</span>
+          <span className="text-xs text-ink-2">{t('legacy.agent.override')}</span>
         </div>
         {overrideOn ? (
           <Textarea
-            aria-label="提示词覆盖内容"
+            aria-label={t('legacy.agent.overrideAria')}
             rows={5}
             value={overrideText}
             onChange={(e) => setOverrideText(e.target.value)}
-            placeholder="输入该 Agent 专属提示词，支持 {{source_text}} 等变量"
+            placeholder={t('legacy.agent.promptPlaceholder', {
+              placeholder: '{{source_text}}',
+            })}
             className="mt-2 font-mono text-xs leading-relaxed"
           />
         ) : (
           <p className="mt-2 rounded-sm border border-dashed border-line bg-paper-sink/50 px-3 py-2 text-xs text-ink-4">
-            使用全局默认提示词
+            {t('legacy.agent.globalPrompt')}
           </p>
         )}
       </div>
 
       {/* 底部操作 */}
       <div className="mt-3 flex items-center justify-end gap-2">
-        {savedTick && <span className="text-xs text-ink-3">已保存</span>}
+        {savedTick && <span className="text-xs text-ink-3">{t('common.saved')}</span>}
         <Button size="sm" onClick={() => void save()} disabled={saving}>
           {saving && <Spinner size="sm" />}
-          {isDraft ? '创建' : '保存'}
+          {isDraft ? t('common.create') : t('common.save')}
         </Button>
       </div>
     </div>

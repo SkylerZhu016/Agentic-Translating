@@ -4,7 +4,7 @@
 
 A multi-option translation decision workbench for difficult texts. It supports bidirectional, multi-model deliberation, evidence-based decisions, and reusable project memory.
 
-**Latest release: [v0.1.2](https://github.com/SkylerZhu016/Agentic-Translating/releases/tag/v0.1.2)** — Windows installer and portable executable. Other platforms can build from source. See the [release notes](docs/releases/0.1.2.md).
+**Latest release: [v0.2.0](https://github.com/SkylerZhu016/Agentic-Translating/releases/tag/v0.2.0)** — Windows installer and portable executable. Other platforms can build from source. See the [release notes](docs/releases/0.2.0.md).
 
 The key difference from a general-purpose coding agent is not treating translation as just another coding task. Instead, it lets multiple roles work on the same open problem. Disagreements between candidate versions are kept as comparable evidence. The main agent decides which perspectives to call on, how to deliberate and merge them, and produces the final version through traceable text operations.
 
@@ -85,10 +85,10 @@ Batch tasks must select a valid revision. They support UTF-8 encoded `.txt` and 
 
 ## Desktop and Self-Hosting
 
-For ordinary Windows users, download one of the two assets from the [v0.1.2 release](https://github.com/SkylerZhu016/Agentic-Translating/releases/tag/v0.1.2):
+For ordinary Windows users, download one of the two assets from the [v0.2.0 release](https://github.com/SkylerZhu016/Agentic-Translating/releases/tag/v0.2.0):
 
-- `Agentic Translating-0.1.2-setup-x64.exe` — recommended installer;
-- `Agentic Translating-0.1.2-portable-x64.exe` — portable version that runs without installation.
+- `Agentic Translating-0.2.0-setup-x64.exe` — recommended installer;
+- `Agentic Translating-0.2.0-portable-x64.exe` — portable version that runs without installation.
 
 The first startup creates local application data. Upgrading does not delete translation history or custom agents. Before removing an endpoint, the application now shows every live and historical reference and can detach active bindings without deleting agent definitions.
 
@@ -97,6 +97,8 @@ Windows packaging:
 ```bash
 npm run package:win
 ```
+
+When working from source, `npm run desktop` starts Electron and a managed Next.js development server directly; it does not require a production build. Its cache is isolated in `.next-electron-dev`, while `npm run dev` uses `.next-web-dev`, so the two development entry points do not mutate each other's output. To inspect the production standalone tree before packaging, first run `npm run build:standalone`, then run `npm run desktop:preview`. Preview never starts an implicit build and reports an actionable error when `.next/standalone/server.js` is absent.
 
 Output goes to the `dist-electron/` directory. Both an NSIS installer and a portable build are generated. Desktop data is stored in the Electron `userData` directory. Keys are protected by a local master key wrapped with `safeStorage`.
 
@@ -155,13 +157,15 @@ regression; core model-flow verification can run entirely from the CLI.
 
 The built-in product concentrates on difficult general translation and poetry-related work. Users can add their own agents and prompt packs for other domains. Batch input currently supports UTF-8 `.txt` and `.md` files. EPUB support is intentionally deferred: a future implementation should evaluate a mature, appropriately licensed parser and round-trip pipeline instead of rebuilding the format from scratch.
 
-Version 0.1.2 has passed 911 Vitest checks, TypeScript validation, a standalone production smoke test, and 21 active Playwright workflows; 13 legacy manual-workflow fixtures are explicitly skipped because v3 orchestration supersedes them. These engineering checks do not claim that FSBP has already proved superior translation quality on a formal unseen evaluation set.
+Version 0.2.0 has passed 1,180 Vitest checks in 119 files, TypeScript validation, a standalone production smoke test through migration 18, and 17 focused browser workflows covering bidirectional drafts and responsive internationalization. The source-development and packaged-preview Electron paths were also exercised through first-launch, persistence, modal, narrow-screen, history, and export-entry journeys. These engineering checks do not turn the development evaluation batch into a formal unseen experiment or prove that an individual component caused the observed quality difference.
 
 ## Development Commands
 
 | Command | Description |
 |---|---|
 | `npm run dev` | Start development server |
+| `npm run desktop` | Start the source desktop with a managed Next.js dev server |
+| `npm run desktop:preview` | Open an existing `.next/standalone` desktop preview; never builds implicitly |
 | `npm run typecheck` | TypeScript type checking |
 | `npm test` | Run Vitest tests |
 | `npm run build` | Next.js production build |

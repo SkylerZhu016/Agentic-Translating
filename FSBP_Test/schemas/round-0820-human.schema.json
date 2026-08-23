@@ -1,0 +1,226 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentic-translating.local/schemas/round-0820-human.schema.json",
+  "title": "Round 0820 Blinded Human Review Record",
+  "oneOf": [
+    { "$ref": "#/$defs/quality" },
+    { "$ref": "#/$defs/isolation" }
+  ],
+  "$defs": {
+    "hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "base": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "namespace",
+        "packetId",
+        "packetHash",
+        "kind",
+        "reviewerType",
+        "reviewerId",
+        "itemId",
+        "confidence",
+        "rationale"
+      ],
+      "properties": {
+        "schemaVersion": { "const": "1.0.0" },
+        "namespace": { "const": "fsbp" },
+        "packetId": { "type": "string", "minLength": 1 },
+        "packetHash": { "$ref": "#/$defs/hash" },
+        "reviewerType": { "const": "human" },
+        "reviewerId": { "enum": ["reviewer-A", "reviewer-B", "reviewer-C"] },
+        "itemId": { "type": "string", "minLength": 1 },
+        "confidence": { "enum": ["high", "medium", "low"] },
+        "rationale": { "type": "string", "minLength": 1 },
+        "unableToJudge": { "type": "boolean" }
+      }
+    },
+    "score": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fidelity",
+        "naturalness",
+        "style_voice",
+        "structure_form",
+        "terminology_logic",
+        "overall_quality"
+      ],
+      "properties": {
+        "fidelity": { "anyOf": [{ "type": "integer", "minimum": 1, "maximum": 10 }, { "type": "null" }] },
+        "naturalness": { "anyOf": [{ "type": "integer", "minimum": 1, "maximum": 10 }, { "type": "null" }] },
+        "style_voice": { "anyOf": [{ "type": "integer", "minimum": 1, "maximum": 10 }, { "type": "null" }] },
+        "structure_form": { "anyOf": [{ "type": "integer", "minimum": 1, "maximum": 10 }, { "type": "null" }] },
+        "terminology_logic": {
+          "anyOf": [
+            { "type": "integer", "minimum": 1, "maximum": 10 },
+            { "type": "null" }
+          ]
+        },
+        "overall_quality": { "anyOf": [{ "type": "integer", "minimum": 1, "maximum": 10 }, { "type": "null" }] }
+      }
+    },
+    "scorableScore": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fidelity",
+        "naturalness",
+        "style_voice",
+        "structure_form",
+        "terminology_logic",
+        "overall_quality"
+      ],
+      "properties": {
+        "fidelity": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "naturalness": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "style_voice": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "structure_form": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "terminology_logic": {
+          "anyOf": [
+            { "type": "integer", "minimum": 1, "maximum": 10 },
+            { "type": "null" }
+          ]
+        },
+        "overall_quality": { "type": "integer", "minimum": 1, "maximum": 10 }
+      }
+    },
+    "unableToJudgeScore": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fidelity",
+        "naturalness",
+        "style_voice",
+        "structure_form",
+        "terminology_logic",
+        "overall_quality"
+      ],
+      "properties": {
+        "fidelity": { "type": "null" },
+        "naturalness": { "type": "null" },
+        "style_voice": { "type": "null" },
+        "structure_form": { "type": "null" },
+        "terminology_logic": { "type": "null" },
+        "overall_quality": { "type": "null" }
+      }
+    },
+    "severeError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate", "location", "category", "severity", "evidence"],
+      "properties": {
+        "candidate": { "type": "string", "pattern": "^[A-C]$" },
+        "location": { "type": "string", "minLength": 1 },
+        "category": { "type": "string", "minLength": 1 },
+        "severity": { "enum": ["major", "critical"] },
+        "evidence": { "type": "string", "minLength": 1 }
+      }
+    },
+    "quality": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["candidateScores", "ranking", "severeErrors", "revisionNeeded"],
+          "properties": {
+            "schemaVersion": true,
+            "namespace": true,
+            "packetId": true,
+            "packetHash": true,
+            "reviewerType": true,
+            "reviewerId": true,
+            "itemId": true,
+            "confidence": true,
+            "rationale": true,
+            "unableToJudge": true,
+            "kind": { "const": "quality" },
+            "candidateScores": {
+              "type": "object",
+              "minProperties": 2,
+              "maxProperties": 3,
+              "propertyNames": { "pattern": "^[A-C]$" },
+              "additionalProperties": { "$ref": "#/$defs/score" }
+            },
+            "ranking": {
+              "type": "array",
+              "minItems": 0,
+              "items": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": { "type": "string", "pattern": "^[A-C]$" }
+              }
+            },
+            "severeErrors": { "type": "array", "items": { "$ref": "#/$defs/severeError" } },
+            "revisionNeeded": {
+              "type": "object",
+              "minProperties": 2,
+              "maxProperties": 3,
+              "propertyNames": { "pattern": "^[A-C]$" },
+              "additionalProperties": { "type": ["boolean", "null"] }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["unableToJudge"],
+            "properties": { "unableToJudge": { "const": true } }
+          },
+          "then": {
+            "properties": {
+              "candidateScores": {
+                "additionalProperties": { "$ref": "#/$defs/unableToJudgeScore" }
+              },
+              "ranking": { "maxItems": 0 },
+              "severeErrors": { "maxItems": 0 },
+              "revisionNeeded": { "additionalProperties": { "type": "null" } },
+              "confidence": { "const": "low" }
+            }
+          },
+          "else": {
+            "properties": {
+              "candidateScores": {
+                "additionalProperties": { "$ref": "#/$defs/scorableScore" }
+              },
+              "revisionNeeded": { "additionalProperties": { "type": "boolean" } }
+            }
+          }
+        }
+      ]
+    },
+    "isolation": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["targetedErrorConfirmed", "outcomes"],
+          "properties": {
+            "schemaVersion": true,
+            "namespace": true,
+            "packetId": true,
+            "packetHash": true,
+            "reviewerType": true,
+            "reviewerId": true,
+            "itemId": true,
+            "confidence": true,
+            "rationale": true,
+            "unableToJudge": true,
+            "kind": { "const": "isolation" },
+            "targetedErrorConfirmed": { "type": "boolean" },
+            "outcomes": {
+              "type": "object",
+              "minProperties": 2,
+              "maxProperties": 2,
+              "additionalProperties": {
+                "enum": ["corrected", "rejected", "retained", "amplified", "unclear"]
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

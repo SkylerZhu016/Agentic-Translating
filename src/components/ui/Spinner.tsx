@@ -1,4 +1,7 @@
+'use client'
+
 import type { HTMLAttributes } from 'react'
+import { useI18n } from '@/src/i18n/LocaleProvider'
 
 // ---------------------------------------------------------------------------
 // Spinner — 墨弧加载指示（currentColor，随上下文着色）
@@ -19,12 +22,13 @@ const sizeClass: Record<SpinnerSize, string> = {
 }
 
 export function Spinner({ size = 'md', testId, className = '', ...rest }: SpinnerProps) {
+  const { t } = useI18n()
   return (
     <svg
       viewBox="0 0 24 24"
       fill="none"
       role="status"
-      aria-label="加载中"
+      aria-label={t('ui.spinner.loading')}
       data-testid={testId}
       className={['animate-spin text-current', sizeClass[size], className].join(' ')}
       {...rest}

@@ -15,10 +15,15 @@
  *   - Batch transactional: one edit fails → rollback + error injection
  */
 
-import { describe, it, expect, afterEach, beforeEach, beforeAll } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach, beforeAll, vi } from 'vitest';
 import http from 'http';
+import Database from 'better-sqlite3';
 import { startMockLLM, type MockLLMInstance } from '../fixtures/mock-llm';
 import type { ChatTurnResult } from '../../src/lib/chat/tool-loop';
+import { migrate } from '../../src/lib/db/migrate';
+import { createTranslationToolRepository } from '../../src/lib/db/translation-tool-repository';
+import { createTranslationToolRuntime } from '../../src/lib/orchestration/translation-tool-runtime';
+import { TRANSLATION_DOMAIN_TOOL_DEFINITIONS } from '../../src/lib/orchestration/translation-tools';
 
 // ---------------------------------------------------------------------------
 // Type narrowing helpers
@@ -945,6 +950,121 @@ describe('runChatTurn', () => {
   // =========================================================================
 
   describe('edge cases', () => {
+    it('does not forward a review-provider credential in the next editing-provider request', async () => {
+      const reviewKey = 'CURRENT-REVIEW-PROVIDER-KEY-SENTINEL-762194';
+      let secondRequest: Record<string, unknown> | null = null;
+      const server = await startRoundServer((round, body) => {
+        if (round === 1) {
+          return {
+            status: 200,
+            body: {
+              id: 'chatcmpl-review-tool',
+              object: 'chat.completion',
+              created: Math.floor(Date.now() / 1000),
+              model: 'editing-model',
+              choices: [{
+                index: 0,
+                message: {
+                  role: 'assistant',
+                  content: 'I will request a bounded review.',
+                  tool_calls: [{
+                    id: 'call_review', type: 'function',
+                    function: {
+                      name: 'request_review',
+                      arguments: JSON.stringify({
+                        segment: 'Current exact translation.',
+                        question: 'Check the subject.',
+                        evidenceIds: ['evidence-1'],
+                      }),
+                    },
+                  }],
+                },
+                finish_reason: 'tool_calls',
+              }],
+              usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+            },
+          };
+        }
+        secondRequest = body;
+        return {
+          status: 200,
+          body: {
+            id: 'chatcmpl-after-review-failure',
+            object: 'chat.completion',
+            created: Math.floor(Date.now() / 1000),
+            model: 'editing-model',
+            choices: [{
+              index: 0,
+              message: { role: 'assistant', content: 'The review was unavailable.' },
+              finish_reason: 'stop',
+            }],
+            usage: { prompt_tokens: 15, completion_tokens: 5, total_tokens: 20 },
+          },
+        };
+      });
+      const db = new Database(':memory:');
+      try {
+        migrate(db);
+        db.prepare(`
+          INSERT INTO sessions (id, source_text, config_snapshot)
+          VALUES ('cross-provider-session', 'source', '{}')
+        `).run();
+        db.prepare(`
+          INSERT INTO orchestration_runs (id, session_id, status, phase)
+          VALUES ('cross-provider-run', 'cross-provider-session', 'running', 'edit')
+        `).run();
+        db.prepare('UPDATE endpoints SET api_key=? WHERE id=1').run(reviewKey);
+        const repository = createTranslationToolRepository(db);
+        const domainRuntime = createTranslationToolRuntime({
+          repository,
+          handlers: {
+            inspectEvidence: () => [],
+            searchProjectMemory: () => ({ items: [] }),
+            requestReview: () => {
+              throw new Error(`review rejected Authorization: Bearer ${reviewKey}`);
+            },
+          },
+        });
+
+        const result = await runChatTurn({
+          endpoint: { baseUrl: server.url, apiKey: 'editing-provider-key' },
+          model: 'editing-model',
+          messages: makeMessages(),
+          currentText: 'Current exact translation.',
+          tools: [...TRANSLATION_DOMAIN_TOOL_DEFINITIONS],
+          domainRuntime,
+          domainContext: {
+            sessionId: 'cross-provider-session',
+            runId: 'cross-provider-run',
+            invocationId: null,
+            parentToolCallId: null,
+            stage: 'edit',
+            actor: 'main_agent',
+            depth: 0,
+            allowedInheritanceMode: 'body_only',
+            knownEvidenceIds: ['evidence-1'],
+            baseVersion: { id: 1, text: 'Current exact translation.' },
+            providerSeed: null,
+            determinismLevel: 'provider_default',
+          },
+          stream: false,
+        });
+
+        expect(okMsg(result).text).toContain('review was unavailable');
+        expect(secondRequest).not.toBeNull();
+        expect(JSON.stringify(secondRequest)).not.toContain(reviewKey);
+        expect(JSON.stringify(secondRequest)).toContain('[REDACTED_CREDENTIAL]');
+        const persisted = db.prepare(`
+          SELECT error_message FROM agent_tool_calls
+          WHERE session_id='cross-provider-session'
+        `).get() as { error_message: string };
+        expect(persisted.error_message).not.toContain(reviewKey);
+      } finally {
+        db.close();
+        await server.close();
+      }
+    });
+
     it('rejects mixed programming and translation tools before applying side effects', async () => {
       const server = await startRoundServer(() => ({
         status: 200,
@@ -1093,6 +1213,273 @@ describe('runChatTurn', () => {
         expect(r.newText).toBe('hi world');
         expect(server.requestCount()).toBe(2);
       } finally {
+        await server.close();
+      }
+    });
+
+    it('valid and malformed replace_text calls reject the whole batch before self-correction', async () => {
+      const server = await startRoundServer((round, body) => {
+        if (round === 1) {
+          return {
+            status: 200,
+            body: {
+              id: 'chatcmpl-mixed-edit-validity',
+              object: 'chat.completion',
+              created: Math.floor(Date.now() / 1000),
+              model: 'test-model',
+              choices: [{
+                index: 0,
+                message: {
+                  role: 'assistant',
+                  content: 'Applying an edit batch.',
+                  tool_calls: [
+                    {
+                      id: 'call_valid', type: 'function',
+                      function: {
+                        name: 'replace_text',
+                        arguments: JSON.stringify({
+                          old_string: 'hello',
+                          new_string: 'partially-applied',
+                        }),
+                      },
+                    },
+                    {
+                      id: 'call_bad_json', type: 'function',
+                      function: { name: 'replace_text', arguments: '{broken json' },
+                    },
+                    {
+                      id: 'call_bad_shape', type: 'function',
+                      function: {
+                        name: 'replace_text',
+                        arguments: JSON.stringify({ old_string: 'world' }),
+                      },
+                    },
+                  ],
+                },
+                finish_reason: 'tool_calls',
+              }],
+              usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+            },
+          };
+        }
+
+        const messages = (body.messages as Array<{
+          role: string;
+          tool_call_id?: string;
+          content?: string;
+        }>) ?? [];
+        expect(messages).toEqual(expect.arrayContaining([
+          expect.objectContaining({
+            role: 'tool',
+            tool_call_id: 'call_valid',
+            content: expect.stringContaining('entire edit batch was rejected'),
+          }),
+          expect.objectContaining({
+            role: 'tool',
+            tool_call_id: 'call_bad_json',
+            content: expect.stringContaining('invalid JSON arguments'),
+          }),
+          expect.objectContaining({
+            role: 'tool',
+            tool_call_id: 'call_bad_shape',
+            content: expect.stringContaining('"new_string" must be a string'),
+          }),
+        ]));
+
+        return {
+          status: 200,
+          body: {
+            id: 'chatcmpl-corrected-batch',
+            object: 'chat.completion',
+            created: Math.floor(Date.now() / 1000),
+            model: 'test-model',
+            choices: [{
+              index: 0,
+              message: {
+                role: 'assistant',
+                content: 'Applying the corrected edit only.',
+                tool_calls: [{
+                  id: 'call_corrected', type: 'function',
+                  function: {
+                    name: 'replace_text',
+                    arguments: JSON.stringify({
+                      old_string: 'hello',
+                      new_string: 'hi',
+                    }),
+                  },
+                }],
+              },
+              finish_reason: 'tool_calls',
+            }],
+            usage: { prompt_tokens: 15, completion_tokens: 8, total_tokens: 23 },
+          },
+        };
+      });
+
+      try {
+        const result = await runChatTurn({
+          endpoint: { baseUrl: server.url, apiKey: 'sk-test' },
+          model: 'test-model',
+          messages: makeMessages(),
+          currentText: 'hello world',
+        });
+
+        const edited = okEdit(result);
+        expect(edited.newText).toBe('hi world');
+        expect(edited.newText).not.toContain('partially-applied');
+        expect(server.requestCount()).toBe(2);
+      } finally {
+        await server.close();
+      }
+    });
+
+    it('atomically traces a malformed replace_text batch through the domain runtime', async () => {
+      const providerCallIds = [
+        'provider-valid-edit',
+        'provider-bad-json',
+        'provider-bad-shape',
+      ];
+      const server = await startRoundServer((round, body) => {
+        if (round === 1) {
+          return {
+            status: 200,
+            body: {
+              choices: [{
+                message: {
+                  role: 'assistant',
+                  content: 'Attempting a traced batch.',
+                  tool_calls: [
+                    {
+                      id: providerCallIds[0], type: 'function',
+                      function: {
+                        name: 'replace_text',
+                        arguments: JSON.stringify({
+                          old_string: 'hello',
+                          new_string: 'must-not-run',
+                        }),
+                      },
+                    },
+                    {
+                      id: providerCallIds[1], type: 'function',
+                      function: { name: 'replace_text', arguments: '{broken' },
+                    },
+                    {
+                      id: providerCallIds[2], type: 'function',
+                      function: {
+                        name: 'replace_text',
+                        arguments: JSON.stringify({ old_string: 'world' }),
+                      },
+                    },
+                  ],
+                },
+                finish_reason: 'tool_calls',
+              }],
+            },
+          };
+        }
+
+        const messages = (body.messages as Array<{
+          role: string;
+          tool_call_id?: string;
+        }>) ?? [];
+        expect(messages.filter((message) => message.role === 'tool'))
+          .toHaveLength(3);
+        return {
+          status: 200,
+          body: {
+            choices: [{
+              message: {
+                role: 'assistant',
+                content: 'I will leave the text unchanged.',
+              },
+              finish_reason: 'stop',
+            }],
+          },
+        };
+      });
+      const db = new Database(':memory:');
+      try {
+        migrate(db);
+        db.prepare(`
+          INSERT INTO sessions (id, source_text, config_snapshot)
+          VALUES ('rejected-batch-session', 'source', '{}')
+        `).run();
+        db.prepare(`
+          INSERT INTO orchestration_runs (id, session_id, status, phase)
+          VALUES ('rejected-batch-run', 'rejected-batch-session', 'running', 'edit')
+        `).run();
+        const repository = createTranslationToolRepository(db);
+        const domainRuntime = createTranslationToolRuntime({
+          repository,
+          handlers: {
+            inspectEvidence: () => [],
+            searchProjectMemory: () => ({ items: [] }),
+            requestReview: () => {
+              throw new Error('not used');
+            },
+          },
+        });
+        const executeSpy = vi.spyOn(domainRuntime, 'execute');
+        const executeBatchSpy = vi.spyOn(domainRuntime, 'executeReplaceTextBatch');
+        const rejectBatchSpy = vi.spyOn(domainRuntime, 'rejectReplaceTextBatch');
+        const callbacks: Array<{
+          name: string;
+          ok: boolean;
+          payload: unknown;
+          callId: string;
+        }> = [];
+
+        const result = await runChatTurn({
+          endpoint: { baseUrl: server.url, apiKey: 'sk-test' },
+          model: 'test-model',
+          messages: makeMessages(),
+          currentText: 'hello world',
+          domainRuntime,
+          domainContext: {
+            sessionId: 'rejected-batch-session',
+            runId: 'rejected-batch-run',
+            invocationId: null,
+            parentToolCallId: null,
+            stage: 'edit',
+            actor: 'main_agent',
+            depth: 0,
+            allowedInheritanceMode: 'body_only',
+            knownEvidenceIds: [],
+            baseVersion: { id: 1, text: 'hello world' },
+            providerSeed: null,
+            determinismLevel: 'provider_default',
+          },
+          callbacks: {
+            onDomainToolResult: (name, ok, payload, callId) => {
+              callbacks.push({ name, ok, payload, callId });
+            },
+          },
+          stream: false,
+        });
+
+        expect(okMsg(result).text).toContain('unchanged');
+        expect(rejectBatchSpy).toHaveBeenCalledTimes(1);
+        expect(executeSpy).not.toHaveBeenCalled();
+        expect(executeBatchSpy).not.toHaveBeenCalled();
+        const traces = repository.listCalls({ sessionId: 'rejected-batch-session' });
+        expect(traces).toHaveLength(3);
+        expect(traces.map((trace) => ({
+          status: trace.status,
+          errorCode: trace.errorCode,
+          providerToolCallId: trace.providerToolCallId,
+        }))).toEqual(expect.arrayContaining(providerCallIds.map((providerToolCallId) => ({
+          status: 'failed',
+          errorCode: 'not_attempted',
+          providerToolCallId,
+        }))));
+        expect(callbacks).toEqual(providerCallIds.map((callId) => ({
+          name: 'replace_text',
+          ok: false,
+          payload: expect.objectContaining({ code: 'not_attempted' }),
+          callId,
+        })));
+      } finally {
+        db.close();
         await server.close();
       }
     });

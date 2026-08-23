@@ -1,10 +1,18 @@
 import Database from 'better-sqlite3'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { migrate } from '../../src/lib/db/migrate'
 import {
   startVNextDraftRegeneration,
   waitForVNextRunsToSettle,
 } from '../../src/lib/orchestration/vnext-runner'
+
+vi.mock('../../src/lib/llm/client', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/lib/llm/client')>()
+  return {
+    ...actual,
+    chatCompletion: vi.fn().mockResolvedValue({ content: 'Fixture draft' }),
+  }
+})
 
 const sessionId = 'checkpoint-order-session'
 const sourceRunId = 'checkpoint-order-source-run'
@@ -33,9 +41,10 @@ function candidateSnapshot(id: string, catalogName: string, sortOrder: number) {
 
 function frozenConfigSnapshot() {
   const binding = {
-    endpointId: null,
-    model: '',
-    contextWindow: null,
+    endpointId: 1,
+    model: 'fixture-model',
+    contextWindow: 128_000,
+    maxOutputTokens: 4_096,
   }
   const candidates = [
     candidateSnapshot('candidate-a', 'Candidate A', 0),
@@ -58,10 +67,22 @@ function frozenConfigSnapshot() {
       version: 1,
     },
     agentVariantSnapshots: candidates,
-    endpointSnapshots: [],
+    endpointSnapshots: [{
+      id: 1,
+      name: 'fixture',
+      baseUrl: 'https://fixture.invalid',
+      chatCompletionsPath: '/v1/chat/completions',
+      apiKey: 'fixture-secret',
+      hasApiKey: true,
+      contextWindow: 128_000,
+    }],
     modelBindings: {
       defaultWorker: binding,
       mainAgent: binding,
+      reviewAgent: binding,
+      filterAgent: binding,
+      orchestrateAgent: binding,
+      assembleAgent: binding,
       editingAgent: binding,
     },
     presetRevisionSnapshot: {
@@ -123,6 +144,10 @@ describe('vNext invocation checkpoint ordering', () => {
     db = new Database(':memory:')
     db.pragma('foreign_keys = ON')
     migrate(db)
+    db.prepare(`
+      INSERT INTO endpoints (id, name, base_url, api_key)
+      VALUES (1, 'current-fixture', 'https://current.invalid', 'fixture-current-key')
+    `).run()
 
     db.prepare(`
       INSERT INTO sessions (

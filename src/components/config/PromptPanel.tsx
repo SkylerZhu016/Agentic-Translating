@@ -9,41 +9,46 @@ import { useEffect, useMemo, useState } from 'react'
 import { Badge, Button, Card, Input, Modal, Spinner, Textarea } from '@/src/components/ui'
 import { configApi, isApiError, type PromptKind, type PromptTemplate } from './api'
 import { Field, type NotifyFn } from './shared'
+import {
+  localizeDiagnosticError,
+  useI18n,
+  type MessageKeyWithoutValues,
+} from '@/src/i18n'
 
-const KINDS: { kind: PromptKind; label: string }[] = [
-  { kind: 'translator', label: '翻译默认' },
-  { kind: 'review', label: '审查' },
-  { kind: 'filter', label: '筛选' },
-  { kind: 'orchestrate', label: '编排' },
-  { kind: 'assemble', label: '组装' },
+const KINDS: { kind: PromptKind; labelKey: MessageKeyWithoutValues }[] = [
+  { kind: 'translator', labelKey: 'legacy.prompt.kind.translator' },
+  { kind: 'review', labelKey: 'legacy.prompt.kind.review' },
+  { kind: 'filter', labelKey: 'legacy.prompt.kind.filter' },
+  { kind: 'orchestrate', labelKey: 'legacy.prompt.kind.orchestrate' },
+  { kind: 'assemble', labelKey: 'legacy.prompt.kind.assemble' },
 ]
 
-const VAR_DOCS: Record<PromptKind, { name: string; desc: string }[]> = {
+const VAR_DOCS: Record<PromptKind, { name: string; descKey: MessageKeyWithoutValues }[]> = {
   translator: [
-    { name: '{{source_lang}}', desc: '原文语言（如 英文）' },
-    { name: '{{target_lang}}', desc: '目标语言（如 中文）' },
-    { name: '{{source_text}}', desc: '待翻译的原文全文' },
-    { name: '{{extra_instructions}}', desc: '附加指令，可为空' },
+    { name: '{{source_lang}}', descKey: 'legacy.prompt.var.sourceLang' },
+    { name: '{{target_lang}}', descKey: 'legacy.prompt.var.targetLang' },
+    { name: '{{source_text}}', descKey: 'legacy.prompt.var.sourceText' },
+    { name: '{{extra_instructions}}', descKey: 'legacy.prompt.var.extraInstructions' },
   ],
   review: [
-    { name: '{{source_text}}', desc: '原文全文' },
-    { name: '{{target_lang}}', desc: '目标语言' },
-    { name: '{{translations}}', desc: '各 Agent 译稿集合' },
+    { name: '{{source_text}}', descKey: 'legacy.prompt.var.sourceTextShort' },
+    { name: '{{target_lang}}', descKey: 'legacy.prompt.var.targetLangShort' },
+    { name: '{{translations}}', descKey: 'legacy.prompt.var.translations' },
   ],
   filter: [
-    { name: '{{source_text}}', desc: '原文全文' },
-    { name: '{{review_output}}', desc: '审查阶段正文（不含注释）' },
+    { name: '{{source_text}}', descKey: 'legacy.prompt.var.sourceTextShort' },
+    { name: '{{review_output}}', descKey: 'legacy.prompt.var.reviewOutput' },
   ],
   orchestrate: [
-    { name: '{{source_text}}', desc: '原文全文' },
-    { name: '{{selected_translations}}', desc: '入选译稿全文' },
-    { name: '{{review_output}}', desc: '审查阶段正文（不含注释）' },
-    { name: '{{filter_output}}', desc: '筛选阶段正文（不含注释）' },
+    { name: '{{source_text}}', descKey: 'legacy.prompt.var.sourceTextShort' },
+    { name: '{{selected_translations}}', descKey: 'legacy.prompt.var.selectedTranslations' },
+    { name: '{{review_output}}', descKey: 'legacy.prompt.var.reviewOutput' },
+    { name: '{{filter_output}}', descKey: 'legacy.prompt.var.filterOutput' },
   ],
   assemble: [
-    { name: '{{source_text}}', desc: '原文全文' },
-    { name: '{{orchestrate_output}}', desc: '编排阶段正文（不含注释）' },
-    { name: '{{selected_translations}}', desc: '入选译稿全文' },
+    { name: '{{source_text}}', descKey: 'legacy.prompt.var.sourceTextShort' },
+    { name: '{{orchestrate_output}}', descKey: 'legacy.prompt.var.orchestrateOutput' },
+    { name: '{{selected_translations}}', descKey: 'legacy.prompt.var.selectedTranslations' },
   ],
 }
 
@@ -54,6 +59,7 @@ export interface PromptPanelProps {
 }
 
 export function PromptPanel({ prompts, notify, onChanged }: PromptPanelProps) {
+  const { t } = useI18n()
   const [activeKind, setActiveKind] = useState<PromptKind>('translator')
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [name, setName] = useState('')
@@ -104,7 +110,7 @@ export function PromptPanel({ prompts, notify, onChanged }: PromptPanelProps) {
   async function save() {
     if (selected == null) return
     if (name.trim().length === 0 || content.trim().length === 0) {
-      setError('名称与内容均不能为空')
+      setError(t('legacy.prompt.error.required'))
       return
     }
     setError(null)
@@ -115,8 +121,8 @@ export function PromptPanel({ prompts, notify, onChanged }: PromptPanelProps) {
         content,
       })
       const copied = res.id !== selected.id
-      notify(copied ? '已另存为自定义副本' : '提示词已保存', {
-        message: copied ? '内置模板保持不变，后续将使用自定义副本。' : undefined,
+      notify(copied ? t('legacy.prompt.savedCopy') : t('legacy.prompt.saved'), {
+        message: copied ? t('legacy.prompt.savedCopyDetail') : undefined,
         tone: 'inverted',
       })
       await onChanged()
@@ -125,7 +131,11 @@ export function PromptPanel({ prompts, notify, onChanged }: PromptPanelProps) {
       setContent(res.content)
       setDirty(false)
     } catch (e) {
-      notify('保存失败', { message: isApiError(e) ? e.message : '网络错误，请重试' })
+      notify(t('config.error.save'), {
+        message: isApiError(e)
+          ? localizeDiagnosticError(t, e.payload, t('config.error.tryLater'))
+          : t('config.error.networkRetry'),
+      })
     } finally {
       setSaving(false)
     }
@@ -135,14 +145,18 @@ export function PromptPanel({ prompts, notify, onChanged }: PromptPanelProps) {
     setResetting(true)
     try {
       await configApi.resetPrompts()
-      notify('已恢复内置默认提示词', {
-        message: '全部自定义副本已删除。',
+      notify(t('legacy.prompt.resetDone'), {
+        message: t('legacy.prompt.resetDoneDetail'),
         tone: 'inverted',
       })
       setResetOpen(false)
       await onChanged()
     } catch (e) {
-      notify('恢复失败', { message: isApiError(e) ? e.message : '网络错误，请重试' })
+      notify(t('legacy.prompt.resetFailed'), {
+        message: isApiError(e)
+          ? localizeDiagnosticError(t, e.payload, t('config.error.tryLater'))
+          : t('config.error.networkRetry'),
+      })
       setResetOpen(false)
     } finally {
       setResetting(false)
@@ -151,17 +165,17 @@ export function PromptPanel({ prompts, notify, onChanged }: PromptPanelProps) {
 
   return (
     <Card
-      overline="Prompts"
-      title="提示词"
+      overline={t('legacy.prompt.overline')}
+      title={t('legacy.prompt.title')}
       actions={
         <Button variant="outline" size="sm" onClick={() => setResetOpen(true)}>
-          恢复内置默认
+          {t('legacy.prompt.reset')}
         </Button>
       }
     >
       {/* kind 选项卡 */}
-      <div role="tablist" aria-label="提示词类别" className="flex flex-wrap gap-1.5">
-        {KINDS.map(({ kind, label }) => (
+      <div role="tablist" aria-label={t('legacy.prompt.categoryAria')} className="flex flex-wrap gap-1.5">
+        {KINDS.map(({ kind, labelKey }) => (
           <button
             key={kind}
             type="button"
@@ -175,23 +189,25 @@ export function PromptPanel({ prompts, notify, onChanged }: PromptPanelProps) {
                 : 'text-ink-2 hover:bg-paper-sink hover:text-ink',
             ].join(' ')}
           >
-            {label}
+            {t(labelKey)}
           </button>
         ))}
       </div>
 
       {/* 模板筹码（内置 + 自定义副本） */}
       <div className="mt-3 flex flex-wrap items-center gap-1.5">
-        {kindList.map((t) => (
+        {kindList.map((template) => (
           <Button
-            key={t.id}
-            variant={t.id === selectedId ? 'primary' : 'outline'}
+            key={template.id}
+            variant={template.id === selectedId ? 'primary' : 'outline'}
             size="sm"
-            onClick={() => selectTemplate(t)}
+            onClick={() => selectTemplate(template)}
           >
-            {t.name}
-            <Badge variant={t.id === selectedId ? 'solid' : 'subtle'} className="ml-1">
-              {t.is_builtin === 1 ? '内置' : '自定义'}
+            {template.name}
+            <Badge variant={template.id === selectedId ? 'solid' : 'subtle'} className="ml-1">
+              {template.is_builtin === 1
+                ? t('legacy.prompt.builtin')
+                : t('legacy.prompt.custom')}
             </Badge>
           </Button>
         ))}
@@ -201,15 +217,15 @@ export function PromptPanel({ prompts, notify, onChanged }: PromptPanelProps) {
         <div className="mt-4">
           {selected.is_builtin === 1 && (
             <p className="mb-3 rounded-sm border border-dashed border-line-2 bg-paper-sink/60 px-3 py-2 text-xs leading-5 text-ink-2">
-              当前为内置模板，不可直接修改；保存时将另存为自定义副本，原内置模板保持不变。
+              {t('legacy.prompt.builtinHint')}
             </p>
           )}
 
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-[1fr_11rem]">
             <div className="space-y-3">
-              <Field label="模板名称">
+              <Field label={t('legacy.prompt.templateName')}>
                 <Input
-                  aria-label="模板名称"
+                  aria-label={t('legacy.prompt.templateName')}
                   value={name}
                   onChange={(e) => {
                     setName(e.target.value)
@@ -217,9 +233,9 @@ export function PromptPanel({ prompts, notify, onChanged }: PromptPanelProps) {
                   }}
                 />
               </Field>
-              <Field label="模板内容" error={error}>
+              <Field label={t('legacy.prompt.templateContent')} error={error}>
                 <Textarea
-                  aria-label="模板内容"
+                  aria-label={t('legacy.prompt.templateContent')}
                   rows={14}
                   value={content}
                   onChange={(e) => {
@@ -233,19 +249,19 @@ export function PromptPanel({ prompts, notify, onChanged }: PromptPanelProps) {
               <div className="flex justify-end">
                 <Button size="sm" onClick={() => void save()} disabled={saving || !dirty}>
                   {saving && <Spinner size="sm" />}
-                  保存
+                  {t('common.save')}
                 </Button>
               </div>
             </div>
 
             {/* 变量说明侧注 */}
             <aside className="rounded-sm border border-line bg-paper px-3 py-3">
-              <p className="overline-label">可用变量</p>
+              <p className="overline-label">{t('legacy.prompt.variables')}</p>
               <dl className="mt-2 space-y-2.5">
                 {VAR_DOCS[activeKind].map((v) => (
                   <div key={v.name}>
                     <dt className="font-mono text-xs text-ink">{v.name}</dt>
-                    <dd className="mt-0.5 text-xs leading-5 text-ink-3">{v.desc}</dd>
+                    <dd className="mt-0.5 text-xs leading-5 text-ink-3">{t(v.descKey)}</dd>
                   </div>
                 ))}
               </dl>
@@ -253,28 +269,28 @@ export function PromptPanel({ prompts, notify, onChanged }: PromptPanelProps) {
           </div>
         </div>
       ) : (
-        <p className="mt-4 text-sm text-ink-3">该类别下暂无模板，可点击「恢复内置默认」生成。</p>
+        <p className="mt-4 text-sm text-ink-3">{t('legacy.prompt.empty')}</p>
       )}
 
       {/* 恢复内置默认确认 */}
       <Modal
         open={resetOpen}
         onClose={() => setResetOpen(false)}
-        title="恢复内置默认"
+        title={t('legacy.prompt.reset')}
         footer={
           <>
             <Button variant="ghost" size="sm" onClick={() => setResetOpen(false)}>
-              取消
+              {t('common.cancel')}
             </Button>
             <Button size="sm" onClick={() => void confirmReset()} disabled={resetting}>
               {resetting && <Spinner size="sm" />}
-              确认恢复
+              {t('legacy.prompt.resetConfirm')}
             </Button>
           </>
         }
       >
         <p className="text-sm leading-6 text-ink-2">
-          将删除全部 5 类提示词的自定义副本，并恢复为内置默认模板。此操作不可撤销，确定继续吗？
+          {t('legacy.prompt.resetDescription')}
         </p>
       </Modal>
     </Card>

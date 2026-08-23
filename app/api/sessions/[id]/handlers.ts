@@ -15,6 +15,7 @@ import { checkTranslationEvidence } from '@/src/lib/evidence/checker'
 import type { ConfigSnapshot } from '@/src/lib/contracts/types'
 import { createProjectRepositories } from '@/src/lib/db/project-repositories'
 import { publicPersistedExecutionError } from '@/src/lib/security/diagnostic-error'
+import { redactCredentialValueForDb } from '@/src/lib/security/credential-redaction'
 
 export function createHandlers(db: Database.Database) {
   const repos = createRepositories(db)
@@ -162,6 +163,7 @@ export function createHandlers(db: Database.Database) {
             direction:
               full.session.direction === 'zh_to_en' ? 'zh_to_en' : 'en_to_zh',
             sourceText: full.session.source_text,
+            taskBrief: full.session.task_brief,
             translatedText: finalVersion.text,
             constraints: snapshot.constraints,
           })
@@ -171,7 +173,7 @@ export function createHandlers(db: Database.Database) {
       }
 
       return NextResponse.json(
-        {
+        redactSecrets(redactCredentialValueForDb(db, {
           session: toPublicSessionDto(full.session),
           projectContext: redactSecrets(projectContext),
           results: publicResults,
@@ -187,7 +189,7 @@ export function createHandlers(db: Database.Database) {
           events,
           final_evidence: finalEvidence,
           latest_version_no: latestVersionNo,
-        },
+        })),
         { status: 200 },
       )
     },

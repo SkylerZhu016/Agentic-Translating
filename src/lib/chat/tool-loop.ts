@@ -23,6 +23,11 @@ import {
   ledgeredChatCompletion,
   type BestEffortLlmCallContext,
 } from '../services/llm-call-ledger';
+import type {
+  TranslationToolExecutionContext,
+} from '../contracts/translation-tools';
+import type { TranslationToolRuntime } from '../orchestration/translation-tool-runtime';
+import { TRANSLATION_DOMAIN_TOOL_DEFINITIONS } from '../orchestration/translation-tools';
 
 const MAX_EDIT_CORRECTION_ATTEMPTS = 1;
 
@@ -40,6 +45,13 @@ export interface ChatCallbacks {
   onToolCall?: (name: string, args: Record<string, unknown>) => void;
   /** Called with the result of applying tool calls */
   onToolResult?: (ok: boolean, result?: { newText: string; diffSummary: string }) => void;
+  /** Called after a translation-domain tool returns or fails. */
+  onDomainToolResult?: (
+    name: string,
+    ok: boolean,
+    payload: unknown,
+    toolCallId: string,
+  ) => void;
   /** Called when falling back from native tools to JSON fence protocol */
   onProtocolFallback?: () => void;
 }
@@ -53,6 +65,10 @@ export interface RunChatTurnParams {
   currentText: string;
   /** Tools exposed to the model (default: safe product CHAT_TOOLS — replace_text only) */
   tools?: ChatCompletionRequest['tools'];
+  /** Bound translation-domain runtime. Omit to disable domain tools. */
+  domainRuntime?: TranslationToolRuntime;
+  /** Frozen execution context shared by domain calls in this chat turn. */
+  domainContext?: TranslationToolExecutionContext;
   callbacks?: ChatCallbacks;
   /** Whether to use streaming (default: true) */
   stream?: boolean;
@@ -64,7 +80,23 @@ export interface RunChatTurnParams {
   signal?: AbortSignal;
   /** Privacy-safe accounting identifiers for this session's physical calls. */
   ledger?: Omit<BestEffortLlmCallContext, 'operation' | 'retryCount'>;
+  /** Exact-request paid-call gate, invoked immediately before every provider I/O. */
+  beforePhysicalCall?: (input: {
+    messages: Array<{ role: string; content: string }>;
+    tools?: ChatCompletionRequest['tools'];
+    maxTokens: number;
+    attempted: number;
+  }) => void;
 }
+
+const DOMAIN_TOOL_NAMES: ReadonlySet<string> = new Set(
+  TRANSLATION_DOMAIN_TOOL_DEFINITIONS.map((tool) => tool.function.name),
+);
+const PROGRAMMING_TOOL_NAMES = new Set([
+  'file_read',
+  'file_edit',
+  'run_command',
+]);
 
 /** Result of a chat turn */
 export type ChatTurnResult =
@@ -81,6 +113,21 @@ function cloneMessages(
   msgs: RunChatTurnParams['messages'],
 ): Array<{ role: string; content: string; name?: string; tool_call_id?: string }> {
   return msgs.map((m) => ({ ...m }));
+}
+
+function paidCallPreflightMessages(
+  messages: RunChatTurnParams['messages'],
+): Array<{ role: string; content: string }> {
+  return messages.map((message) => {
+    const wireMessage = message as unknown as Record<string, unknown>;
+    const toolCalls = wireMessage.tool_calls;
+    return {
+      role: message.role,
+      content:
+        message.content +
+        (toolCalls === undefined ? '' : `\n${JSON.stringify(toolCalls)}`),
+    };
+  });
 }
 
 /** Build a diff summary string from a list of edits */
@@ -133,27 +180,51 @@ function buildExactMatchCorrectionMessage(params: {
   );
 }
 
-/**
- * Extract replace_text edits from tool calls, filtering out unknown tools
- * and invalid arguments.
- */
+interface InvalidEditToolCall {
+  callIndex: number;
+  reason: string;
+}
+
+/** Parse every replace_text call without silently dropping malformed entries. */
 function extractEdits(
   toolCalls: Array<{ id: string; name: string; arguments: string }>,
-): Array<{ edit: Edit; callId: string }> {
-  const results: Array<{ edit: Edit; callId: string }> = [];
-  for (const tc of toolCalls) {
+): {
+  valid: Array<{ edit: Edit; callId: string }>;
+  invalid: InvalidEditToolCall[];
+} {
+  const valid: Array<{ edit: Edit; callId: string }> = [];
+  const invalid: InvalidEditToolCall[] = [];
+  for (const [callIndex, tc] of toolCalls.entries()) {
     if (tc.name !== 'replace_text') continue;
     const args = parseToolArgs(tc.arguments);
-    if (!args) continue;
-    const oldString = typeof args.old_string === 'string' ? args.old_string : '';
-    const newString = typeof args.new_string === 'string' ? args.new_string : '';
-    if (!oldString && oldString !== '') continue; // empty old_string is invalid
-    results.push({
-      edit: { old_string: oldString, new_string: newString },
+    if (!args) {
+      invalid.push({
+        callIndex,
+        reason:
+          'invalid JSON arguments; expected one JSON object with string fields "old_string" and "new_string"',
+      });
+      continue;
+    }
+    if (typeof args.old_string !== 'string' || args.old_string.length === 0) {
+      invalid.push({
+        callIndex,
+        reason: '"old_string" must be a non-empty string',
+      });
+      continue;
+    }
+    if (typeof args.new_string !== 'string') {
+      invalid.push({
+        callIndex,
+        reason: '"new_string" must be a string',
+      });
+      continue;
+    }
+    valid.push({
+      edit: { old_string: args.old_string, new_string: args.new_string },
       callId: tc.id,
     });
   }
-  return results;
+  return { valid, invalid };
 }
 
 /** System instruction for JSON fence protocol fallback */
@@ -363,7 +434,67 @@ export async function runChatTurn(
   const onActivity = callbacks?.onActivity;
   const onToolCall = callbacks?.onToolCall;
   const onToolResult = callbacks?.onToolResult;
+  const onDomainToolResult = callbacks?.onDomainToolResult;
   const onProtocolFallback = callbacks?.onProtocolFallback;
+  const exposedToolNames = new Set(
+    (tools ?? []).map((tool) => tool.function.name),
+  );
+  const applyAndTraceReplaceBatch = async (
+    calls: Array<{
+      args: unknown;
+      providerToolCallId?: string;
+    }>,
+    legacyEdits: Edit[],
+  ): Promise<
+    | { ok: true; newText: string }
+    | {
+        ok: false;
+        failedIndex: number;
+        reason: string;
+        suggestions?: string[];
+      }
+  > => {
+    if (!params.domainRuntime || !params.domainContext) {
+      return applyExactReplacementBatch(currentText, legacyEdits);
+    }
+    const executed = await params.domainRuntime.executeReplaceTextBatch({
+      calls: calls.map((call) => ({
+        args: call.args,
+        providerToolCallId: call.providerToolCallId,
+      })),
+      context: {
+        ...params.domainContext,
+        baseVersion: params.domainContext.baseVersion
+          ? { ...params.domainContext.baseVersion, text: currentText }
+          : null,
+      },
+    });
+    if (executed.ok) {
+      executed.calls.forEach((call, index) => {
+        onDomainToolResult?.(
+          'replace_text',
+          true,
+          call.result,
+          calls[index]?.providerToolCallId ?? call.callId,
+        );
+      });
+      return { ok: true, newText: executed.newText };
+    }
+    executed.traces.forEach((trace, index) => {
+      onDomainToolResult?.(
+        'replace_text',
+        false,
+        { code: trace.errorCode, message: trace.errorMessage },
+        calls[index]?.providerToolCallId ?? trace.id,
+      );
+    });
+    return {
+      ok: false,
+      failedIndex: executed.failedIndex,
+      reason: executed.reason,
+      suggestions: executed.suggestions,
+    };
+  };
 
   // Clone messages so we don't mutate the caller's array
   const messages = cloneMessages(inputMessages);
@@ -372,10 +503,19 @@ export async function runChatTurn(
   let editCorrectionAttempts = 0;
   let physicalRequestCount = 0;
 
-  const nextLedgerContext = (): BestEffortLlmCallContext | undefined => {
-    if (!params.ledger) return undefined;
+  const nextPhysicalRequest = (
+    requestMessages: RunChatTurnParams['messages'],
+    requestTools?: ChatCompletionRequest['tools'],
+  ): BestEffortLlmCallContext | undefined => {
     const retryCount = physicalRequestCount;
     physicalRequestCount += 1;
+    params.beforePhysicalCall?.({
+      messages: paidCallPreflightMessages(requestMessages),
+      tools: requestTools,
+      maxTokens,
+      attempted: physicalRequestCount,
+    });
+    if (!params.ledger) return undefined;
     return {
       ...params.ledger,
       operation: 'chat_edit',
@@ -417,7 +557,7 @@ export async function runChatTurn(
           onActivity,
           maxTokens,
           params.signal,
-          nextLedgerContext(),
+          nextPhysicalRequest(messages),
         );
       } else {
         // Native tools protocol
@@ -431,7 +571,7 @@ export async function runChatTurn(
           stream,
           maxTokens,
           params.signal,
-          nextLedgerContext(),
+          nextPhysicalRequest(messages, tools),
         );
       }
     } catch (error: unknown) {
@@ -474,8 +614,12 @@ export async function runChatTurn(
         continue;
       }
 
-      // Apply the fence edits
-      const batchResult = applyExactReplacementBatch(currentText, fenceEdits);
+      // Apply the fence edits and, when audit tooling is available, persist
+      // every replacement outcome through the same trace-first batch runtime.
+      const batchResult = await applyAndTraceReplaceBatch(
+        fenceEdits.map((edit) => ({ args: edit })),
+        fenceEdits,
+      );
 
       if (batchResult.ok) {
         // Fire callbacks for each edit
@@ -540,22 +684,47 @@ export async function runChatTurn(
     }
 
     // ---------------------------------------------------------------
-    // Step 3a: Programming tools (file_read / file_edit / run_command)
+    // Step 3a: non-edit tools. Domain calls use the bound translation runtime;
+    // programming calls require an explicitly exposed programming definition.
     // ---------------------------------------------------------------
     // When the model mixes programming tools with replace_text in one batch,
     // every call is executed and its result backfilled, then the loop
     // continues so the model sees the outcomes (replace_text edits update
     // currentText for subsequent iterations). Pure replace_text batches
     // keep the legacy path below (apply → return on success).
-    const programCalls = toolCalls.filter((tc) => tc.name !== 'replace_text');
-    if (programCalls.length > 0) {
+    const nonEditCalls = toolCalls.filter((tc) => tc.name !== 'replace_text');
+    if (nonEditCalls.length > 0) {
       if (toolCalls.some((tc) => tc.name === 'replace_text')) {
+        if (params.domainRuntime && params.domainContext) {
+          const replaceCalls = toolCalls.filter(
+            (tc) => tc.name === 'replace_text',
+          );
+          const traces = params.domainRuntime.rejectReplaceTextBatch({
+            calls: replaceCalls.map((tc) => ({
+              args: parseToolArgs(tc.arguments) ?? {
+                invalidJsonArguments: tc.arguments,
+              },
+              providerToolCallId: tc.id,
+            })),
+            context: params.domainContext,
+            reason:
+              'The replacement was not attempted because the provider mixed text edits with other tools.',
+          });
+          traces.forEach((trace, index) => {
+            onDomainToolResult?.(
+              'replace_text',
+              false,
+              { code: trace.errorCode, message: trace.errorMessage },
+              replaceCalls[index]?.id ?? trace.id,
+            );
+          });
+        }
         return {
           ok: false,
           code: 'mixed_tool_batch_not_supported',
           message:
-            'Text edits and programming tools cannot run in the same model response. ' +
-            'No edit or programming side effect was applied.',
+            'Text edits and other tools cannot run in the same model response. ' +
+            'No edit or tool side effect was applied.',
         };
       }
       messages.push({
@@ -571,60 +740,136 @@ export async function runChatTurn(
       for (const tc of toolCalls) {
         const args = parseToolArgs(tc.arguments) ?? {};
         if (onToolCall) onToolCall(tc.name, args);
-        const toolResult = await executeProgrammaticTool(tc.name, args);
-        if (onToolResult) {
-          onToolResult(toolResult.ok, toolResult.ok
-            ? { newText: currentText, diffSummary: toolResult.content.slice(0, 200) }
-            : undefined);
+        let toolContent: string;
+        if (DOMAIN_TOOL_NAMES.has(tc.name)) {
+          if (!params.domainRuntime || !params.domainContext) {
+            toolContent = `Error: translation domain tool ${tc.name} is unavailable in this turn.`;
+            onDomainToolResult?.(tc.name, false, {
+              code: 'domain_runtime_unavailable',
+              message: toolContent,
+            }, tc.id);
+          } else {
+            try {
+              const executed = await params.domainRuntime.execute({
+                name: tc.name,
+                args,
+                providerToolCallId: tc.id,
+                context: params.domainContext,
+              });
+              toolContent = JSON.stringify(executed.result);
+              onDomainToolResult?.(tc.name, true, executed.result, tc.id);
+            } catch (error) {
+              const failure = {
+                code:
+                  error && typeof error === 'object' && 'code' in error
+                    ? String(error.code)
+                    : 'domain_tool_failed',
+                message: error instanceof Error ? error.message : String(error),
+              };
+              toolContent = `Error: ${failure.code}: ${failure.message}`;
+              onDomainToolResult?.(tc.name, false, failure, tc.id);
+            }
+          }
+        } else if (
+          PROGRAMMING_TOOL_NAMES.has(tc.name) &&
+          exposedToolNames.has(tc.name)
+        ) {
+          const toolResult = await executeProgrammaticTool(tc.name, args);
+          toolContent = toolResult.content;
+          if (onToolResult) {
+            onToolResult(toolResult.ok, toolResult.ok
+              ? { newText: currentText, diffSummary: toolResult.content.slice(0, 200) }
+              : undefined);
+          }
+        } else {
+          // A hallucinated or unexposed name is never forwarded to the host
+          // programming executor.
+          toolContent = 'Unknown tool — ignored.';
         }
         messages.push({
           role: 'tool',
           tool_call_id: tc.id,
-          content: toolResult.content,
+          content: toolContent,
         });
       }
       continue;
     }
 
-    // Extract replace_text edits from tool calls
-    const extractedEdits = extractEdits(toolCalls);
+    // Parse the complete replace_text batch before applying any edit. A model
+    // argument error rejects the whole batch so a valid sibling cannot be
+    // committed while a malformed sibling is silently discarded.
+    const extracted = extractEdits(toolCalls);
+    const extractedEdits = extracted.valid;
     const edits = extractedEdits.map((e) => e.edit);
 
-    if (edits.length === 0) {
-      // Tool calls exist but none produced valid replace_text edits
-      // (e.g., unknown tool names or invalid JSON arguments)
-      // Check if there were any replace_text calls at all
-      const hasReplaceTextCalls = toolCalls.some((tc) => tc.name === 'replace_text');
+    if (extracted.invalid.length > 0) {
+      const invalidByCallIndex = new Map(
+        extracted.invalid.map((failure) => [failure.callIndex, failure]),
+      );
+      const firstFailure = extracted.invalid[0];
+      const batchReason =
+        `replace_text call #${firstFailure.callIndex + 1} has ${firstFailure.reason}. ` +
+        'No edit in this batch was applied.';
 
-      if (hasReplaceTextCalls) {
-        // Model tried to use replace_text but arguments were invalid → inject error
-        messages.push({
-          role: 'assistant',
-          content: content || null,
-          tool_calls: toolCalls.map((tc) => ({
-            id: tc.id,
-            type: 'function' as const,
-            function: { name: tc.name, arguments: tc.arguments },
+      if (params.domainRuntime && params.domainContext) {
+        const traces = params.domainRuntime.rejectReplaceTextBatch({
+          calls: toolCalls.map((tc) => ({
+            args: parseToolArgs(tc.arguments) ?? {
+              invalidJsonArguments: tc.arguments,
+            },
+            providerToolCallId: tc.id,
           })),
-        } as unknown as { role: string; content: string });
-
-        for (const tc of toolCalls) {
-          if (tc.name !== 'replace_text') continue;
-          messages.push({
-            role: 'tool',
-            tool_call_id: tc.id,
-            content:
-              'Error: invalid JSON arguments for replace_text. ' +
-              'Arguments must be valid JSON with "old_string" and "new_string" fields. ' +
-              `Received: ${tc.arguments}`,
-          });
-        }
-        continue;
+          context: params.domainContext,
+          reason: batchReason,
+        });
+        traces.forEach((trace, index) => {
+          onDomainToolResult?.(
+            'replace_text',
+            false,
+            { code: trace.errorCode, message: trace.errorMessage },
+            toolCalls[index]?.id ?? trace.id,
+          );
+        });
       }
 
-      // No replace_text calls at all — pure message
-      return { ok: true, kind: 'message', text: content };
+      if (onToolResult) onToolResult(false);
+      messages.push({
+        role: 'assistant',
+        content: content || null,
+        tool_calls: toolCalls.map((tc) => ({
+          id: tc.id,
+          type: 'function' as const,
+          function: { name: tc.name, arguments: tc.arguments },
+        })),
+      } as unknown as { role: string; content: string });
+
+      for (const [callIndex, tc] of toolCalls.entries()) {
+        const failure = invalidByCallIndex.get(callIndex);
+        messages.push({
+          role: 'tool',
+          tool_call_id: tc.id,
+          content: failure
+            ? `Error: replace_text call #${failure.callIndex + 1} has ${failure.reason}. ` +
+              'The entire edit batch was rejected; no edit was applied.'
+            : `Error: this replace_text call was not applied because another call ` +
+              `in the same batch was invalid (call #${firstFailure.callIndex + 1}). ` +
+              'The entire edit batch was rejected.',
+        });
+      }
+      continue;
     }
+
+    const tracedBatch = params.domainRuntime && params.domainContext
+      ? await applyAndTraceReplaceBatch(
+          toolCalls.map((tc) => ({
+            args: parseToolArgs(tc.arguments) ?? {
+              invalidJsonArguments: tc.arguments,
+            },
+            providerToolCallId: tc.id,
+          })),
+          edits,
+        )
+      : null;
 
     // Fire onToolCall for each valid edit
     if (onToolCall) {
@@ -639,7 +884,7 @@ export async function runChatTurn(
     // ---------------------------------------------------------------
     // Step 4: Apply edits transactionally
     // ---------------------------------------------------------------
-    const batchResult = applyExactReplacementBatch(currentText, edits);
+    const batchResult = tracedBatch ?? applyExactReplacementBatch(currentText, edits);
 
     if (batchResult.ok) {
       const diffSummary = buildDiffSummary(edits);

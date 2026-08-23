@@ -32,23 +32,27 @@ export function Card({
     <section
       data-testid={testId}
       className={[
-        'rounded-md border border-line bg-paper-raise shadow-card',
+        'min-w-0 break-words rounded-md border border-line bg-paper-raise shadow-card',
         className,
       ].join(' ')}
       {...rest}
     >
       {hasHeader && (
-        <header className="flex items-end justify-between gap-4 border-b border-line px-5 pb-3 pt-4">
-          <div className="min-w-0">
+        <header className="flex min-w-0 flex-col items-stretch gap-3 border-b border-line px-5 pb-3 pt-4 sm:flex-row sm:items-end sm:justify-between sm:gap-4">
+          <div className="min-w-0 max-w-full">
             {overline != null && <p className="overline-label">{overline}</p>}
             {title != null && (
-              <h2 className="mt-1 truncate font-serif text-base font-medium text-ink">{title}</h2>
+              <h2 className="mt-1 break-words font-serif text-base font-medium text-ink">{title}</h2>
             )}
           </div>
-          {actions != null && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
+          {actions != null && (
+            <div className="flex min-w-0 max-w-full flex-wrap items-center gap-2 sm:shrink-0">
+              {actions}
+            </div>
+          )}
         </header>
       )}
-      <div className={padded ? 'px-5 py-4' : undefined}>{children}</div>
+      <div className={padded ? 'min-w-0 px-5 py-4' : 'min-w-0'}>{children}</div>
     </section>
   )
 }

@@ -25,6 +25,11 @@ export async function discoverEndpointModels(
     baseUrl: string
     chatCompletionsPath?: string | null
     apiKey: string
+    resolveRuntimeEndpoint?: () => {
+      baseUrl: string
+      chatCompletionsPath?: string | null
+      apiKey: string
+    }
   },
   options: {
     fetchImpl?: typeof fetch
@@ -39,12 +44,13 @@ export async function discoverEndpointModels(
   )
 
   try {
-    const response = await fetchImpl(resolveModelsUrl(endpoint), {
+    const physicalEndpoint = endpoint.resolveRuntimeEndpoint?.() ?? endpoint
+    const response = await fetchImpl(resolveModelsUrl(physicalEndpoint), {
       method: 'GET',
       headers: {
         Accept: 'application/json',
-        ...(endpoint.apiKey
-          ? { Authorization: `Bearer ${endpoint.apiKey}` }
+        ...(physicalEndpoint.apiKey
+          ? { Authorization: `Bearer ${physicalEndpoint.apiKey}` }
           : {}),
       },
       cache: 'no-store',
@@ -86,6 +92,15 @@ export async function discoverEndpointModels(
     )
   } catch (error) {
     if (error instanceof ModelDiscoveryError) throw error
+    const runtimeCode = error && typeof error === 'object' && 'code' in error
+      ? (error as { code?: unknown }).code
+      : null
+    if (
+      runtimeCode === 'runtime_endpoint_deleted' ||
+      runtimeCode === 'runtime_endpoint_disabled' ||
+      runtimeCode === 'runtime_endpoint_key_unavailable' ||
+      runtimeCode === 'runtime_endpoint_address_invalid'
+    ) throw error
     if (error instanceof Error && error.name === 'AbortError') {
       throw new ModelDiscoveryError('读取模型列表超时')
     }

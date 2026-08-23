@@ -26,7 +26,7 @@ describe('workspace draft project selection API', () => {
     db.close()
   })
 
-  it('round-trips selectedProjectId and clears it with the draft', async () => {
+  it('round-trips project and Main Agent mode, then clears both with the draft', async () => {
     const project = createProjectRepositories(db).projects.create({
       name: 'Draft API project',
       description: '',
@@ -46,6 +46,7 @@ describe('workspace draft project selection API', () => {
           selectedPresetRevisionId: null,
           allowedAgentVariantIds: [],
           reviewMode: 'main_editor',
+          mainEditorRunMode: 'tool_enabled',
           promptBundleRevisionId: null,
           constraints: {},
         }),
@@ -53,13 +54,23 @@ describe('workspace draft project selection API', () => {
       params,
     )
     expect(putResponse.status).toBe(200)
-    expect((await putResponse.json()).selectedProjectId).toBe(project.id)
+    expect(await putResponse.json()).toEqual(
+      expect.objectContaining({
+        selectedProjectId: project.id,
+        mainEditorRunMode: 'tool_enabled',
+      }),
+    )
 
     const getResponse = await GET(
       new NextRequest('http://localhost/api/workspace-drafts/en_to_zh'),
       params,
     )
-    expect((await getResponse.json()).selectedProjectId).toBe(project.id)
+    expect(await getResponse.json()).toEqual(
+      expect.objectContaining({
+        selectedProjectId: project.id,
+        mainEditorRunMode: 'tool_enabled',
+      }),
+    )
 
     expect(
       (
@@ -75,12 +86,10 @@ describe('workspace draft project selection API', () => {
       new NextRequest('http://localhost/api/workspace-drafts/en_to_zh'),
       params,
     )
-    expect(await cleared.json()).toEqual(
-      expect.objectContaining({ sourceText: '', selectedProjectId: null }),
-    )
+    expect(await cleared.json()).toBeNull()
   })
 
-  it('defaults omitted selectedProjectId to null for older clients', async () => {
+  it('defaults fields omitted by older clients without rejecting the draft', async () => {
     const response = await PUT(
       new NextRequest('http://localhost/api/workspace-drafts/en_to_zh', {
         method: 'PUT',
@@ -97,6 +106,11 @@ describe('workspace draft project selection API', () => {
       { params: Promise.resolve({ direction: 'en_to_zh' }) },
     )
     expect(response.status).toBe(200)
-    expect((await response.json()).selectedProjectId).toBeNull()
+    expect(await response.json()).toEqual(
+      expect.objectContaining({
+        selectedProjectId: null,
+        mainEditorRunMode: 'fixed_pipeline',
+      }),
+    )
   })
 })

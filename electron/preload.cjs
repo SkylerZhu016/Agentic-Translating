@@ -7,4 +7,5 @@ contextBridge.exposeInMainWorld('agenticDesktop', {
     ipcRenderer.invoke('agentic:export-batch', batchId, includeAudit),
   openDataDirectory: () => ipcRenderer.invoke('agentic:open-data-dir'),
   openDiagnosticLogs: () => ipcRenderer.invoke('agentic:open-diagnostic-logs'),
+  setLocale: (locale) => ipcRenderer.invoke('agentic:set-locale', locale),
 })

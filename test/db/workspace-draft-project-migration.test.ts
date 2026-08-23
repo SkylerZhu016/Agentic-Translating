@@ -3,9 +3,10 @@ import Database from 'better-sqlite3'
 import fs from 'fs'
 import path from 'path'
 import { createVNextRepositories } from '@/src/lib/db/vnext-repositories'
+import { seed } from '@/src/lib/db/seed'
 import type { WorkspaceDraft } from '@/src/lib/contracts/vnext'
 
-describe('migration 0012 workspace draft project selection', () => {
+describe('workspace draft migrations', () => {
   let db: Database.Database | null = null
 
   afterEach(() => {
@@ -13,7 +14,7 @@ describe('migration 0012 workspace draft project selection', () => {
     db = null
   })
 
-  it('preserves an old draft and defaults selectedProjectId to null', () => {
+  it('preserves an old draft and defaults newly persisted fields safely', () => {
     db = new Database(':memory:')
     db.pragma('foreign_keys = ON')
     db.exec(`
@@ -58,6 +59,15 @@ describe('migration 0012 workspace draft project selection', () => {
       migrationName,
     )
 
+    const runModeMigration =
+      '0018_workspace_draft_main_editor_run_mode.sql'
+    db.exec(
+      fs.readFileSync(path.join(migrationsDir, runModeMigration), 'utf8'),
+    )
+    db.prepare('INSERT INTO migrations (version, name) VALUES (18, ?)').run(
+      runModeMigration,
+    )
+
     expect(
       createVNextRepositories(db).workspaceDrafts.get('en_to_zh'),
     ).toEqual(
@@ -65,11 +75,12 @@ describe('migration 0012 workspace draft project selection', () => {
         sourceText: 'legacy source',
         taskBrief: 'legacy brief',
         selectedProjectId: null,
+        mainEditorRunMode: 'fixed_pipeline',
       }),
     )
   })
 
-  it('persists and clears the selected project with the rest of the draft', () => {
+  it('persists, compares, and clears project and Main Agent mode with the draft', () => {
     db = new Database(':memory:')
     db.pragma('foreign_keys = ON')
     const migrationsDir = path.join(
@@ -122,22 +133,28 @@ describe('migration 0012 workspace draft project selection', () => {
       selectedPresetRevisionId: null,
       allowedAgentVariantIds: [],
       reviewMode: 'main_editor',
+      mainEditorRunMode: 'tool_enabled',
       promptBundleRevisionId: null,
       constraints: {},
     } satisfies Omit<WorkspaceDraft, 'updatedAt'>
     drafts.upsert(draft)
-    expect(drafts.get('en_to_zh')?.selectedProjectId).toBe(projectId)
+    expect(drafts.get('en_to_zh')).toEqual(
+      expect.objectContaining({
+        selectedProjectId: projectId,
+        mainEditorRunMode: 'tool_enabled',
+      }),
+    )
 
     expect(
       drafts.clearIfMatches({ ...draft, sourceText: 'newer source' }),
     ).toBe(false)
+    expect(
+      drafts.clearIfMatches({ ...draft, mainEditorRunMode: 'fixed_pipeline' }),
+    ).toBe(false)
     expect(drafts.get('en_to_zh')?.sourceText).toBe('source')
     expect(drafts.clearIfMatches(draft)).toBe(true)
-    expect(drafts.get('en_to_zh')).toEqual(
-      expect.objectContaining({
-        sourceText: '',
-        selectedProjectId: null,
-      }),
-    )
+    expect(drafts.get('en_to_zh')).toBeNull()
+    seed(db)
+    expect(drafts.get('en_to_zh')).toBeNull()
   })
 })

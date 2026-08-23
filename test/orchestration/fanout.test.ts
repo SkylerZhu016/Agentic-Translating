@@ -25,6 +25,7 @@ import {
   ServerError,
   AuthError,
   ClientError,
+  IncompleteOutputError,
 } from '../../src/lib/llm/client';
 
 // =============================================================================
@@ -103,6 +104,28 @@ describe('runFanOut', () => {
       expect(succeededResult).toBeDefined();
       expect(succeededResult!.status).toBe('complete');
       expect(succeededResult!.content).toBeTruthy();
+    });
+
+    it('retains partial visible output when an upstream stream is interrupted', async () => {
+      const partialCaller = async () => (async function* () {
+        yield { type: 'text' as const, content: 'Partial translation' };
+        throw new IncompleteOutputError(
+          'LLM stream was interrupted before a completion marker',
+          'Partial translation',
+        );
+      })();
+      const summary = await runFanOut(
+        [makeAgent('partial-agent', 'partial-model', 'http://unused.invalid')],
+        {},
+        partialCaller,
+        { retryDelaysMs: [] },
+      );
+
+      expect(summary.results[0]).toMatchObject({
+        status: 'error',
+        content: 'Partial translation',
+        error: 'LLM stream was interrupted before a completion marker',
+      });
     });
   });
 
@@ -197,7 +220,8 @@ describe('runFanOut', () => {
 
       expect(summary.failed).toBe(1);
       expect(summary.succeeded).toBe(0);
-      expect(summary.results[0].error).toMatch(/empty body/i);
+      expect(summary.results[0]).toMatchObject({ status: 'error' });
+      expect(summary.results[0].error).toMatch(/visible content/i);
 
       const reqs = mock.getRequests();
       const callsForAgent = reqs.filter((r) => {

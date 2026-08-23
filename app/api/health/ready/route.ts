@@ -5,6 +5,7 @@ import { migrate, getAppliedVersion } from '@/src/lib/db/migrate'
 
 export async function GET() {
   const diagnosticId = crypto.randomUUID()
+  const startupNonce = process.env.AGENTIC_DESKTOP_STARTUP_NONCE ?? null
   try {
     const db = getDb()
     migrate(db)
@@ -14,6 +15,7 @@ export async function GET() {
       ready: true,
       migrationVersion: getAppliedVersion(db),
       diagnosticId,
+      startupNonce,
     })
   } catch (error) {
     return Response.json(
@@ -21,6 +23,7 @@ export async function GET() {
         ready: false,
         error: error instanceof Error ? error.message : String(error),
         diagnosticId,
+        startupNonce,
       },
       { status: 503 },
     )

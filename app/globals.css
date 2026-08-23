@@ -93,6 +93,10 @@
     min-height: 100dvh;
   }
 
+  html[lang="en"] body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+
   ::selection {
     background: var(--color-ink);
     color: var(--color-paper);
@@ -112,6 +116,93 @@
   * {
     scrollbar-width: thin;
     scrollbar-color: var(--color-line-2) transparent;
+  }
+}
+
+html[lang="en"] .font-serif,
+html[lang="en"] .poem-text {
+  font-family: Georgia, "Times New Roman", serif;
+  line-height: 1.78;
+  letter-spacing: 0.012em;
+}
+
+html[lang="en"] .poem-text-sm {
+  font-family: Georgia, "Times New Roman", serif;
+  line-height: 1.72;
+  letter-spacing: 0.01em;
+}
+
+/*
+ * Browser/Electron zoom can reduce the header's real layout width without
+ * changing viewport-based media queries. Size containment lets the header
+ * respond to that real width instead of inheriting desktop `sm:` labels that
+ * have a 632px minimum inline size at 200% zoom.
+ */
+.top-nav-shell {
+  container-type: inline-size;
+}
+
+@container (max-width: 39.999rem) {
+  .top-nav-inner {
+    height: auto !important;
+    min-height: var(--spacing-topbar);
+    flex-wrap: wrap !important;
+    padding: 0.5rem 1rem !important;
+  }
+
+  .top-nav-controls {
+    width: 100% !important;
+    justify-content: space-between !important;
+    gap: 0.25rem !important;
+  }
+
+  .top-nav-links {
+    gap: 0.25rem !important;
+  }
+
+  .top-nav-link {
+    padding-inline: 0.25rem !important;
+  }
+
+  .top-nav-wide-label {
+    display: none !important;
+  }
+
+  .top-nav-compact-label {
+    display: inline !important;
+  }
+}
+
+.compatibility-endpoint-section {
+  container-type: inline-size;
+}
+
+@container (max-width: 31.999rem) {
+  .compatibility-endpoint-grid {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+}
+
+/* Nested form controls must be allowed to shrink inside narrow cards. */
+@layer components {
+  .responsive-form {
+    min-inline-size: 0;
+    max-inline-size: 100%;
+    overflow-wrap: anywhere;
+  }
+
+  .responsive-form :where(div, label, fieldset, legend, p, span) {
+    min-inline-size: 0;
+    max-inline-size: 100%;
+  }
+
+  .responsive-form :where(
+    input:not([type="checkbox"]):not([type="radio"]),
+    select,
+    textarea
+  ) {
+    min-inline-size: 0;
+    max-inline-size: 100%;
   }
 }
 

@@ -12,6 +12,21 @@
 import { Badge, Button, Spinner } from '@/src/components/ui'
 import { TID } from '@/src/lib/testids'
 import type { AgentCardState } from './use-translation'
+import { useI18n } from '@/src/i18n/LocaleProvider'
+import { localizeDiagnosticError } from '@/src/i18n/diagnostic'
+import { localizeEvidenceSummary } from '@/src/i18n/evidence'
+
+function evidenceHasFindings(report: NonNullable<AgentCardState['evidence']>) {
+  return [
+    report.requiredTermsMissing,
+    report.forbiddenTermsFound,
+    report.numberWarnings,
+    report.structureWarnings,
+    report.punctuationWarnings,
+    report.rhymeWarnings,
+    report.boundaryWarnings,
+  ].some((warnings) => warnings.length > 0)
+}
 
 export interface AgentStreamCardProps {
   card: AgentCardState
@@ -25,6 +40,7 @@ export interface AgentStreamCardProps {
 // ── 状态徽章 ────────────────────────────────────────────────────
 
 function StatusBadge({ status }: { status: AgentCardState['status'] }) {
+  const { t } = useI18n()
   if (status === 'streaming') {
     return (
       <span
@@ -32,7 +48,7 @@ function StatusBadge({ status }: { status: AgentCardState['status'] }) {
         className="inline-flex items-center gap-1.5 rounded-xs border border-line-2 px-1.5 py-0.5 text-[0.6875rem] font-medium leading-4 tracking-wide text-ink"
       >
         <Spinner size="sm" />
-        翻译中
+        {t('agent.status.streaming')}
       </span>
     )
   }
@@ -42,7 +58,7 @@ function StatusBadge({ status }: { status: AgentCardState['status'] }) {
         data-testid={TID.translate.agentStatusComplete}
         className="inline-flex items-center gap-1.5 rounded-xs border border-pine/40 bg-pine/10 px-1.5 py-0.5 text-[0.6875rem] font-medium leading-4 tracking-wide text-pine"
       >
-        完成
+        {t('agent.status.complete')}
       </span>
     )
   }
@@ -52,11 +68,11 @@ function StatusBadge({ status }: { status: AgentCardState['status'] }) {
         data-testid={TID.translate.agentStatusError}
         className="inline-flex items-center gap-1.5 rounded-xs border border-cinnabar/40 bg-cinnabar/10 px-1.5 py-0.5 text-[0.6875rem] font-medium leading-4 tracking-wide text-cinnabar"
       >
-        失败
+        {t('agent.status.error')}
       </span>
     )
   }
-  return <Badge variant="subtle">等待</Badge>
+  return <Badge variant="subtle">{t('agent.status.pending')}</Badge>
 }
 
 // ── 卡片 ────────────────────────────────────────────────────────
@@ -68,6 +84,7 @@ export function AgentStreamCard({
   retryDisabled,
   onRetry,
 }: AgentStreamCardProps) {
+  const { t } = useI18n()
   const errorTone = card.status === 'error'
 
   return (
@@ -91,17 +108,17 @@ export function AgentStreamCard({
         </div>
         <div className="flex items-center gap-1.5">
           {(card.attempts?.length ?? 0) > 1 && (
-            <Badge variant="subtle">尝试 {card.attempts!.length}</Badge>
+            <Badge variant="subtle">{t('agent.attemptCount', { count: card.attempts!.length })}</Badge>
           )}
           {card.kind === 'context_analysis' && (
-            <Badge variant="outline">前置分析</Badge>
+            <Badge variant="outline">{t('agent.kind.contextAnalysis')}</Badge>
           )}
           {card.kind === 'poetry_plan' && (
-            <Badge variant="outline">诗体规划</Badge>
+            <Badge variant="outline">{t('agent.kind.poetryPlan')}</Badge>
           )}
           {card.evidence && (
-            <Badge variant={card.evidence.summary.startsWith('未发现') ? 'outline' : 'subtle'}>
-              {card.evidence.summary}
+            <Badge variant={evidenceHasFindings(card.evidence) ? 'subtle' : 'outline'}>
+              {localizeEvidenceSummary(t, card.evidence.summary)}
             </Badge>
           )}
           <StatusBadge status={card.status} />
@@ -112,7 +129,13 @@ export function AgentStreamCard({
       <div className="flex-1 px-4 py-3">
         {card.status === 'error' ? (
           <div className="flex h-full flex-col items-start gap-3">
-            <p className="text-sm leading-6 text-cinnabar">{card.error ?? '未知错误'}</p>
+            <p className="text-sm leading-6 text-cinnabar">
+              {localizeDiagnosticError(
+                t,
+                card.error,
+                card.error ?? t('error.unknown'),
+              )}
+            </p>
             <Button
               variant="outline"
               size="sm"
@@ -123,10 +146,10 @@ export function AgentStreamCard({
             >
               {retrying ? (
                 <>
-                  <Spinner size="sm" /> 重试中…
+                  <Spinner size="sm" /> {t('agent.retrying')}
                 </>
               ) : (
-                '重试此 Agent'
+                t('agent.retry')
               )}
             </Button>
           </div>
@@ -146,18 +169,18 @@ export function AgentStreamCard({
           card.status === 'streaming' ? (
             <div
               role="status"
-              aria-label={`${card.name} 正在思考`}
+              aria-label={t('agent.thinking.label', { name: card.name })}
               className="flex min-h-24 items-center justify-center gap-2 text-sm leading-6 text-ink-4"
             >
               <Spinner size="sm" />
               <span>
                 {card.lastActivityAt
-                  ? '模型仍在工作，刚刚收到活动信号…'
-                  : '模型正在思考，等待首个字词…'}
+                  ? t('agent.thinking.active')
+                  : t('agent.thinking.waiting')}
               </span>
             </div>
           ) : (
-            <p className="text-sm leading-6 text-ink-4">排队等待开始…</p>
+            <p className="text-sm leading-6 text-ink-4">{t('agent.queued')}</p>
           )
         )}
       </div>
@@ -171,10 +194,10 @@ export function AgentStreamCard({
           >
             {retrying ? (
               <>
-                <Spinner size="sm" /> 重刷中
+                <Spinner size="sm" /> {t('agent.refreshing')}
               </>
             ) : (
-              '重刷此 Agent'
+              t('agent.refresh')
             )}
           </Button>
         </div>
@@ -184,7 +207,7 @@ export function AgentStreamCard({
           {card.annotation && (
             <details>
               <summary className="cursor-pointer text-xs font-medium text-ink-3">
-                Agent 注释
+                {t('agent.annotation')}
               </summary>
               <p className="mt-2 whitespace-pre-wrap text-xs leading-5 text-ink-3">
                 {card.annotation}
@@ -194,7 +217,7 @@ export function AgentStreamCard({
           {card.evidence && (
             <details className={card.annotation ? 'mt-2' : ''}>
               <summary className="cursor-pointer text-xs font-medium text-ink-3">
-                辅助证据详情
+                {t('agent.evidenceDetails')}
               </summary>
               <p className="mt-2 whitespace-pre-wrap text-xs leading-5 text-ink-3">
                 {card.evidence.naturalLanguage}
@@ -207,13 +230,23 @@ export function AgentStreamCard({
         <div className="border-t border-line px-4 py-2">
           <details>
             <summary className="cursor-pointer text-xs font-medium text-ink-3">
-              查看尝试记录
+              {t('agent.attempts')}
             </summary>
             <ol className="mt-2 space-y-1 text-xs leading-5 text-ink-3">
               {card.attempts!.map((attempt, index) => (
                 <li key={attempt.id}>
-                  第 {index + 1} 次 · {attempt.model} · {attempt.status}
-                  {attempt.error ? ` · ${attempt.error}` : ''}
+                  {t('agent.attemptLine', {
+                    number: index + 1,
+                    model: attempt.model,
+                    status: attempt.status,
+                  })}
+                  {attempt.error
+                    ? ` · ${localizeDiagnosticError(
+                        t,
+                        attempt.error,
+                        t('error.unknown'),
+                      )}`
+                    : ''}
                 </li>
               ))}
             </ol>

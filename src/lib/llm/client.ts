@@ -5,7 +5,7 @@
 //   chatCompletion(endpoint, request) → ChatCompletionResponse | AsyncIterable<LLMStreamEvent>
 //   Error normalization: AuthError, RateLimitError, ServerError, etc.
 //   AbortSignal.any merging for timeout + external signal
-//   SSE streaming via parseSSEChunk
+//   SSE streaming via a bounded incremental line parser
 //   Non-stream auto-detection fallback
 //   Tool call delta accumulation
 //
@@ -13,7 +13,6 @@
 // ---------------------------------------------------------------------------
 
 import { AGENT_MAX_DURATION_MS, AGENT_TIMEOUT_MS } from '../constants';
-import { parseSSEChunk, takeCompleteSSEText } from '../contracts/sse';
 import { resolveChatCompletionsUrl } from './endpoint-url';
 
 // =============================================================================
@@ -105,13 +104,22 @@ export class AbortedError extends LLMError {
 
 /** Provider ended generation before a complete answer was produced. */
 export class IncompleteOutputError extends LLMError {
-  constructor(message?: string) {
+  public readonly partialContent: string;
+  public readonly providerDiagnostics?: ProviderDiagnostics;
+
+  constructor(
+    message?: string,
+    partialContent = '',
+    providerDiagnostics?: ProviderDiagnostics,
+  ) {
     super(
       'incomplete_output',
       message ?? 'LLM response ended before completion',
       { retryable: true },
     );
     this.name = 'IncompleteOutputError';
+    this.partialContent = partialContent;
+    this.providerDiagnostics = providerDiagnostics;
   }
 }
 
@@ -161,6 +169,31 @@ export interface ChatCompletionRequest {
   signal?: AbortSignal;
 }
 
+export interface ChatCompletionEndpoint {
+  baseUrl: string;
+  apiKey: string;
+  chatCompletionsPath?: string;
+  /** Runtime-only, single-read supplier invoked before every physical fetch. */
+  resolveRuntimeEndpoint?: () => {
+    baseUrl: string;
+    apiKey: string;
+    chatCompletionsPath?: string;
+  };
+}
+
+function resolvePhysicalEndpoint(endpoint: ChatCompletionEndpoint): {
+  baseUrl: string;
+  apiKey: string;
+  chatCompletionsPath?: string;
+} {
+  if (endpoint.resolveRuntimeEndpoint) return endpoint.resolveRuntimeEndpoint();
+  return {
+    baseUrl: endpoint.baseUrl,
+    chatCompletionsPath: endpoint.chatCompletionsPath,
+    apiKey: endpoint.apiKey,
+  };
+}
+
 /** Non-streaming chat completion response */
 export interface ChatCompletionResponse {
   content: string;
@@ -174,6 +207,14 @@ export interface ChatCompletionResponse {
     completion_tokens: number;
     total_tokens: number;
   };
+  providerDiagnostics?: ProviderDiagnostics;
+}
+
+/** Safe shape-only diagnostics. Provider reasoning text is never retained. */
+export interface ProviderDiagnostics {
+  reasoningFields: Array<'reasoning_content' | 'thinking' | 'reasoning'>;
+  reasoningChunks: number;
+  reasoningCharacters: number;
 }
 
 /** Events yielded by streaming chat completion */
@@ -201,6 +242,7 @@ export type LLMStreamEvent =
         completion_tokens: number;
         total_tokens: number;
       };
+      providerDiagnostics?: ProviderDiagnostics;
     };
 
 /** Type guard for AsyncIterable */
@@ -297,16 +339,24 @@ async function readResponseText(
   if (!response.body) return '';
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
-  let text = '';
+  const fragments: string[] = [];
+  let characters = 0;
+  const append = (fragment: string) => {
+    if (fragment.length > MAX_RESPONSE_TEXT_CHARACTERS - characters) {
+      throw new ClientError('LLM response exceeded the bounded body limit');
+    }
+    fragments.push(fragment);
+    characters += fragment.length;
+  };
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       onActivity();
-      text += decoder.decode(value, { stream: true });
+      append(decoder.decode(value, { stream: true }));
     }
-    text += decoder.decode();
-    return text;
+    append(decoder.decode());
+    return fragments.join('');
   } finally {
     try {
       reader.releaseLock();
@@ -317,22 +367,195 @@ async function readResponseText(
 }
 
 type CompletionUsage = NonNullable<ChatCompletionResponse['usage']>;
+type ReasoningField = ProviderDiagnostics['reasoningFields'][number];
+
+const REASONING_FIELDS: readonly ReasoningField[] = [
+  'reasoning_content',
+  'thinking',
+  'reasoning',
+];
+const MAX_SSE_PENDING_CHARACTERS = 8 * 1024 * 1024;
+const MAX_SSE_EVENTS = 100_000;
+const MAX_VISIBLE_CONTENT_CHARACTERS = 8 * 1024 * 1024;
+const MAX_RESPONSE_TEXT_CHARACTERS = 8 * 1024 * 1024;
+const TERMINAL_USAGE_TAIL_GRACE_MS = 1_000;
+const MAX_TERMINAL_USAGE_TAIL_EVENTS = 16;
+
+interface MutableProviderDiagnostics {
+  reasoningFields: Set<ReasoningField>;
+  reasoningChunks: number;
+  reasoningCharacters: number;
+}
+
+function createProviderDiagnostics(): MutableProviderDiagnostics {
+  return {
+    reasoningFields: new Set(),
+    reasoningChunks: 0,
+    reasoningCharacters: 0,
+  };
+}
+
+function observeReasoningFields(
+  value: unknown,
+  diagnostics: MutableProviderDiagnostics,
+): void {
+  if (!value || typeof value !== 'object') return;
+  const record = value as Record<string, unknown>;
+  for (const field of REASONING_FIELDS) {
+    const fragment = record[field];
+    if (typeof fragment !== 'string' || fragment.length === 0) continue;
+    diagnostics.reasoningFields.add(field);
+    diagnostics.reasoningChunks += 1;
+    diagnostics.reasoningCharacters += fragment.length;
+  }
+}
+
+function snapshotProviderDiagnostics(
+  diagnostics: MutableProviderDiagnostics,
+): ProviderDiagnostics | undefined {
+  if (diagnostics.reasoningChunks === 0) return undefined;
+  return {
+    reasoningFields: REASONING_FIELDS.filter((field) =>
+      diagnostics.reasoningFields.has(field)),
+    reasoningChunks: diagnostics.reasoningChunks,
+    reasoningCharacters: diagnostics.reasoningCharacters,
+  };
+}
+
+function toolCallsAreComplete(
+  toolCalls: ChatCompletionResponse['toolCalls'],
+): toolCalls is NonNullable<ChatCompletionResponse['toolCalls']> {
+  if (!toolCallsHaveCompleteEnvelope(toolCalls)) return false;
+  return toolCalls.every((toolCall) => {
+    try {
+      const args = JSON.parse(toolCall.arguments) as unknown;
+      return Boolean(args) && typeof args === 'object' && !Array.isArray(args);
+    } catch {
+      return false;
+    }
+  });
+}
+
+/**
+ * A complete JSON response transports each tool call atomically. Once its
+ * required envelope fields are present, malformed argument JSON is a model
+ * tool error for the tool loop to report and let the model correct; it is not
+ * evidence that the provider response was truncated.
+ *
+ * The SSE path deliberately keeps using the stricter toolCallsAreComplete
+ * check above because an unterminated JSON value there can be evidence that
+ * the argument fragments themselves were cut off in transit.
+ */
+function toolCallsHaveCompleteEnvelope(
+  toolCalls: ChatCompletionResponse['toolCalls'],
+): toolCalls is NonNullable<ChatCompletionResponse['toolCalls']> {
+  if (!toolCalls?.length) return false;
+  return toolCalls.every((toolCall) =>
+    typeof toolCall.id === 'string' && toolCall.id.length > 0 &&
+    typeof toolCall.name === 'string' && toolCall.name.length > 0 &&
+    typeof toolCall.arguments === 'string' && toolCall.arguments.length > 0);
+}
+
+function extractJsonResponseToolCalls(
+  message: Record<string, unknown> | undefined,
+  partialContent: string,
+  providerDiagnostics?: ProviderDiagnostics,
+): ChatCompletionResponse['toolCalls'] | undefined {
+  const rawToolCalls = message?.tool_calls;
+  if (rawToolCalls === undefined) return undefined;
+  if (!Array.isArray(rawToolCalls)) {
+    throw new IncompleteOutputError(
+      'LLM response contained a non-array tool_calls value',
+      partialContent,
+      providerDiagnostics,
+    );
+  }
+  if (rawToolCalls.length === 0) return undefined;
+  return rawToolCalls.map((value) => {
+    const toolCall = value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : undefined;
+    const rawFunction = toolCall?.function;
+    const fn = rawFunction && typeof rawFunction === 'object' && !Array.isArray(rawFunction)
+      ? rawFunction as Record<string, unknown>
+      : undefined;
+    return {
+      id: typeof toolCall?.id === 'string' ? toolCall.id : '',
+      name: typeof fn?.name === 'string' ? fn.name : '',
+      arguments: typeof fn?.arguments === 'string' ? fn.arguments : '',
+    };
+  });
+}
+
+function assertSuccessfulFinishReason(
+  finishReason: unknown,
+  partialContent: string,
+  providerDiagnostics?: ProviderDiagnostics,
+  hasCompleteToolCalls = false,
+): void {
+  if (finishReason === 'stop') return;
+  if (finishReason === 'tool_calls' && hasCompleteToolCalls) return;
+  if (finishReason === 'length') {
+    throw new IncompleteOutputError(
+      'LLM response was truncated because the completion token limit was reached',
+      partialContent,
+      providerDiagnostics,
+    );
+  }
+  if (finishReason === 'tool_calls') {
+    throw new IncompleteOutputError(
+      'LLM response ended with incomplete tool calls',
+      partialContent,
+      providerDiagnostics,
+    );
+  }
+  const label = typeof finishReason === 'string'
+    ? JSON.stringify(finishReason)
+    : 'a missing finish_reason';
+  throw new IncompleteOutputError(
+    `LLM response ended with non-success finish_reason ${label}`,
+    partialContent,
+    providerDiagnostics,
+  );
+}
+
+function emptyVisibleContentMessage(
+  providerDiagnostics: ProviderDiagnostics | undefined,
+  usage: CompletionUsage | undefined,
+): string {
+  if (providerDiagnostics) {
+    return 'LLM response completed with reasoning but no visible content';
+  }
+  if (usage) return 'LLM response completed with usage but no visible content';
+  return 'LLM response completed without visible content';
+}
+
+function isSafeTokenCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
 
 function parseCompletionUsage(value: unknown): CompletionUsage | undefined {
   if (!value || typeof value !== 'object') return undefined;
   const usage = value as Record<string, unknown>;
   const promptTokens = usage.prompt_tokens;
   const completionTokens = usage.completion_tokens;
-  const totalTokens = usage.total_tokens;
   if (
-    typeof promptTokens !== 'number' ||
-    !Number.isFinite(promptTokens) ||
-    typeof completionTokens !== 'number' ||
-    !Number.isFinite(completionTokens) ||
-    typeof totalTokens !== 'number' ||
-    !Number.isFinite(totalTokens)
+    !isSafeTokenCount(promptTokens) ||
+    !isSafeTokenCount(completionTokens)
   ) {
     return undefined;
+  }
+  if (promptTokens > Number.MAX_SAFE_INTEGER - completionTokens) {
+    return undefined;
+  }
+  const computedTotal = promptTokens + completionTokens;
+  const explicitTotal = usage.total_tokens;
+  let totalTokens = computedTotal;
+  if (explicitTotal !== undefined) {
+    if (!isSafeTokenCount(explicitTotal) || explicitTotal !== computedTotal) {
+      return undefined;
+    }
+    totalTokens = explicitTotal;
   }
   return {
     prompt_tokens: promptTokens,
@@ -391,17 +614,18 @@ interface StreamFetchResult {
 }
 
 async function fetchStreamResponse(
-  endpoint: { baseUrl: string; apiKey: string; chatCompletionsPath?: string },
+  endpoint: ChatCompletionEndpoint,
   request: ChatCompletionRequest,
   signal: AbortSignal,
   onActivity: () => void,
 ): Promise<StreamFetchResult> {
   const fetchOnce = async (includeUsage: boolean): Promise<Response> => {
-    const response = await fetch(resolveChatCompletionsUrl(endpoint), {
+    const physicalEndpoint = resolvePhysicalEndpoint(endpoint);
+    const response = await fetch(resolveChatCompletionsUrl(physicalEndpoint), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${endpoint.apiKey}`,
+        Authorization: `Bearer ${physicalEndpoint.apiKey}`,
       },
       body: JSON.stringify({
         model: request.model,
@@ -536,21 +760,31 @@ function mapNetworkError(error: unknown): never {
   throw new NetworkError(message);
 }
 
+function isRuntimeCredentialError(error: unknown): error is Error {
+  if (!error || typeof error !== 'object' || !('code' in error)) return false;
+  const code = (error as { code?: unknown }).code;
+  return code === 'runtime_endpoint_deleted' ||
+    code === 'runtime_endpoint_disabled' ||
+    code === 'runtime_endpoint_key_unavailable' ||
+    code === 'runtime_endpoint_address_invalid';
+}
+
 // =============================================================================
 // Non-streaming request
 // =============================================================================
 
 async function nonStreamCompletion(
-  endpoint: { baseUrl: string; apiKey: string; chatCompletionsPath?: string },
+  endpoint: ChatCompletionEndpoint,
   request: ChatCompletionRequest,
   signal: AbortSignal,
   onActivity: () => void,
 ): Promise<ChatCompletionResponse> {
-  const response = await fetch(resolveChatCompletionsUrl(endpoint), {
+  const physicalEndpoint = resolvePhysicalEndpoint(endpoint);
+  const response = await fetch(resolveChatCompletionsUrl(physicalEndpoint), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${endpoint.apiKey}`,
+      Authorization: `Bearer ${physicalEndpoint.apiKey}`,
     },
     body: JSON.stringify({
       model: request.model,
@@ -578,33 +812,49 @@ async function nonStreamCompletion(
   }
 
   const choice = (body.choices as Array<Record<string, unknown>>)?.[0];
-  if (choice?.finish_reason === 'length') {
+  const message = choice?.message as Record<string, unknown> | undefined;
+  const mutableDiagnostics = createProviderDiagnostics();
+  observeReasoningFields(message, mutableDiagnostics);
+  const providerDiagnostics = snapshotProviderDiagnostics(mutableDiagnostics);
+  const content = (message?.content as string) ?? '';
+
+  const toolCalls = extractJsonResponseToolCalls(
+    message,
+    content,
+    providerDiagnostics,
+  );
+
+  const hasCompleteToolCalls = toolCallsHaveCompleteEnvelope(toolCalls);
+  if (toolCalls && !hasCompleteToolCalls) {
     throw new IncompleteOutputError(
-      'LLM response was truncated because the completion token limit was reached',
+      'LLM response contained incomplete tool calls',
+      content,
+      providerDiagnostics,
     );
   }
-  const message = choice?.message as Record<string, unknown> | undefined;
-  const content = (message?.content as string) ?? '';
-  // reasoning_content/thinking intentionally discarded — not included in response
+  assertSuccessfulFinishReason(
+    choice?.finish_reason,
+    content,
+    providerDiagnostics,
+    hasCompleteToolCalls,
+  );
 
-  // Extract tool calls
-  let toolCalls: ChatCompletionResponse['toolCalls'] | undefined;
-  const rawToolCalls = message?.tool_calls as Array<Record<string, unknown>> | undefined;
-  if (rawToolCalls && rawToolCalls.length > 0) {
-    toolCalls = rawToolCalls.map((tc) => ({
-      id: (tc.id as string) ?? '',
-      name: ((tc.function as Record<string, unknown>)?.name as string) ?? '',
-      arguments: ((tc.function as Record<string, unknown>)?.arguments as string) ?? '',
-    }));
-  }
-
-  // Extract usage
+  // Extract usage before classifying a terminal empty response so the error
+  // remains specific even when the provider emitted no reasoning field.
   const usage = parseCompletionUsage(body.usage);
+  if (!content && !hasCompleteToolCalls) {
+    throw new IncompleteOutputError(
+      emptyVisibleContentMessage(providerDiagnostics, usage),
+      '',
+      providerDiagnostics,
+    );
+  }
 
   return {
     content,
     ...(toolCalls ? { toolCalls } : {}),
     ...(usage ? { usage } : {}),
+    ...(providerDiagnostics ? { providerDiagnostics } : {}),
   };
 }
 
@@ -613,7 +863,7 @@ async function nonStreamCompletion(
 // =============================================================================
 
 async function* streamCompletion(
-  endpoint: { baseUrl: string; apiKey: string; chatCompletionsPath?: string },
+  endpoint: ChatCompletionEndpoint,
   request: ChatCompletionRequest,
   signal: AbortSignal,
   onActivity: () => void,
@@ -641,33 +891,44 @@ async function* streamCompletion(
     }
 
     const choice = (body.choices as Array<Record<string, unknown>>)?.[0];
-    if (choice?.finish_reason === 'length') {
-      throw new IncompleteOutputError(
-        'LLM response was truncated because the completion token limit was reached',
-      );
-    }
     const message = choice?.message as Record<string, unknown> | undefined;
+    const mutableDiagnostics = createProviderDiagnostics();
+    observeReasoningFields(message, mutableDiagnostics);
+    const providerDiagnostics = snapshotProviderDiagnostics(mutableDiagnostics);
     const content = (message?.content as string) ?? '';
-    // reasoning_content/thinking intentionally discarded — not accumulated
-
-    // Emit as text event
-    if (content) {
-      yield { type: 'text', content };
-    }
 
     // Extract usage
     const usage = parseCompletionUsage(body.usage);
 
-    // Extract tool calls from non-stream response
-    let toolCalls: ChatCompletionResponse['toolCalls'] | undefined;
-    const rawToolCalls = message?.tool_calls as Array<Record<string, unknown>> | undefined;
-    if (rawToolCalls && rawToolCalls.length > 0) {
-      toolCalls = rawToolCalls.map((tc) => ({
-        id: (tc.id as string) ?? '',
-        name: ((tc.function as Record<string, unknown>)?.name as string) ?? '',
-        arguments: ((tc.function as Record<string, unknown>)?.arguments as string) ?? '',
-      }));
+    const toolCalls = extractJsonResponseToolCalls(
+      message,
+      content,
+      providerDiagnostics,
+    );
+
+    const hasCompleteToolCalls = toolCallsHaveCompleteEnvelope(toolCalls);
+    if (toolCalls && !hasCompleteToolCalls) {
+      throw new IncompleteOutputError(
+        'LLM response contained incomplete tool calls',
+        content,
+        providerDiagnostics,
+      );
     }
+    assertSuccessfulFinishReason(
+      choice?.finish_reason,
+      content,
+      providerDiagnostics,
+      hasCompleteToolCalls,
+    );
+    if (!content && !hasCompleteToolCalls) {
+      throw new IncompleteOutputError(
+        emptyVisibleContentMessage(providerDiagnostics, usage),
+        '',
+        providerDiagnostics,
+      );
+    }
+
+    if (content) yield { type: 'text', content };
 
     yield {
       type: 'done',
@@ -675,6 +936,7 @@ async function* streamCompletion(
       transport: 'json_fallback',
       ...(toolCalls ? { toolCalls } : {}),
       ...(usage ? { usage } : {}),
+      ...(providerDiagnostics ? { providerDiagnostics } : {}),
     };
     return;
   }
@@ -696,16 +958,278 @@ async function* streamCompletion(
   const decoder = new TextDecoder();
 
   // Accumulated state
-  let accumulatedContent = ''; // content-only text from deltas
-  let pendingBuffer = ''; // only the unfinished SSE tail
-  let lastFinishReason: string | null = null;
-  let sawDoneSentinel = false;
+  const contentFragments: string[] = []; // visible content only
+  let visibleContentCharacters = 0;
+  const pendingLineFragments: string[] = [];
+  let pendingLineCharacters = 0;
+  let eventDataLines: string[] = [];
+  let eventDataCharacters = 0;
+  let parsedEventCount = 0;
+  let cleanEofCandidate: 'aggregate_message' | 'final_usage' | null = null;
   let completedNaturally = false;
   let accumulatedUsage: CompletionUsage | undefined;
+  const mutableDiagnostics = createProviderDiagnostics();
   const toolCallAccumulator = new Map<
     number,
     { id: string; name: string; argumentsFragments: string[] }
   >();
+  const content = () => contentFragments.join('');
+  const diagnostics = () => snapshotProviderDiagnostics(mutableDiagnostics);
+  const appendVisibleContent = (fragment: string) => {
+    if (
+      fragment.length > MAX_VISIBLE_CONTENT_CHARACTERS - visibleContentCharacters
+    ) {
+      throw new IncompleteOutputError(
+        'LLM visible content exceeded the bounded stream limit',
+        content(),
+        diagnostics(),
+      );
+    }
+    contentFragments.push(fragment);
+    visibleContentCharacters += fragment.length;
+  };
+  const dataIsComplete = (data: string): boolean => {
+    if (data.trim() === '[DONE]') return true;
+    try {
+      JSON.parse(data);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const dataHasExplicitFinishReason = (data: string): boolean => {
+    try {
+      const value = JSON.parse(data) as {
+        choices?: Array<{ finish_reason?: unknown }>;
+      };
+      const finishReason = value.choices?.[0]?.finish_reason;
+      return finishReason !== null && finishReason !== undefined;
+    } catch {
+      return false;
+    }
+  };
+  function* flushDataEvent(): Generator<string> {
+    if (!eventDataLines.length) return;
+    const lines = eventDataLines;
+    eventDataLines = [];
+    eventDataCharacters = 0;
+    const joined = lines.join('\n');
+    if (dataIsComplete(joined)) {
+      yield joined;
+      return;
+    }
+    // NewAPI may omit blank SSE separators while still sending one complete
+    // JSON payload per data line. Standard multiline data remains joined.
+    if (lines.length > 1 && lines.every(dataIsComplete)) {
+      for (const data of lines) yield data;
+      return;
+    }
+    throw new IncompleteOutputError(
+      'LLM SSE contained malformed or truncated JSON data',
+      content(),
+      diagnostics(),
+    );
+  }
+  function* consumeLine(input: string): Generator<string> {
+    const line = input.endsWith('\r') ? input.slice(0, -1) : input;
+    if (line === '') {
+      yield* flushDataEvent();
+      return;
+    }
+    if (line.startsWith(':')) return;
+    if (!line.startsWith('data:')) return;
+    const data = line.slice(5).replace(/^ /, '');
+    if (data.trim() === '[DONE]') {
+      yield* flushDataEvent();
+      yield '[DONE]';
+      return;
+    }
+    if (eventDataLines.length === 1 && dataIsComplete(eventDataLines[0])) {
+      yield* flushDataEvent();
+    }
+    if (data.length > MAX_SSE_PENDING_CHARACTERS - eventDataCharacters) {
+      throw new IncompleteOutputError(
+        'LLM SSE event exceeded the bounded parser buffer',
+        content(),
+        diagnostics(),
+      );
+    }
+    eventDataLines.push(data);
+    eventDataCharacters += data.length;
+    if (dataHasExplicitFinishReason(data)) yield* flushDataEvent();
+  }
+  const appendPendingLine = (fragment: string) => {
+    if (!fragment) return;
+    if (fragment.length > MAX_SSE_PENDING_CHARACTERS - pendingLineCharacters) {
+      throw new IncompleteOutputError(
+        'LLM SSE line exceeded the bounded parser buffer',
+        content(),
+        diagnostics(),
+      );
+    }
+    pendingLineFragments.push(fragment);
+    pendingLineCharacters += fragment.length;
+  };
+  function* consumeDecodedText(chunk: string): Generator<string> {
+    let start = 0;
+    while (true) {
+      const boundary = chunk.indexOf('\n', start);
+      if (boundary < 0) break;
+      appendPendingLine(chunk.slice(start, boundary));
+      const line = pendingLineFragments.join('');
+      pendingLineFragments.length = 0;
+      pendingLineCharacters = 0;
+      yield* consumeLine(line);
+      start = boundary + 1;
+    }
+    appendPendingLine(chunk.slice(start));
+  }
+  function* flushEof(): Generator<string> {
+    if (pendingLineCharacters) {
+      const line = pendingLineFragments.join('');
+      pendingLineFragments.length = 0;
+      pendingLineCharacters = 0;
+      yield* consumeLine(line);
+    }
+    yield* flushDataEvent();
+  }
+  const finalToolCalls = () => (
+    toolCallAccumulator.size > 0
+      ? Array.from(toolCallAccumulator.entries()).map(([_idx, acc]) => ({
+          id: acc.id,
+          name: acc.name,
+          arguments: acc.argumentsFragments.join(''),
+        }))
+      : undefined
+  );
+  const completionSnapshot = () => {
+    const finalContent = content();
+    const providerDiagnostics = diagnostics();
+    const toolCalls = finalToolCalls();
+    const hasCompleteToolCalls = toolCallsAreComplete(toolCalls);
+    if (toolCalls && !hasCompleteToolCalls) {
+      throw new IncompleteOutputError(
+        'LLM stream contained incomplete tool calls',
+        finalContent,
+        providerDiagnostics,
+      );
+    }
+    if (!finalContent && !hasCompleteToolCalls) {
+      throw new IncompleteOutputError(
+        emptyVisibleContentMessage(providerDiagnostics, accumulatedUsage),
+        '',
+        providerDiagnostics,
+      );
+    }
+    return {
+      finalContent,
+      providerDiagnostics,
+      toolCalls,
+      hasCompleteToolCalls,
+    };
+  };
+  const doneEvent = (
+    snapshot: ReturnType<typeof completionSnapshot>,
+  ): Extract<LLMStreamEvent, { type: 'done' }> => ({
+    type: 'done',
+    content: snapshot.finalContent,
+    transport: 'sse',
+    ...(snapshot.toolCalls ? { toolCalls: snapshot.toolCalls } : {}),
+    ...(accumulatedUsage ? { usage: accumulatedUsage } : {}),
+    ...(snapshot.providerDiagnostics
+      ? { providerDiagnostics: snapshot.providerDiagnostics }
+      : {}),
+  });
+  const reconcileAggregateContent = (aggregate: string): string => {
+    const current = content();
+    if (aggregate === current) return '';
+    if (aggregate.startsWith(current)) {
+      const suffix = aggregate.slice(current.length);
+      appendVisibleContent(suffix);
+      return suffix;
+    }
+    throw new IncompleteOutputError(
+      'LLM aggregate message did not match the streamed visible content',
+      current,
+      diagnostics(),
+    );
+  };
+  const cancelAfterTerminal = async () => {
+    try {
+      await reader.cancel('SSE terminal event received');
+    } catch {
+      // A parsed terminal event remains authoritative if cancellation races EOF.
+    }
+  };
+  function* eventsForRead(chunk: string, done: boolean): Generator<string> {
+    if (chunk) yield* consumeDecodedText(chunk);
+    if (done) yield* flushEof();
+  }
+  const consumeTerminalUsageEvent = (eventData: string): boolean => {
+    if (eventData === '[DONE]') return true;
+    let payload: { usage?: unknown; choices?: unknown };
+    try {
+      payload = JSON.parse(eventData) as typeof payload;
+    } catch {
+      return true;
+    }
+    if (!Array.isArray(payload.choices) || payload.choices.length !== 0) {
+      return true;
+    }
+    const usage = parseCompletionUsage(payload.usage);
+    if (!usage) return true;
+    accumulatedUsage = usage;
+    return true;
+  };
+  const readTerminalTail = async (
+    timeoutMs: number,
+  ): Promise<ReadableStreamReadResult<Uint8Array> | null> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        reader.read(),
+        new Promise<null>((resolve) => {
+          timer = setTimeout(() => resolve(null), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+  const collectTerminalUsageTail = async (): Promise<void> => {
+    const deadline = Date.now() + TERMINAL_USAGE_TAIL_GRACE_MS;
+    let tailEvents = 0;
+    while (tailEvents < MAX_TERMINAL_USAGE_TAIL_EVENTS) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) return;
+      let readResult: ReadableStreamReadResult<Uint8Array> | null;
+      try {
+        readResult = await readTerminalTail(remainingMs);
+      } catch {
+        return;
+      }
+      if (!readResult) return;
+      const chunk = readResult.done
+        ? decoder.decode()
+        : decoder.decode(readResult.value, { stream: true });
+      if (chunk.length > MAX_SSE_PENDING_CHARACTERS) return;
+      let iterator: Generator<string>;
+      try {
+        iterator = eventsForRead(chunk, readResult.done);
+        while (tailEvents < MAX_TERMINAL_USAGE_TAIL_EVENTS) {
+          const next = iterator.next();
+          if (next.done) break;
+          tailEvents += 1;
+          if (parsedEventCount >= MAX_SSE_EVENTS) return;
+          parsedEventCount += 1;
+          if (consumeTerminalUsageEvent(next.value)) return;
+        }
+      } catch {
+        return;
+      }
+      if (readResult.done) return;
+    }
+  };
 
   try {
     while (true) {
@@ -714,152 +1238,213 @@ async function* streamCompletion(
         ? decoder.decode()
         : decoder.decode(value, { stream: true });
       if (!done) onActivity();
-      if (chunk) pendingBuffer += chunk;
 
-      const { completeText, remainder } =
-        takeCompleteSSEText(pendingBuffer);
-      pendingBuffer = remainder;
-      const events = completeText ? parseSSEChunk(completeText) : [];
+      let authoritativeSnapshot:
+        | ReturnType<typeof completionSnapshot>
+        | undefined;
+      let terminalTailSettled = false;
+      const dataIterator = eventsForRead(chunk, done);
+      while (true) {
+        let next: IteratorResult<string>;
+        try {
+          next = dataIterator.next();
+        } catch (error) {
+          if (authoritativeSnapshot) {
+            terminalTailSettled = true;
+            break;
+          }
+          throw error;
+        }
+        if (next.done) break;
+        const eventData = next.value;
 
-      for (const event of events) {
+        if (authoritativeSnapshot) {
+          if (parsedEventCount >= MAX_SSE_EVENTS) {
+            terminalTailSettled = true;
+            break;
+          }
+          parsedEventCount += 1;
+          terminalTailSettled = consumeTerminalUsageEvent(eventData);
+          if (terminalTailSettled) break;
+          continue;
+        }
+
+        parsedEventCount += 1;
+        if (parsedEventCount > MAX_SSE_EVENTS) {
+          throw new IncompleteOutputError(
+            'LLM SSE stream exceeded the bounded event limit',
+            content(),
+            diagnostics(),
+          );
+        }
 
         // [DONE] sentinel
-        if (event.data === '[DONE]') {
-          sawDoneSentinel = true;
-          if (lastFinishReason === 'length') {
-            throw new IncompleteOutputError(
-              'LLM response was truncated because the completion token limit was reached',
-            );
-          }
-          // Assemble final toolCalls from accumulated fragments
-          let finalToolCalls:
-            | Array<{ id: string; name: string; arguments: string }>
-            | undefined;
-
-          if (toolCallAccumulator.size > 0) {
-            finalToolCalls = Array.from(
-              toolCallAccumulator.entries(),
-            ).map(([_idx, acc]) => ({
-              id: acc.id,
-              name: acc.name,
-              arguments: acc.argumentsFragments.join(''),
-            }));
-          }
-
+        if (eventData === '[DONE]') {
+          const snapshot = completionSnapshot();
           completedNaturally = true;
-          yield {
-            type: 'done',
-            content: accumulatedContent,
-            transport: 'sse',
-            ...(finalToolCalls ? { toolCalls: finalToolCalls } : {}),
-            ...(accumulatedUsage ? { usage: accumulatedUsage } : {}),
-          };
+          await cancelAfterTerminal();
+          yield doneEvent(snapshot);
           return;
         }
 
         // Parse the SSE data as JSON
+        let payload: {
+          usage?: unknown;
+          choices?: Array<{
+            finish_reason?: unknown;
+            delta?: Record<string, unknown>;
+            message?: Record<string, unknown>;
+          }>;
+        };
         try {
-          const delta = JSON.parse(event.data);
-          const usage = parseCompletionUsage(delta.usage);
-          if (usage) accumulatedUsage = usage;
-
-          const choice = delta.choices?.[0];
-          if (!choice) continue;
-          if (typeof choice.finish_reason === 'string') {
-            lastFinishReason = choice.finish_reason;
-          }
-
-          const deltaObj = choice.delta;
-          if (!deltaObj) continue;
-
-          // ---- Text delta ----
-          // reasoning_content/thinking intentionally discarded — not accumulated
-          if (typeof deltaObj.content === 'string' && deltaObj.content.length > 0) {
-            accumulatedContent += deltaObj.content;
-            yield { type: 'text', content: deltaObj.content };
-          }
-
-          // ---- Tool call delta ----
-          if (Array.isArray(deltaObj.tool_calls)) {
-            for (const tc of deltaObj.tool_calls as Array<Record<string, unknown>>) {
-              const idx = (tc.index as number) ?? 0;
-
-              if (!toolCallAccumulator.has(idx)) {
-                toolCallAccumulator.set(idx, {
-                  id: (tc.id as string) ?? '',
-                  name: '',
-                  argumentsFragments: [],
-                });
-              }
-
-              const acc = toolCallAccumulator.get(idx)!;
-
-              // Update id if provided (typically only in the first delta)
-              if (tc.id && typeof tc.id === 'string') {
-                acc.id = tc.id;
-              }
-
-              // Update function name if provided
-              const func = tc.function as Record<string, unknown> | undefined;
-              if (func?.name && typeof func.name === 'string') {
-                acc.name = func.name;
-              }
-
-              // Accumulate arguments fragment
-              if (func?.arguments && typeof func.arguments === 'string') {
-                acc.argumentsFragments.push(func.arguments);
-              }
-
-              yield {
-                type: 'tool_call_delta',
-                index: idx,
-                id: tc.id as string | undefined,
-                name: func?.name as string | undefined,
-                arguments: (func?.arguments as string) ?? '',
-              };
-            }
-          }
+          payload = JSON.parse(eventData) as typeof payload;
         } catch {
-          // Skip malformed SSE data chunks
+          throw new IncompleteOutputError(
+            'LLM SSE contained malformed JSON data',
+            content(),
+            diagnostics(),
+          );
         }
+        const usage = parseCompletionUsage(payload.usage);
+        if (usage) accumulatedUsage = usage;
+
+        const choice = payload.choices?.[0];
+        if (!choice) {
+          cleanEofCandidate = usage && visibleContentCharacters > 0
+            ? 'final_usage'
+            : null;
+          continue;
+        }
+
+        const deltaObj = choice.delta;
+        const aggregateMessage = choice.message;
+        const hasDeltaObject = Boolean(
+          deltaObj && typeof deltaObj === 'object' && !Array.isArray(deltaObj),
+        );
+        observeReasoningFields(deltaObj, mutableDiagnostics);
+        observeReasoningFields(aggregateMessage, mutableDiagnostics);
+
+        // ---- Text delta ----
+        if (typeof deltaObj?.content === 'string' && deltaObj.content.length > 0) {
+          appendVisibleContent(deltaObj.content);
+          yield { type: 'text', content: deltaObj.content };
+        }
+
+        // ---- Aggregate message ----
+        let hasAggregateEvidence = false;
+        if (
+          typeof aggregateMessage?.content === 'string' &&
+          aggregateMessage.content.length > 0
+        ) {
+          const suffix = reconcileAggregateContent(aggregateMessage.content);
+          if (suffix) yield { type: 'text', content: suffix };
+          hasAggregateEvidence = true;
+        }
+
+        // ---- Tool call delta ----
+        if (Array.isArray(deltaObj?.tool_calls)) {
+          for (const tc of deltaObj.tool_calls as Array<Record<string, unknown>>) {
+            const idx = (tc.index as number) ?? 0;
+
+            if (!toolCallAccumulator.has(idx)) {
+              toolCallAccumulator.set(idx, {
+                id: (tc.id as string) ?? '',
+                name: '',
+                argumentsFragments: [],
+              });
+            }
+
+            const acc = toolCallAccumulator.get(idx)!;
+            if (tc.id && typeof tc.id === 'string') acc.id = tc.id;
+
+            const func = tc.function as Record<string, unknown> | undefined;
+            if (func?.name && typeof func.name === 'string') acc.name = func.name;
+            if (func?.arguments && typeof func.arguments === 'string') {
+              acc.argumentsFragments.push(func.arguments);
+            }
+
+            yield {
+              type: 'tool_call_delta',
+              index: idx,
+              id: tc.id as string | undefined,
+              name: func?.name as string | undefined,
+              arguments: (func?.arguments as string) ?? '',
+            };
+          }
+        }
+
+        if (typeof choice.finish_reason === 'string') {
+          const providerDiagnostics = diagnostics();
+          const toolCalls = finalToolCalls();
+          assertSuccessfulFinishReason(
+            choice.finish_reason,
+            content(),
+            providerDiagnostics,
+            toolCallsAreComplete(toolCalls),
+          );
+          authoritativeSnapshot = completionSnapshot();
+          continue;
+        }
+        if (
+          choice.finish_reason !== null && choice.finish_reason !== undefined
+        ) {
+          assertSuccessfulFinishReason(
+            undefined,
+            content(),
+            diagnostics(),
+            toolCallsAreComplete(finalToolCalls()),
+          );
+        }
+
+        cleanEofCandidate = hasAggregateEvidence
+          ? 'aggregate_message'
+          : usage && !hasDeltaObject && visibleContentCharacters > 0
+            ? 'final_usage'
+            : null;
+      }
+      if (authoritativeSnapshot) {
+        if (!terminalTailSettled) await collectTerminalUsageTail();
+        completedNaturally = true;
+        await cancelAfterTerminal();
+        yield doneEvent(authoritativeSnapshot);
+        return;
       }
       if (done) break;
     }
 
-    if (lastFinishReason === 'length') {
-      throw new IncompleteOutputError(
-        'LLM response was truncated because the completion token limit was reached',
-      );
-    }
-    if (!sawDoneSentinel && !lastFinishReason) {
+    if (!cleanEofCandidate) {
       throw new IncompleteOutputError(
         'LLM stream closed without a completion marker',
+        content(),
+        diagnostics(),
       );
     }
-
-    // Some compatible providers omit [DONE] but send a terminal finish_reason.
-    let finalToolCalls:
-      | Array<{ id: string; name: string; arguments: string }>
-      | undefined;
-
-    if (toolCallAccumulator.size > 0) {
-      finalToolCalls = Array.from(toolCallAccumulator.entries()).map(
-        ([_idx, acc]) => ({
-          id: acc.id,
-          name: acc.name,
-          arguments: acc.argumentsFragments.join(''),
-        }),
-      );
-    }
+    const snapshot = completionSnapshot();
+    assertSuccessfulFinishReason(
+      'stop',
+      snapshot.finalContent,
+      snapshot.providerDiagnostics,
+      snapshot.hasCompleteToolCalls,
+    );
 
     completedNaturally = true;
-    yield {
-      type: 'done',
-      content: accumulatedContent,
-      transport: 'sse',
-      ...(finalToolCalls ? { toolCalls: finalToolCalls } : {}),
-      ...(accumulatedUsage ? { usage: accumulatedUsage } : {}),
-    };
+    yield doneEvent(snapshot);
+  } catch (error: unknown) {
+    // A socket/proxy interruption after visible deltas must not erase the
+    // partial provider output. Guard-triggered aborts retain their timeout or
+    // cancellation identity; their consumer already holds the yielded text.
+    if (
+      visibleContentCharacters > 0 &&
+      !signal.aborted &&
+      !(error instanceof IncompleteOutputError)
+    ) {
+      throw new IncompleteOutputError(
+        'LLM stream was interrupted before a completion marker',
+        content(),
+        diagnostics(),
+      );
+    }
+    throw error;
   } finally {
     // An early consumer return must tear down the upstream response, not just
     // release our local lock and leave the provider generating in background.
@@ -903,14 +1488,22 @@ async function* streamCompletion(
  *   - AbortedError — non-retryable
  */
 export async function chatCompletion(
-  endpoint: { baseUrl: string; apiKey: string; chatCompletionsPath?: string },
+  endpoint: ChatCompletionEndpoint,
   request: ChatCompletionRequest,
 ): Promise<ChatCompletionResponse | AsyncIterable<LLMStreamEvent>> {
-  const idleTimeoutMs = request.timeoutMs ?? AGENT_TIMEOUT_MS;
-  const maxDurationMs = request.maxDurationMs ?? AGENT_MAX_DURATION_MS;
+  // Callers may shorten either guard, but cannot extend a physical request
+  // beyond the product-wide fifteen-minute upstream ceiling.
+  const idleTimeoutMs = Math.min(
+    request.timeoutMs ?? AGENT_TIMEOUT_MS,
+    AGENT_MAX_DURATION_MS,
+  );
+  const maxDurationMs = Math.min(
+    request.maxDurationMs ?? AGENT_MAX_DURATION_MS,
+    AGENT_MAX_DURATION_MS,
+  );
   const guard = createRequestGuard(
     idleTimeoutMs,
-    Math.max(idleTimeoutMs, maxDurationMs),
+    maxDurationMs,
     request.signal,
   );
   const onActivity = () => {
@@ -942,6 +1535,8 @@ export async function chatCompletion(
     // but callers still need the stable external-abort contract.
     if (guard.signal.aborted) throwGuardAbort(guard.reason());
 
+    if (isRuntimeCredentialError(error)) throw error;
+
     // If already an LLMError, re-throw as-is
     if (error instanceof LLMError) {
       throw error;
@@ -970,6 +1565,7 @@ function normalizeStreamIterationError(
   // abort can race with a provider socket failure that was already mapped to
   // NetworkError; the externally visible result must remain AbortedError.
   if (guard.signal.aborted) throwGuardAbort(guard.reason());
+  if (isRuntimeCredentialError(error)) throw error;
   if (error instanceof LLMError) throw error;
 
   if (

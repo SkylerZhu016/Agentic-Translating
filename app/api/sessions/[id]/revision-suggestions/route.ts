@@ -9,6 +9,14 @@ import {
   logSafeDiagnostic,
   publicDiagnosticError,
 } from '@/src/lib/security/diagnostic-error'
+import {
+  SESSION_PREFLIGHT_DEFAULTS,
+  assertPhysicalPaidCallPreflight,
+  loadStoredSessionSnapshotForChat,
+  resolvePreflightOutputLimit,
+  sessionPreflightErrorDto,
+} from '@/src/lib/services/session-preflight'
+import { runtimeEndpointCredentialErrorDto } from '@/src/lib/services/runtime-endpoint-credentials'
 
 function inferRevisionPromptLanguage(params: {
   snapshot: ConfigSnapshot
@@ -57,11 +65,28 @@ export async function POST(
 
   let snapshot: ConfigSnapshot
   try {
-    snapshot = JSON.parse(session.config_snapshot) as ConfigSnapshot
-  } catch {
+    snapshot = loadStoredSessionSnapshotForChat(db, session)
+  } catch (error) {
+    const preflightError = sessionPreflightErrorDto(error)
+    if (preflightError) {
+      return NextResponse.json(preflightError.body, {
+        status: preflightError.status,
+      })
+    }
     return NextResponse.json({ error: 'invalid_snapshot' }, { status: 500 })
   }
-  const config = resolveChatConfig(snapshot)
+  let config: ReturnType<typeof resolveChatConfig>
+  try {
+    config = resolveChatConfig(snapshot, db)
+  } catch (error) {
+    const credentialError = runtimeEndpointCredentialErrorDto(error)
+    if (credentialError) {
+      return NextResponse.json(credentialError.body, {
+        status: credentialError.status,
+      })
+    }
+    throw error
+  }
   if (!config) {
     return NextResponse.json({ error: 'no_chat_config' }, { status: 400 })
   }
@@ -73,6 +98,20 @@ export async function POST(
   })
   const projectContext = sessionProjectContextBlock(db, id, promptLanguage)
   const taskBrief = session.task_brief ?? ''
+  const frozenContextWindow = config.contextWindow
+  const frozenOutputLimit = config.maxOutputTokens ??
+    (snapshot.preflight
+      ? resolvePreflightOutputLimit(
+          snapshot.preflight,
+          {
+            bindingRole: 'editingAgent',
+            endpointId: config.endpointId,
+            model: config.model,
+          },
+        )
+      : snapshot.version === 3
+        ? SESSION_PREFLIGHT_DEFAULTS.maxOutputTokens
+        : null)
 
   try {
     const result = await generateRevisionSuggestion({
@@ -89,14 +128,33 @@ export async function POST(
         : taskBrief,
       currentTranslation: latest.text,
       userRequest: body.message.trim(),
+      preflightPhysicalCall(call) {
+        return assertPhysicalPaidCallPreflight({
+          stage: call.operation,
+          bindingRole: 'editingAgent',
+          endpointId: config.endpointId,
+          model: config.model,
+          contextWindow: frozenContextWindow,
+          maxOutputTokens: frozenOutputLimit,
+          messages: call.messages,
+          attempted: call.attempted,
+        })
+      },
       ledger: {
         db,
         sessionId: id,
         endpointId: config.endpointId,
+        requireCurrentCredential: true,
       },
     })
     return NextResponse.json(result)
   } catch (error) {
+    const preflightError = sessionPreflightErrorDto(error)
+    if (preflightError) {
+      return NextResponse.json(preflightError.body, {
+        status: preflightError.status,
+      })
+    }
     const diagnostic = publicDiagnosticError('suggestion_failed')
     logSafeDiagnostic({
       scope: 'chat.revision_suggestion',

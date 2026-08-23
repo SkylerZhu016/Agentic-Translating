@@ -12,12 +12,17 @@ import {
 } from '../../src/lib/constants'
 
 describe('operational constants', () => {
-  it('AGENT_TIMEOUT_MS = 20 minutes', () => {
-    expect(AGENT_TIMEOUT_MS).toBe(20 * 60_000)
+  it('AGENT_TIMEOUT_MS = 900 seconds', () => {
+    expect(AGENT_TIMEOUT_MS).toBe(900_000)
   })
 
-  it('AGENT_MAX_DURATION_MS = 90 minutes', () => {
-    expect(AGENT_MAX_DURATION_MS).toBe(90 * 60_000)
+  it('AGENT_MAX_DURATION_MS = 900 seconds', () => {
+    expect(AGENT_MAX_DURATION_MS).toBe(900_000)
+  })
+
+  it('does not regress either physical-call guard below the 900-second contract', () => {
+    expect(AGENT_TIMEOUT_MS).toBe(15 * 60_000)
+    expect(AGENT_MAX_DURATION_MS).toBe(15 * 60_000)
   })
 
   it('MAX_CONCURRENCY = 8', () => {

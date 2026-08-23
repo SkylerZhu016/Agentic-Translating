@@ -23,13 +23,20 @@ import { chatCompletion } from '@/src/lib/llm/client'
 import { encodeSSE } from '@/src/lib/contracts/sse'
 import type { Stage, StageOutput, TranslationResult } from '@/src/lib/contracts/types'
 import type { SessionContext, StageRunResult } from '@/src/lib/orchestration/pipeline'
-import { decryptSecret } from '@/src/lib/security/secrets'
 import {
   executionDiagnosticError,
   logSafeDiagnostic,
   serializeExecutionDiagnosticError,
   type ExecutionDiagnosticErrorDto,
 } from '@/src/lib/security/diagnostic-error'
+import {
+  ensureStoredSessionPreflight,
+  sessionPreflightErrorDto,
+} from '@/src/lib/services/session-preflight'
+import {
+  currentRuntimeEndpoint,
+  resolveRuntimeEndpoint,
+} from '@/src/lib/services/runtime-endpoint-credentials'
 
 // =============================================================================
 // Constants
@@ -142,8 +149,15 @@ export function createHandlers(db: Database.Database) {
       return NextResponse.json({ error: 'Session not found' }, { status: 404 })
     }
     try {
-      const snapshot = JSON.parse(session.config_snapshot) as { version?: number }
-      if (snapshot.version === 3) {
+      const snapshot = JSON.parse(session.config_snapshot) as Record<string, unknown>
+      if (
+        snapshot.version === 3 &&
+        snapshot.promptBundleSnapshot &&
+        snapshot.modelBindings &&
+        Array.isArray(snapshot.endpointSnapshots) &&
+        Array.isArray(snapshot.agentVariantSnapshots) &&
+        snapshot.orchestrationPolicy
+      ) {
         return NextResponse.json(
           {
             error: 'vnext_stage_is_automatic',
@@ -154,6 +168,17 @@ export function createHandlers(db: Database.Database) {
       }
     } catch {
       // Legacy malformed snapshots continue through the existing validation.
+    }
+    try {
+      ensureStoredSessionPreflight(db, session)
+    } catch (error) {
+      const preflightError = sessionPreflightErrorDto(error)
+      if (preflightError) {
+        return NextResponse.json(preflightError.body, {
+          status: preflightError.status,
+        })
+      }
+      throw error
     }
 
     // ── 2. Guard: session state ───────────────────────────────────
@@ -249,16 +274,12 @@ export function createHandlers(db: Database.Database) {
     }[stage] ?? snapshot.modelBindings?.mainAgent
     const coordinatorEndpointId =
       stageBinding?.endpointId ??
-      snapshot.coordinator?.endpoint_id
-    const endpoint =
-      snapshot.endpointSnapshots?.find(
-        (candidate) => candidate.id === coordinatorEndpointId,
-      ) ??
-      snapshot.endpoints?.find(
-        (candidate) => candidate.id === coordinatorEndpointId,
-      ) ??
-      snapshot.endpoint
-    if (!endpoint) {
+      snapshot.coordinator?.endpoint_id ??
+      null
+    let endpoint: ReturnType<typeof resolveRuntimeEndpoint>
+    try {
+      endpoint = resolveRuntimeEndpoint(db, snapshot, coordinatorEndpointId)
+    } catch (error) {
       // Roll back running status
       const rollbackRow = repos.stageOutputs.getBySessionAndStage(sessionId, stage)
       if (rollbackRow) {
@@ -267,26 +288,23 @@ export function createHandlers(db: Database.Database) {
           status: 'failed',
           prompt_used: null,
           raw_output: null,
-          error: 'No LLM endpoint configured.',
+          error: error instanceof Error ? error.message : 'No LLM endpoint configured.',
         })
       }
       return NextResponse.json(
         {
-          error: 'No LLM endpoint configured. Please configure an endpoint first.',
+          error: error instanceof Error
+            ? error.message
+            : 'No LLM endpoint configured. Please configure an endpoint first.',
         },
         { status: 400 },
       )
     }
 
     const coordinatorEndpoint = {
-      baseUrl: 'baseUrl' in endpoint ? endpoint.baseUrl : endpoint.base_url,
-      chatCompletionsPath:
-        'baseUrl' in endpoint
-          ? endpoint.chatCompletionsPath ?? '/v1/chat/completions'
-          : endpoint.chat_completions_path ?? '/v1/chat/completions',
-      apiKey: decryptSecret(
-        'apiKey' in endpoint ? endpoint.apiKey : endpoint.api_key,
-      ),
+      baseUrl: endpoint.baseUrl,
+      chatCompletionsPath: endpoint.chatCompletionsPath,
+      apiKey: endpoint.apiKey,
     }
     const coordinatorModel =
       stageBinding?.model ||
@@ -416,7 +434,14 @@ export function createHandlers(db: Database.Database) {
                 // Handled in persistence below
               },
             },
-            chatCompletion,
+            (runtimeEndpoint, llmRequest) => chatCompletion(
+              {
+                ...runtimeEndpoint,
+                resolveRuntimeEndpoint: () =>
+                  currentRuntimeEndpoint(db, endpoint.id),
+              },
+              llmRequest,
+            ),
           )
         } catch (err: unknown) {
           emitFailure(err)

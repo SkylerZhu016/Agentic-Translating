@@ -10,10 +10,13 @@
  * forwards them; the longer idle window also covers providers that buffer
  * those deltas.
  */
-export const AGENT_TIMEOUT_MS = 20 * 60_000
+export const AGENT_TIMEOUT_MS = 15 * 60_000
 
-/** Absolute safety ceiling for one model call, even while the stream is active. */
-export const AGENT_MAX_DURATION_MS = 90 * 60_000
+/**
+ * Absolute safety ceiling for one physical model call, even while the stream
+ * is active. Calls still unfinished at fifteen minutes are upstream failures.
+ */
+export const AGENT_MAX_DURATION_MS = 15 * 60_000
 
 /** Default model completion budget; reasoning models may use much of it. */
 export const DEFAULT_COMPLETION_TOKEN_BUDGET = 65_536

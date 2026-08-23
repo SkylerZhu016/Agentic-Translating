@@ -5,6 +5,7 @@ import { Badge, Button, Card, Spinner, Textarea } from '@/src/components/ui'
 import { useDirection } from '@/src/components/direction/DirectionProvider'
 import type { DirectionPromptBundle } from '@/src/lib/contracts/vnext'
 import type { NotifyFn } from './shared'
+import { useI18n, type MessageKey } from '@/src/i18n'
 
 interface PromptBundleView {
   id: string
@@ -19,19 +20,20 @@ interface PromptBundleView {
 }
 
 const MODULES = [
-  ['mainAgentSystemPrompt', '主 Agent'],
-  ['workerBasePrompt', '翻译公共基础'],
-  ['reviewPrompt', '审查'],
-  ['filterPrompt', '筛选'],
-  ['orchestratePrompt', '编排'],
-  ['assemblePrompt', '组装'],
-  ['editingPrompt', '编辑'],
-] as const
+  ['mainAgentSystemPrompt', 'promptBundle.module.mainAgent'],
+  ['workerBasePrompt', 'promptBundle.module.workerBase'],
+  ['reviewPrompt', 'promptBundle.module.review'],
+  ['filterPrompt', 'promptBundle.module.filter'],
+  ['orchestratePrompt', 'promptBundle.module.orchestrate'],
+  ['assemblePrompt', 'promptBundle.module.assemble'],
+  ['editingPrompt', 'promptBundle.module.editing'],
+] as const satisfies ReadonlyArray<readonly [keyof DirectionPromptBundle, MessageKey]>
 
 type ModuleKey = (typeof MODULES)[number][0]
 
 export function PromptBundlePanel({ notify }: { notify: NotifyFn }) {
   const { direction } = useDirection()
+  const { t, formatNumber } = useI18n()
   const [bundles, setBundles] = useState<PromptBundleView[]>([])
   const [selectedId, setSelectedId] = useState('')
   const [moduleKey, setModuleKey] =
@@ -73,20 +75,20 @@ export function PromptBundlePanel({ notify }: { notify: NotifyFn }) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          name: `${selected.name} · 用户副本`,
+          name: t('promptBundle.userCopyName', { name: selected.name }),
           direction,
           payload: { ...draft, version: 1 },
         }),
       })
-      if (!response.ok) throw new Error('复制失败')
+      if (!response.ok) throw new Error(t('promptBundle.error.clone'))
       const created = (await response.json()) as PromptBundleView
-      notify('已复制为用户提示词包', { tone: 'inverted' })
+      notify(t('promptBundle.cloned'), { tone: 'inverted' })
       await load()
       setSelectedId(created.id)
       setDraft(created.currentRevision.payload)
     } catch (error) {
-      notify('复制失败', {
-        message: error instanceof Error ? error.message : '请重试',
+      notify(t('promptBundle.error.clone'), {
+        message: error instanceof Error ? error.message : t('config.error.tryLater'),
       })
     } finally {
       setSaving(false)
@@ -108,12 +110,12 @@ export function PromptBundlePanel({ notify }: { notify: NotifyFn }) {
           }),
         },
       )
-      if (!response.ok) throw new Error('保存 revision 失败')
-      notify('提示词包已生成新 revision', { tone: 'inverted' })
+      if (!response.ok) throw new Error(t('promptBundle.error.saveRevision'))
+      notify(t('promptBundle.savedRevision'), { tone: 'inverted' })
       await load()
     } catch (error) {
-      notify('保存失败', {
-        message: error instanceof Error ? error.message : '请重试',
+      notify(t('config.error.save'), {
+        message: error instanceof Error ? error.message : t('config.error.tryLater'),
       })
     } finally {
       setSaving(false)
@@ -122,12 +124,14 @@ export function PromptBundlePanel({ notify }: { notify: NotifyFn }) {
 
   return (
     <Card
-      overline="Prompt Center"
-      title="提示词中心"
+      overline={t('promptBundle.overline')}
+      title={t('promptBundle.title')}
       actions={
         selected ? (
           <Badge variant={selected.isBuiltin ? 'solid' : 'outline'}>
-            {selected.isBuiltin ? '官方只读' : `revision ${selected.currentRevisionNo}`}
+            {selected.isBuiltin
+              ? t('promptBundle.officialReadonly')
+              : t('promptBundle.revision', { revision: formatNumber(selected.currentRevisionNo) })}
           </Badge>
         ) : undefined
       }
@@ -141,19 +145,22 @@ export function PromptBundlePanel({ notify }: { notify: NotifyFn }) {
           >
             {bundles.map((bundle) => (
               <option key={bundle.id} value={bundle.id}>
-                {bundle.name} v{bundle.currentRevisionNo}
+                {t('promptBundle.option', {
+                  name: bundle.name,
+                  version: formatNumber(bundle.currentRevisionNo),
+                })}
               </option>
             ))}
           </select>
           <div className="flex flex-wrap gap-1.5">
-            {MODULES.map(([key, label]) => (
+            {MODULES.map(([key, labelKey]) => (
               <Button
                 key={key}
                 size="sm"
                 variant={moduleKey === key ? 'primary' : 'outline'}
                 onClick={() => setModuleKey(key)}
               >
-                {label}
+                {t(labelKey)}
               </Button>
             ))}
           </div>
@@ -168,11 +175,13 @@ export function PromptBundlePanel({ notify }: { notify: NotifyFn }) {
                   : current,
               )
             }
-            aria-label={`${MODULES.find(([key]) => key === moduleKey)?.[1]}提示词`}
+            aria-label={t('promptBundle.promptAria', {
+              module: t(MODULES.find(([key]) => key === moduleKey)?.[1] ?? 'promptBundle.module.mainAgent'),
+            })}
           />
           <details className="rounded-sm border border-line bg-paper/55">
             <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-ink-3">
-              工具说明
+              {t('promptBundle.toolDescriptions')}
             </summary>
             <pre className="max-h-56 overflow-auto whitespace-pre-wrap border-t border-line px-3 py-2 text-xs leading-5 text-ink-2">
               {JSON.stringify(draft.toolDescriptions, null, 2)}
@@ -185,7 +194,7 @@ export function PromptBundlePanel({ notify }: { notify: NotifyFn }) {
               disabled={saving}
               onClick={() => void cloneOfficial()}
             >
-              {saving && <Spinner size="sm" />}复制为用户包
+              {saving && <Spinner size="sm" />}{t('promptBundle.clone')}
             </Button>
           ) : (
             <Button
@@ -193,12 +202,12 @@ export function PromptBundlePanel({ notify }: { notify: NotifyFn }) {
               disabled={saving}
               onClick={() => void saveRevision()}
             >
-              {saving && <Spinner size="sm" />}保存为新 revision
+              {saving && <Spinner size="sm" />}{t('promptBundle.saveRevision')}
             </Button>
           )}
         </div>
       ) : (
-        <p className="text-sm text-ink-3">当前方向没有可用提示词包。</p>
+        <p className="text-sm text-ink-3">{t('promptBundle.empty')}</p>
       )}
     </Card>
   )

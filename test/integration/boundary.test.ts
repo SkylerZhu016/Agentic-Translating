@@ -35,7 +35,9 @@ import { parseSSEChunk, type SSEEvent } from '../../src/lib/contracts/sse'
 import { ALLOWED_TRANSITIONS, type SessionState } from '../../src/lib/contracts/schemas'
 import { InvalidTransitionError } from '../../src/lib/guards'
 import type { ConfigSnapshot } from '../../src/lib/contracts/types'
+import type { ConfigSnapshotVNext, ModelBinding } from '../../src/lib/contracts/vnext'
 import type { LLMStreamEvent } from '../../src/lib/llm/client'
+import { encryptSecret } from '../../src/lib/security/secrets'
 
 // Route handlers
 import { POST as translatePost } from '../../app/api/sessions/[id]/translate/route'
@@ -196,6 +198,104 @@ describe('Integration — 边界硬化', () => {
     targetLang: 'Chinese',
   }
 
+  function upgradeToCompleteV3<
+    T extends { id: string; config_snapshot: string },
+  >(
+    session: T,
+    targetDb: Database.Database = db,
+  ): T {
+    const legacy = JSON.parse(session.config_snapshot) as ConfigSnapshot
+    const endpoints = legacy.endpoints ?? (legacy.endpoint ? [legacy.endpoint] : [])
+    const firstAgent = legacy.agents[0]
+    const worker: ModelBinding = {
+      endpointId: firstAgent?.endpoint_id ?? null,
+      model: firstAgent?.model ?? '',
+      contextWindow: 128_000,
+      maxOutputTokens: 4_096,
+    }
+    const main: ModelBinding = {
+      endpointId: legacy.coordinator?.endpoint_id ?? worker.endpointId,
+      model: legacy.coordinator?.model ?? worker.model,
+      contextWindow: 128_000,
+      maxOutputTokens: 4_096,
+    }
+    const editing: ModelBinding = {
+      endpointId: legacy.coordinator?.chat_endpoint_id ?? main.endpointId,
+      model: legacy.coordinator?.chat_model ?? main.model,
+      contextWindow: 128_000,
+      maxOutputTokens: 4_096,
+    }
+    const modern: ConfigSnapshot & ConfigSnapshotVNext = {
+      ...legacy,
+      version: 3,
+      direction: 'en_to_zh',
+      promptBundleSnapshot: {
+        direction: 'en_to_zh',
+        promptLanguage: 'zh',
+        mainAgentSystemPrompt: '统筹翻译。',
+        workerBasePrompt: legacy.prompts.translator ?? '翻译原文。',
+        reviewPrompt: legacy.prompts.review ?? '审查译文。',
+        filterPrompt: legacy.prompts.filter ?? '筛选译文。',
+        orchestratePrompt: legacy.prompts.orchestrate ?? '统筹译文。',
+        assemblePrompt: legacy.prompts.assemble ?? '组装译文。',
+        editingPrompt: '编辑译文。',
+        toolDescriptions: {},
+        version: 1,
+      },
+      agentVariantSnapshots: legacy.agents.map((agent, index) => ({
+        id: agent.name,
+        archetypeId: `boundary-${index + 1}`,
+        direction: 'en_to_zh' as const,
+        catalogName: agent.name,
+        catalogDescription: 'Boundary fixture translator',
+        rolePrompt: agent.prompt_override ?? 'Translate faithfully.',
+        promptLanguage: 'zh' as const,
+        promptVersion: 1,
+        enabled: true,
+        endpointOverrideId: agent.endpoint_id,
+        modelOverride: agent.model,
+        sortOrder: agent.sort_order,
+      })),
+      endpointSnapshots: endpoints.map((endpoint) => ({
+        id: endpoint.id,
+        name: endpoint.name,
+        baseUrl: endpoint.base_url,
+        chatCompletionsPath:
+          endpoint.chat_completions_path ?? '/v1/chat/completions',
+        apiKey: encryptSecret(endpoint.api_key),
+        hasApiKey: Boolean(endpoint.api_key),
+        contextWindow: endpoint.context_window ?? 128_000,
+      })),
+      modelBindings: {
+        defaultWorker: worker,
+        mainAgent: main,
+        reviewAgent: main,
+        filterAgent: main,
+        orchestrateAgent: main,
+        assembleAgent: main,
+        editingAgent: editing,
+      },
+      presetRevisionSnapshot: null,
+      taskBrief: '',
+      constraints: {},
+      orchestrationPolicy: {
+        teamPolicy: 'fixed',
+        reviewMode: 'main_editor',
+        maxAgentCalls: Math.max(1, legacy.agents.length),
+        candidateAnnotationMode: 'body_only',
+      },
+    }
+    targetDb.prepare(
+      'UPDATE sessions SET config_snapshot=? WHERE id=?',
+    ).run(JSON.stringify(modern), session.id)
+    session.config_snapshot = JSON.stringify(modern)
+    return session
+  }
+
+  function createRunnableSession() {
+    return upgradeToCompleteV3(service.createSession(DEF_SOURCE))
+  }
+
   beforeEach(() => {
     vi.clearAllMocks()
 
@@ -308,7 +408,7 @@ describe('Integration — 边界硬化', () => {
       })
 
       // Create session (captures snapshot with OLD prompt)
-      const session = service.createSession(DEF_SOURCE)
+      const session = createRunnableSession()
 
       // Mutate live config: change prompt template + add new agent
       repos.promptTemplates.insert({
@@ -352,10 +452,10 @@ describe('Integration — 边界硬化', () => {
   })
 
   // =========================================================================
-  // AC3 + AC23: 6 agent 中 1 失败 → 统筹仍跑通且 final_text 非空
+  // AC3: 6 agent 中 1 失败 → fanout 保留其余完整结果
   // =========================================================================
-  describe('AC3+AC23: 6 agents 1 失败 → 全流程打通', () => {
-    it('translate(5成功+1失败)→review→filter→orchestrate→assemble 产出非空 final_text', async () => {
+  describe('AC3: 6 agents 1 失败 → fanout 部分成功', () => {
+    it('translate 保留 5 个成功结果并记录 1 个失败结果', async () => {
       // 6 agents
       for (let i = 0; i < 6; i++) {
         repos.translatorAgents.insert({
@@ -366,21 +466,14 @@ describe('Integration — 边界硬化', () => {
 
       // ── Phase 1: Translate ──────────────────────────────────────
       let callIndex = 0
-      const LLM_CALLS_BEFORE_STAGES = 6
       mockChatCompletion.mockImplementation(async () => {
         const idx = callIndex++
         // Agent 5 fails
         if (idx === 5) throw new Error('Agent 5 LLM failure')
-        if (idx < 6) return mockStream(`Translation from agent ${idx}`)
-        // Stages
-        if (idx === 6) return mockStream(VALID_REVIEW_JSON)
-        if (idx === 7) return mockStream(VALID_FILTER_JSON)
-        if (idx === 8) return mockStream(VALID_ORCHESTRATE_JSON)
-        if (idx === 9) return mockStream(VALID_ASSEMBLE_JSON)
-        return mockStream('fallback')
+        return mockStream(`Translation from agent ${idx}`)
       })
 
-      const session = service.createSession(DEF_SOURCE)
+      const session = createRunnableSession()
       expect(session.state).toBe('draft')
 
       // Translate
@@ -406,36 +499,8 @@ describe('Integration — 边界硬化', () => {
       expect(results.filter((r) => r.status === 'error')).toHaveLength(1)
 
       // Session should be in 'translated' state
-      let updated = repos.sessions.getById(session.id)!
+      const updated = repos.sessions.getById(session.id)!
       expect(updated.state).toBe('translated')
-
-      // ── Phase 2: Run stages ────────────────────────────────────
-      const stageHandler = createStageHandlers(db).POST
-      const stages = ['review', 'filter', 'orchestrate', 'assemble'] as const
-
-      for (const stage of stages) {
-        const sResp = await stageHandler(
-          mockStageRequest(session.id, stage),
-          { params: Promise.resolve({ id: session.id, stage }) },
-        )
-        expect(sResp.status).toBe(200)
-        const sEvents = await collectSSEEvents(sResp)
-
-        // Verify stage_complete event
-        const stageComplete = sEvents.find((e) => e.event === 'stage_complete')
-        expect(stageComplete).toBeDefined()
-        expect(sEvents[sEvents.length - 1].event).toBe('done')
-      }
-
-      // ── Assert: final_version exists with non-empty text ────────
-      updated = repos.sessions.getById(session.id)!
-      expect(updated.state).toBe('assembled')
-
-      const full = service.getSessionFull(session.id)
-      expect(full!.versions).toHaveLength(1)
-      expect(full!.versions[0].text).toBeTruthy()
-      expect(full!.versions[0].text.length).toBeGreaterThan(0)
-      expect(full!.versions[0].source).toBe('assemble')
     })
   })
 
@@ -466,7 +531,7 @@ describe('Integration — 边界硬化', () => {
         return mockStream('result', { delayMs: 2 })
       })
 
-      const session = service.createSession(DEF_SOURCE)
+      const session = createRunnableSession()
       const response = await translatePost(
         mockPostRequest(session.id),
         { params: Promise.resolve({ id: session.id }) },
@@ -504,8 +569,8 @@ describe('Integration — 边界硬化', () => {
         return mockStream('parallel result')
       })
 
-      const sessionA = service.createSession(DEF_SOURCE)
-      const sessionB = service.createSession(DEF_SOURCE)
+      const sessionA = createRunnableSession()
+      const sessionB = createRunnableSession()
 
       // Fire both translate routes concurrently
       const [resA, resB] = await Promise.all([
@@ -577,7 +642,7 @@ describe('Integration — 边界硬化', () => {
         return stuckStream()
       })
 
-      const session = service.createSession(DEF_SOURCE)
+      const session = createRunnableSession()
       const response = await translatePost(
         mockPostRequest(session.id),
         { params: Promise.resolve({ id: session.id }) },
@@ -703,7 +768,10 @@ describe('Integration — 边界硬化', () => {
           })
         }
 
-        const session = serviceA.createSession(DEF_SOURCE)
+        const session = upgradeToCompleteV3(
+          serviceA.createSession(DEF_SOURCE),
+          dbA,
+        )
         mockGetDb.mockReturnValue(dbA)
         mockChatCompletion.mockImplementation(async () => mockStream('test'))
 

@@ -11,6 +11,7 @@ import { useEffect, useRef, useState } from 'react'
 import { TID } from '@/src/lib/testids'
 import { Button, Spinner, Textarea } from '@/src/components/ui'
 import { truncate, type ChatMessageView, type ToolCallView } from './types'
+import { useI18n } from '@/src/i18n/LocaleProvider'
 
 export interface ChatPanelProps {
   messages: ChatMessageView[]
@@ -33,15 +34,19 @@ export interface ChatPanelProps {
 // ── 工具调用徽章 ──────────────────────────────────────────────
 
 function ToolCallBadge({ call }: { call: ToolCallView }) {
+  const { t } = useI18n()
   const isReplace = !call.toolName || call.toolName === 'replace_text'
   const label = isReplace
-    ? `替换「${truncate(call.oldString, 20)}」→「${truncate(call.newString, 20)}」`
+    ? t('chat.tool.replace', {
+        old: truncate(call.oldString, 20),
+        next: truncate(call.newString, 20),
+      })
     : call.toolName === 'file_read'
-      ? `读取文件 ${truncate(call.oldString, 40)}`
+      ? t('chat.tool.read', { path: truncate(call.oldString, 40) })
       : call.toolName === 'file_edit'
-        ? `编辑文件 ${truncate(call.oldString, 40)}`
+        ? t('chat.tool.edit', { path: truncate(call.oldString, 40) })
         : call.toolName === 'run_command'
-          ? `执行命令 ${truncate(call.oldString, 40)}`
+          ? t('chat.tool.command', { command: truncate(call.oldString, 40) })
           : `${call.toolName} ${truncate(call.oldString, 40)}`
 
   const tone =
@@ -73,7 +78,7 @@ function ToolCallBadge({ call }: { call: ToolCallView }) {
         <span className="min-w-0 break-all">{label}</span>
       </span>
       {call.status === 'failed' && isReplace && (
-        <p className="mt-1 text-[0.6875rem] leading-4 text-cinnabar">替换未生效：未找到唯一匹配，文本保持不变</p>
+        <p role="alert" className="mt-1 text-[0.6875rem] leading-4 text-cinnabar">{t('chat.tool.replaceFailed')}</p>
       )}
       {call.status === 'ok' && call.diffSummary && (
         <p className="mt-1 text-[0.6875rem] leading-4 text-ink-3">{truncate(call.diffSummary, 160)}</p>
@@ -120,7 +125,7 @@ function MessageItem({ message }: { message: ChatMessageView }) {
         </div>
         {message.toolCalls?.map((call) => <ToolCallBadge key={call.id} call={call} />)}
         {message.error && (
-          <p className="mt-1.5 text-[0.75rem] leading-4 text-cinnabar">{message.error}</p>
+          <p role="alert" className="mt-1.5 text-[0.75rem] leading-4 text-cinnabar">{message.error}</p>
         )}
       </div>
     </li>
@@ -128,13 +133,6 @@ function MessageItem({ message }: { message: ChatMessageView }) {
 }
 
 // ── 面板 ─────────────────────────────────────────────────────
-
-function formatElapsed(milliseconds: number): string {
-  const seconds = Math.max(0, Math.floor(milliseconds / 1000))
-  const minutes = Math.floor(seconds / 60)
-  const remainder = seconds % 60
-  return minutes > 0 ? `${minutes} 分 ${remainder} 秒` : `${remainder} 秒`
-}
 
 export function ChatPanel({
   messages,
@@ -147,6 +145,7 @@ export function ChatPanel({
   onSend,
   onSuggest,
 }: ChatPanelProps) {
+  const { t, formatDuration } = useI18n()
   const [draft, setDraft] = useState('')
   const [suggesting, setSuggesting] = useState(false)
   const [suggestionStartedAt, setSuggestionStartedAt] = useState<number | null>(null)
@@ -171,7 +170,7 @@ export function ChatPanel({
 
   const elapsed = activityStartedAt == null
     ? null
-    : formatElapsed(clock - activityStartedAt)
+    : formatDuration(clock - activityStartedAt, { maxParts: 2 })
 
   const send = () => {
     const value = draft.trim()
@@ -188,11 +187,11 @@ export function ChatPanel({
     setSuggestionError(null)
     try {
       const feedback = (await onSuggest(value)).trim()
-      if (!feedback) throw new Error('模型没有返回可用建议')
+      if (!feedback) throw new Error(t('chat.suggestion.empty'))
       setDraft(feedback)
     } catch (error) {
       setSuggestionError(
-        error instanceof Error ? error.message : '细化修改意见失败',
+        error instanceof Error ? error.message : t('chat.suggestion.failed'),
       )
     } finally {
       setSuggesting(false)
@@ -202,15 +201,15 @@ export function ChatPanel({
 
   const inputDisabled = !canChat || streaming || suggesting
   const activityLabel = activityPhase === 'waiting_for_model'
-    ? '正在等待模型开始输出'
+    ? t('chat.activity.waiting')
     : activityPhase === 'thinking'
-      ? '已收到模型活动，正在思考'
+      ? t('chat.activity.thinking')
     : activityPhase === 'applying_edits'
-      ? '正在核对并应用修改'
-      : '正在生成回复'
+      ? t('chat.activity.applying')
+      : t('chat.activity.generating')
   const suggestionElapsed = suggestionStartedAt == null
     ? null
-    : formatElapsed(clock - suggestionStartedAt)
+    : formatDuration(clock - suggestionStartedAt, { maxParts: 2 })
 
   return (
     <div data-testid={TID.edit.chatPanel} className="flex h-full flex-col">
@@ -225,17 +224,17 @@ export function ChatPanel({
             <Spinner size="sm" className="shrink-0" />
             <span>
               {remoteStreaming
-                ? `另一处正在执行对话修订 · ${activityLabel}`
-                : `统筹 Agent ${activityLabel}`}
-              {elapsed ? ` · 已等待 ${elapsed}` : ''}
-              {' · 页面仍在工作'}
+                ? t('chat.activity.remote', { activity: activityLabel })
+                : t('chat.activity.local', { activity: activityLabel })}
+              {elapsed ? t('chat.activity.elapsed', { elapsed }) : ''}
+              {t('chat.activity.alive')}
             </span>
           </div>
         )}
         {messages.length === 0 ? (
           <div className="flex h-full min-h-44 items-center justify-center">
             <p className="max-w-60 text-center text-sm leading-6 text-ink-4">
-              选中译文片段提出修改指令，或与统筹 Agent 持续对话打磨译文
+              {t('chat.empty')}
             </p>
           </div>
         ) : (
@@ -260,8 +259,8 @@ export function ChatPanel({
           }}
           rows={2}
           disabled={inputDisabled}
-          placeholder={canChat ? '继续打磨译文……（Enter 发送，Shift+Enter 换行）' : disabledHint}
-          aria-label="聊天输入"
+          placeholder={canChat ? t('chat.placeholder') : disabledHint}
+          aria-label={t('chat.input.aria')}
           className="resize-none"
         />
         <div className="mt-2 flex items-center justify-between">
@@ -269,10 +268,20 @@ export function ChatPanel({
             {suggestionError
               ? suggestionError
               : suggesting
-                ? `目标语读者与双语核验者正在分别定位问题${suggestionElapsed ? ` · 已等待 ${suggestionElapsed}` : ''}，结果只会回填输入框`
+                ? t('chat.suggestion.running', {
+                    elapsed: suggestionElapsed
+                      ? t('chat.activity.elapsed', { elapsed: suggestionElapsed })
+                      : '',
+                  })
               : streaming
-              ? `${remoteStreaming ? '其他客户端正在修订' : '统筹 Agent 回复中'}${elapsed ? ` · ${elapsed}` : ''}`
-              : '修改通过替换工具落版，历史可追溯'}
+              ? remoteStreaming
+                ? t('chat.streaming.remote', {
+                    elapsed: elapsed ? t('chat.activity.elapsed', { elapsed }) : '',
+                  })
+                : t('chat.streaming.local', {
+                    elapsed: elapsed ? t('chat.activity.elapsed', { elapsed }) : '',
+                  })
+              : t('chat.traceable')}
           </span>
           <div className="flex shrink-0 flex-wrap justify-end gap-2">
             {onSuggest && (
@@ -281,13 +290,13 @@ export function ChatPanel({
                 variant="ghost"
                 onClick={() => void suggest()}
                 disabled={inputDisabled || draft.trim().length === 0}
-                title="让两个隔离审查镜头把当前感受细化为具体修改意见；不会自动发送"
+                title={t('chat.suggestion.title')}
               >
-                {suggesting ? <Spinner size="sm" /> : '细化意见'}
+                {suggesting ? <Spinner size="sm" /> : t('chat.suggestion.action')}
               </Button>
             )}
             <Button size="sm" onClick={send} disabled={inputDisabled || draft.trim().length === 0}>
-              {streaming ? <Spinner size="sm" /> : '发送'}
+              {streaming ? <Spinner size="sm" /> : t('chat.send')}
             </Button>
           </div>
         </div>

@@ -24,23 +24,17 @@ import { VersionHistory } from './VersionHistory'
 import type {
   ChatMessage,
   ChatMessageView,
-  FinalVersion,
   SelectionSnapshot,
   ToolCallView,
 } from './types'
 import { RevisionEvidence } from './RevisionEvidence'
 import { DisagreementMap } from './DisagreementMap'
+import { useI18n } from '@/src/i18n/LocaleProvider'
+import { localizeDiagnosticError } from '@/src/i18n/diagnostic'
+import { localizeEvidenceSummary } from '@/src/i18n/evidence'
 
 /** 高亮停留时长（ms） */
 const HIGHLIGHT_DURATION = 2600
-
-const SOURCE_LABEL: Record<FinalVersion['source'], string> = {
-  assemble: '组装',
-  main_draft: '主 Agent 成稿',
-  edit: '编辑',
-  restore: '恢复',
-  revert: '撤销',
-}
 
 // ── 服务端历史消息 → 视图模型 ─────────────────────────────────
 function toView(message: ChatMessage): ChatMessageView {
@@ -64,6 +58,7 @@ type ChatActivityPhase =
   | 'applying_edits'
 
 export function EditorSection() {
+  const { t } = useI18n()
   const { data, sessionId, candidateRevision, refresh } = useSessionFull()
 
   /** 本地流式叠加层：乐观用户消息 + 流式 AI 消息；服务端落库后清空 */
@@ -103,10 +98,10 @@ export function EditorSection() {
     currentVersion != null &&
     (sessionState === 'assembled' || sessionState === 'refining')
   const disabledHint = readonly
-    ? '统筹进行中，暂不可对话'
+    ? t('editor.disabled.coordinating')
     : sessionState === 'done'
-      ? '会话已完结'
-      : '完成组装后即可对话修改'
+      ? t('editor.disabled.done')
+      : t('editor.disabled.waitAssembly')
 
   // ── 流式叠加层局部更新（最后一条 streaming 消息）────────────
   const patchStreamingMessage = useCallback((patch: (msg: ChatMessageView) => ChatMessageView) => {
@@ -141,7 +136,9 @@ export function EditorSection() {
       if (!canChat || streaming || !sessionId) return
 
       const beforeText = currentText
-      const userContent = selection ? `针对选中文段「${selection.text}」：${message}` : message
+      const userContent = selection
+        ? t('editor.selection.request', { text: selection.text, message })
+        : message
 
       setLive([
         { id: `local-user-${Date.now()}`, role: 'user', content: userContent },
@@ -159,10 +156,10 @@ export function EditorSection() {
         })
 
         if (!res.ok || !res.body) {
-          let note = `请求失败（${res.status}）`
+          let note = t('editor.error.request', { status: res.status })
           try {
             const errBody = (await res.json()) as { message?: string; error?: string }
-            note = errBody.message ?? errBody.error ?? note
+            note = localizeDiagnosticError(t, errBody.error, note)
           } catch { /* 非 JSON 错误体 */ }
           patchStreamingMessage((msg) => ({ ...msg, streaming: false, error: note }))
           return
@@ -227,7 +224,11 @@ export function EditorSection() {
                 patchStreamingMessage((msg) => ({
                   ...msg,
                   streaming: false,
-                  error: payload.message ?? payload.error ?? '本轮回复失败',
+                  error: localizeDiagnosticError(
+                    t,
+                    payload.error,
+                    t('editor.error.reply'),
+                  ),
                 }))
               }
               break
@@ -252,7 +253,11 @@ export function EditorSection() {
           for (const evt of parseSSEChunk(pending + '\n\n')) handleEvent(evt.event, evt.data)
         }
       } catch {
-        patchStreamingMessage((msg) => ({ ...msg, streaming: false, error: '连接中断，本轮回复可能未完成' }))
+        patchStreamingMessage((msg) => ({
+          ...msg,
+          streaming: false,
+          error: t('editor.error.connection'),
+        }))
       } finally {
         patchStreamingMessage((msg) => ({ ...msg, streaming: false }))
         setStreaming(false)
@@ -265,26 +270,26 @@ export function EditorSection() {
         emitSessionChanged(sessionId)
       }
     },
-    [canChat, streaming, sessionId, currentText, refresh, patchStreamingMessage, flashChange],
+    [canChat, streaming, sessionId, currentText, refresh, patchStreamingMessage, flashChange, t],
   )
 
   // ── 恢复版本 ────────────────────────────────────────────────
   const restoreVersion = useCallback(
     async (versionNo: number) => {
-      if (!sessionId) throw new Error('暂无会话')
+      if (!sessionId) throw new Error(t('editor.error.noSession'))
       const res = await fetch(`/api/sessions/${sessionId}/versions/${versionNo}/restore`, { method: 'POST' })
       if (!res.ok) {
-        let note = `恢复失败（${res.status}）`
+        let note = t('editor.error.restore', { status: res.status })
         try {
-          const errBody = (await res.json()) as { message?: string }
-          if (errBody.message) note = errBody.message
+          const errBody = (await res.json()) as { message?: string; error?: string }
+          note = localizeDiagnosticError(t, errBody.error, note)
         } catch { /* 非 JSON 错误体 */ }
         throw new Error(note)
       }
       await refresh()
       emitSessionChanged(sessionId)
     },
-    [sessionId, refresh],
+    [sessionId, refresh, t],
   )
 
   const popoverSubmit = useCallback(
@@ -294,7 +299,7 @@ export function EditorSection() {
 
   const suggestRevision = useCallback(
     async (message: string): Promise<string> => {
-      if (!sessionId) throw new Error('暂无会话')
+      if (!sessionId) throw new Error(t('editor.error.noSession'))
       const response = await fetch(
         `/api/sessions/${sessionId}/revision-suggestions`,
         {
@@ -315,30 +320,46 @@ export function EditorSection() {
       }
       if (!response.ok) {
         throw new Error(
-          body.message ?? body.error ?? `生成修订建议失败（${response.status}）`,
+          localizeDiagnosticError(
+            t,
+            body.error,
+            t('editor.error.suggestion', { status: response.status }),
+          ),
         )
       }
-      if (!body.feedback?.trim()) throw new Error('模型没有返回可用建议')
+      if (!body.feedback?.trim()) throw new Error(t('editor.error.emptySuggestion'))
       return body.feedback
     },
-    [sessionId],
+    [sessionId, t],
   )
 
   return (
     <div className="grid grid-cols-1 gap-5 lg:col-span-12 lg:grid-cols-12">
       {/* 最终译文 */}
       <Card
-        overline="Final Text"
-        title="最终译文"
+        overline={t('editor.final.overline')}
+        title={t('editor.final.title')}
         className="lg:col-span-7"
         actions={
           currentVersionNo != null ? (
             <div className="flex items-center gap-1.5">
               {data?.final_evidence && (
-                <Badge variant="outline">{data.final_evidence.summary}</Badge>
+                <Badge variant="outline">
+                  {localizeEvidenceSummary(t, data.final_evidence.summary)}
+                </Badge>
               )}
               <Badge variant="subtle">
-                v{currentVersionNo} · {SOURCE_LABEL[currentVersion!.source]}
+                v{currentVersionNo} · {
+                  currentVersion!.source === 'assemble'
+                    ? t('version.source.assemble')
+                    : currentVersion!.source === 'main_draft'
+                      ? t('version.source.mainDraft')
+                      : currentVersion!.source === 'edit'
+                        ? t('version.source.edit')
+                        : currentVersion!.source === 'revert'
+                          ? t('version.source.revert')
+                          : t('version.source.restore')
+                }
               </Badge>
             </div>
           ) : undefined
@@ -348,8 +369,8 @@ export function EditorSection() {
           text={currentText}
           emptyHint={
             data
-              ? `最终译文将在工作流正式提交后显示。当前状态：${data.session.state}`
-              : '创建任务后，正式提交的译文将在此显示。'
+              ? t('editor.final.waitingState', { state: data.session.state })
+              : t('editor.final.waitingTask')
           }
           readonly={readonly}
           busy={chatBusy}
@@ -360,7 +381,7 @@ export function EditorSection() {
 
       {/* 右侧栏：对话修订 + 版本历史 */}
       <div className="flex flex-col gap-5 lg:col-span-5">
-        <Card overline="Chat" title="对话修订" padded={false}>
+        <Card overline={t('editor.chat.overline')} title={t('editor.chat.title')} padded={false}>
           <ChatPanel
             messages={messages}
             streaming={chatBusy}
@@ -374,7 +395,7 @@ export function EditorSection() {
           />
         </Card>
 
-        <Card overline="Versions" title="版本历史" padded={false}>
+        <Card overline={t('editor.versions.overline')} title={t('editor.versions.title')} padded={false}>
           <VersionHistory
             versions={currentVersion ? versions : []}
             currentVersionNo={currentVersionNo}

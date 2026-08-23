@@ -14,10 +14,15 @@ import {
   STAGES,
   canRunStage,
   nodeStatus,
-  stageBlockReason,
   type StageRowMap,
   type StageStatus,
 } from './stage-meta'
+import {
+  localizedStageBlockReason,
+  localizedStageMeta,
+  localizedStageStatus,
+} from './localized-stage'
+import { useI18n } from '@/src/i18n/LocaleProvider'
 
 export interface StageStepperProps {
   stageRows: StageRowMap
@@ -54,14 +59,6 @@ const statusTextClass: Record<StageStatus, string> = {
   stale: 'text-amber',
 }
 
-const statusLabel: Record<StageStatus, string> = {
-  pending: '待运行',
-  running: '运行中……',
-  complete: '完成',
-  failed: '失败',
-  stale: '已过期',
-}
-
 export function StageStepper({
   stageRows,
   runningStage,
@@ -69,14 +66,16 @@ export function StageStepper({
   transientNotes,
   onRun,
 }: StageStepperProps) {
+  const { t } = useI18n()
   return (
     <ol data-testid={TID.stage.stepper} className="space-y-0">
       {STAGES.map((meta, i) => {
+        const localizedMeta = localizedStageMeta(meta.key, t)
         const status = nodeStatus(meta.key, stageRows, runningStage)
         const runnable = canRunStage(meta.key, stageRows, sessionState, runningStage)
         const blockReason = runnable
           ? null
-          : stageBlockReason(meta.key, stageRows, sessionState, runningStage)
+          : localizedStageBlockReason(meta.key, stageRows, sessionState, runningStage, t)
         const note = transientNotes?.[meta.key] ?? null
         const row = stageRows[meta.key]
         const hasRunBefore = row != null && row.status !== 'pending'
@@ -96,10 +95,10 @@ export function StageStepper({
                 onClick={() => onRun(meta.key)}
                 title={
                   runnable
-                    ? `运行「${meta.label}」`
+                    ? t('stage.run.title', { stage: localizedMeta.label })
                     : (blockReason ?? undefined)
                 }
-                aria-label={`运行${meta.label}`}
+                aria-label={t('stage.run.aria', { stage: localizedMeta.label })}
                 className={[
                   'flex h-7 w-7 shrink-0 items-center justify-center rounded-xs border font-serif text-sm transition-colors duration-150',
                   circleClass[status],
@@ -136,7 +135,7 @@ export function StageStepper({
                     status === 'pending' ? 'text-ink-3' : 'text-ink',
                   ].join(' ')}
                 >
-                  {meta.label}
+                  {localizedMeta.label}
                 </p>
                 <Button
                   testId={TID.stage.runStageButton}
@@ -149,30 +148,32 @@ export function StageStepper({
                 >
                   {status === 'running' ? (
                     <>
-                      <Spinner size="sm" /> 运行中
+                      <Spinner size="sm" /> {t('stage.status.running')}
                     </>
                   ) : hasRunBefore ? (
-                    '重跑'
+                    t('stage.rerun')
                   ) : (
-                    '运行'
+                    t('stage.run')
                   )}
                 </Button>
               </div>
 
-              <p className="text-xs leading-5 text-ink-3">{meta.hint}</p>
+              <p className="text-xs leading-5 text-ink-3">{localizedMeta.hint}</p>
 
               {/* 状态行：文案 + stale 徽章 */}
               <p className={`mt-1 flex items-center gap-1.5 text-xs ${statusTextClass[status]}`}>
                 {status === 'running' && <Spinner size="sm" />}
-                {blockReason && status === 'pending' ? blockReason : statusLabel[status]}
+                {blockReason && status === 'pending'
+                  ? blockReason
+                  : localizedStageStatus(status, t)}
                 {status === 'stale' && (
                   <Badge
                     testId={TID.stage.staleBadge}
                     variant="outline"
-                    title="上游已重跑，需重新运行"
+                    title={t('stage.stale.title')}
                     className="border-amber/60 text-amber"
                   >
-                    已过期
+                    {t('stage.status.stale')}
                   </Badge>
                 )}
               </p>

@@ -16,6 +16,7 @@ const forbiddenTopLevelEntries = [
   'e2e',
   'playwright-report',
   'test-results',
+  'FSBP_Test',
 ]
 
 for (const entry of forbiddenTopLevelEntries) {

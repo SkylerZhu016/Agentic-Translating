@@ -1,0 +1,639 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentic-translating.local/schemas/round-0820-tool-evidence-case-study.schema.json",
+  "title": "Round 0820 Sanitized Real Tool Evidence Case Study",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "reportStatus",
+    "roundId",
+    "evidenceType",
+    "provenance",
+    "caseStudy",
+    "coverageOnly",
+    "gateMaterialization",
+    "conclusionBoundary",
+    "privacy"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "round-0820.tool-evidence-case-study.v1" },
+    "reportStatus": { "const": "complete" },
+    "roundId": { "const": "round-0820" },
+    "evidenceType": { "const": "single_real_end_to_end_tool_case" },
+    "provenance": { "$ref": "#/$defs/provenance" },
+    "caseStudy": { "$ref": "#/$defs/caseStudy" },
+    "coverageOnly": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "$ref": "#/$defs/coverageOnlyTool" }
+    },
+    "gateMaterialization": { "$ref": "#/$defs/gateMaterialization" },
+    "conclusionBoundary": { "$ref": "#/$defs/conclusionBoundary" },
+    "privacy": { "$ref": "#/$defs/privacy" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "nullableSha256": {
+      "anyOf": [
+        { "$ref": "#/$defs/sha256" },
+        { "type": "null" }
+      ]
+    },
+    "nullableNonNegativeInteger": {
+      "anyOf": [
+        { "type": "integer", "minimum": 0 },
+        { "type": "null" }
+      ]
+    },
+    "nullableNonNegativeNumber": {
+      "anyOf": [
+        { "type": "number", "minimum": 0 },
+        { "type": "null" }
+      ]
+    },
+    "nullableNonEmptyString": {
+      "anyOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ]
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "extractedAt",
+        "generationId",
+        "scriptVersion",
+        "scriptSha256",
+        "schemaPath",
+        "schemaSha256",
+        "hashNamespace",
+        "queryScope",
+        "sourceDatabase"
+      ],
+      "properties": {
+        "extractedAt": { "type": "string", "format": "date-time" },
+        "generationId": { "type": "string", "pattern": "^[a-f0-9]{32}$" },
+        "scriptVersion": { "type": "string", "minLength": 1 },
+        "scriptSha256": { "$ref": "#/$defs/sha256" },
+        "schemaPath": {
+          "const": "FSBP_Test/schemas/round-0820-tool-evidence-case-study.schema.json"
+        },
+        "schemaSha256": { "$ref": "#/$defs/sha256" },
+        "hashNamespace": { "const": "round-0820-tool-evidence:v1" },
+        "queryScope": { "type": "string", "minLength": 1 },
+        "sourceDatabase": { "$ref": "#/$defs/sourceDatabase" }
+      }
+    },
+    "sourceDatabase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "databaseFileSha256",
+        "databaseBytes",
+        "walPresent",
+        "walFileSha256",
+        "walBytes",
+        "fileSetSha256"
+      ],
+      "properties": {
+        "path": { "const": "data/app.db" },
+        "databaseFileSha256": { "$ref": "#/$defs/sha256" },
+        "databaseBytes": { "type": "integer", "minimum": 1 },
+        "walPresent": { "type": "boolean" },
+        "walFileSha256": { "$ref": "#/$defs/nullableSha256" },
+        "walBytes": { "type": "integer", "minimum": 0 },
+        "fileSetSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "caseStudy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "runs",
+        "summary",
+        "toolTraces",
+        "reviewSubagentInvocations",
+        "llmLedger",
+        "versionChain",
+        "patches"
+      ],
+      "properties": {
+        "identity": { "$ref": "#/$defs/identity" },
+        "runs": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "$ref": "#/$defs/run" }
+        },
+        "summary": { "$ref": "#/$defs/summary" },
+        "toolTraces": {
+          "type": "array",
+          "minItems": 9,
+          "maxItems": 9,
+          "items": { "$ref": "#/$defs/toolTrace" }
+        },
+        "reviewSubagentInvocations": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "$ref": "#/$defs/reviewChild" }
+        },
+        "llmLedger": { "$ref": "#/$defs/llmLedger" },
+        "versionChain": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": { "$ref": "#/$defs/version" }
+        },
+        "patches": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "$ref": "#/$defs/patch" }
+        }
+      }
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionIdHash",
+        "direction",
+        "state",
+        "reviewMode",
+        "mainEditorRunMode",
+        "configuredModelSet",
+        "requestedModelSet",
+        "sourceCharacterCount",
+        "taskBriefCharacterCount",
+        "finalVersionIdHash"
+      ],
+      "properties": {
+        "sessionIdHash": { "$ref": "#/$defs/sha256" },
+        "direction": { "enum": ["en_to_zh", "zh_to_en"] },
+        "state": { "type": "string", "minLength": 1 },
+        "reviewMode": { "const": "main_editor" },
+        "mainEditorRunMode": { "const": "tool_enabled" },
+        "configuredModelSet": { "const": ["GPT 5.6 Sol: CPA"] },
+        "requestedModelSet": { "const": ["GPT 5.6 Sol: CPA"] },
+        "sourceCharacterCount": { "type": "integer", "minimum": 1 },
+        "taskBriefCharacterCount": { "type": "integer", "minimum": 0 },
+        "finalVersionIdHash": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runIdHash",
+        "kind",
+        "status",
+        "phase",
+        "toolTraceCount",
+        "llmLedgerCount"
+      ],
+      "properties": {
+        "runIdHash": { "$ref": "#/$defs/sha256" },
+        "kind": { "enum": ["translation", "chat_edit"] },
+        "status": { "const": "complete" },
+        "phase": { "enum": ["complete", "edit"] },
+        "toolTraceCount": { "type": "integer", "minimum": 0 },
+        "llmLedgerCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "invocationCount",
+        "toolTraceCount",
+        "toolStatusCounts",
+        "toolNameCounts",
+        "failedWriteDraftBeforeSuccess",
+        "readOnlyReviewChildCount",
+        "bodyOnlyInspectEvidenceCount",
+        "replaceTextVersionEdgeCount",
+        "llmCallCount",
+        "llmStatusCounts",
+        "inputTokens",
+        "outputTokens",
+        "reasoningTokens",
+        "firstByteObservedCount",
+        "latencyObservedCount",
+        "responseModelObservedCount",
+        "linkageClosure"
+      ],
+      "properties": {
+        "invocationCount": { "type": "integer", "minimum": 1 },
+        "toolTraceCount": { "const": 9 },
+        "toolStatusCounts": { "$ref": "#/$defs/toolStatusCounts" },
+        "toolNameCounts": { "$ref": "#/$defs/toolNameCounts" },
+        "failedWriteDraftBeforeSuccess": { "const": 2 },
+        "readOnlyReviewChildCount": { "const": 2 },
+        "bodyOnlyInspectEvidenceCount": { "const": 2 },
+        "replaceTextVersionEdgeCount": { "const": 2 },
+        "llmCallCount": { "type": "integer", "minimum": 1 },
+        "llmStatusCounts": { "$ref": "#/$defs/completeStatusCounts" },
+        "inputTokens": { "$ref": "#/$defs/nullableNonNegativeInteger" },
+        "outputTokens": { "$ref": "#/$defs/nullableNonNegativeInteger" },
+        "reasoningTokens": { "$ref": "#/$defs/nullableNonNegativeInteger" },
+        "firstByteObservedCount": { "type": "integer", "minimum": 0 },
+        "latencyObservedCount": { "type": "integer", "minimum": 0 },
+        "responseModelObservedCount": { "const": 0 },
+        "linkageClosure": { "$ref": "#/$defs/linkageClosure" }
+      }
+    },
+    "toolStatusCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["complete", "failed"],
+      "properties": {
+        "complete": { "const": 7 },
+        "failed": { "const": 2 }
+      }
+    },
+    "toolNameCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["inspect_evidence", "replace_text", "request_review", "write_draft"],
+      "properties": {
+        "inspect_evidence": { "const": 2 },
+        "replace_text": { "const": 2 },
+        "request_review": { "const": 2 },
+        "write_draft": { "const": 3 }
+      }
+    },
+    "completeStatusCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["complete"],
+      "properties": {
+        "complete": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "linkageClosure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "selectedRunCount",
+        "toolToRunAndInvocationCount",
+        "reviewParentChildCount",
+        "invocationToLedgerCount",
+        "runScopedLedgerCount",
+        "sessionScopedLedgerCount",
+        "orphanToolCount",
+        "orphanInvocationCount",
+        "orphanLedgerCount"
+      ],
+      "properties": {
+        "selectedRunCount": { "const": 2 },
+        "toolToRunAndInvocationCount": { "const": 9 },
+        "reviewParentChildCount": { "const": 2 },
+        "invocationToLedgerCount": { "type": "integer", "minimum": 1 },
+        "runScopedLedgerCount": { "type": "integer", "minimum": 1 },
+        "sessionScopedLedgerCount": { "type": "integer", "minimum": 0 },
+        "orphanToolCount": { "const": 0 },
+        "orphanInvocationCount": { "const": 0 },
+        "orphanLedgerCount": { "const": 0 }
+      }
+    },
+    "toolTrace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "toolCallIdHash",
+        "runIdHash",
+        "invocationIdHash",
+        "parentToolCallIdHash",
+        "providerToolCallIdHash",
+        "logicalCallKeyHash",
+        "childInvocationIdHash",
+        "stage",
+        "actor",
+        "depth",
+        "schemaVersion",
+        "handlerVersion",
+        "toolName",
+        "status",
+        "errorCategory",
+        "readOnly",
+        "bodyOnly",
+        "evidenceRefCount",
+        "latencyMs"
+      ],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1, "maximum": 9 },
+        "toolCallIdHash": { "$ref": "#/$defs/sha256" },
+        "runIdHash": { "$ref": "#/$defs/sha256" },
+        "invocationIdHash": { "$ref": "#/$defs/sha256" },
+        "parentToolCallIdHash": { "$ref": "#/$defs/nullableSha256" },
+        "providerToolCallIdHash": { "$ref": "#/$defs/nullableSha256" },
+        "logicalCallKeyHash": { "$ref": "#/$defs/nullableSha256" },
+        "childInvocationIdHash": { "$ref": "#/$defs/nullableSha256" },
+        "stage": { "enum": ["draft", "edit"] },
+        "actor": { "const": "main_agent" },
+        "depth": { "const": 0 },
+        "schemaVersion": { "const": "translation-tools/v1" },
+        "handlerVersion": { "const": "translation-tool-runtime/v1" },
+        "toolName": {
+          "enum": ["inspect_evidence", "request_review", "write_draft", "replace_text"]
+        },
+        "status": { "enum": ["complete", "failed"] },
+        "errorCategory": { "$ref": "#/$defs/nullableNonEmptyString" },
+        "readOnly": { "type": "boolean" },
+        "bodyOnly": { "type": "boolean" },
+        "evidenceRefCount": { "type": "integer", "minimum": 0 },
+        "latencyMs": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "reviewChild": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "invocationIdHash",
+        "parentToolCallIdHash",
+        "parentRunIdHash",
+        "role",
+        "model",
+        "status",
+        "readOnly",
+        "latencyMs",
+        "ledgerCallCount"
+      ],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1, "maximum": 2 },
+        "invocationIdHash": { "$ref": "#/$defs/sha256" },
+        "parentToolCallIdHash": { "$ref": "#/$defs/sha256" },
+        "parentRunIdHash": { "$ref": "#/$defs/sha256" },
+        "role": { "const": "tool-review-subagent" },
+        "model": { "const": "GPT 5.6 Sol: CPA" },
+        "status": { "const": "complete" },
+        "readOnly": { "const": true },
+        "latencyMs": { "type": "integer", "minimum": 0 },
+        "ledgerCallCount": { "const": 1 }
+      }
+    },
+    "llmLedger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["records", "byOperation"],
+      "properties": {
+        "records": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/ledgerRecord" }
+        },
+        "byOperation": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/ledgerOperation" }
+        }
+      }
+    },
+    "ledgerRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "llmCallIdHash",
+        "runIdHash",
+        "invocationIdHash",
+        "operation",
+        "requestedModel",
+        "responseModelObserved",
+        "status",
+        "errorCategory",
+        "inputTokens",
+        "outputTokens",
+        "reasoningTokens",
+        "usageSource",
+        "firstByteMs",
+        "latencyMs",
+        "retryCount"
+      ],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1 },
+        "llmCallIdHash": { "$ref": "#/$defs/sha256" },
+        "runIdHash": { "$ref": "#/$defs/nullableSha256" },
+        "invocationIdHash": { "$ref": "#/$defs/nullableSha256" },
+        "operation": { "type": "string", "minLength": 1 },
+        "requestedModel": { "const": "GPT 5.6 Sol: CPA" },
+        "responseModelObserved": { "const": false },
+        "status": { "const": "complete" },
+        "errorCategory": { "$ref": "#/$defs/nullableNonEmptyString" },
+        "inputTokens": { "$ref": "#/$defs/nullableNonNegativeInteger" },
+        "outputTokens": { "$ref": "#/$defs/nullableNonNegativeInteger" },
+        "reasoningTokens": { "$ref": "#/$defs/nullableNonNegativeInteger" },
+        "usageSource": { "enum": ["provider", "estimated", "unknown"] },
+        "firstByteMs": { "$ref": "#/$defs/nullableNonNegativeInteger" },
+        "latencyMs": { "$ref": "#/$defs/nullableNonNegativeInteger" },
+        "retryCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "ledgerOperation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "callCount",
+        "statusCounts",
+        "inputTokens",
+        "outputTokens",
+        "reasoningTokens",
+        "averageFirstByteMs",
+        "averageLatencyMs"
+      ],
+      "properties": {
+        "operation": { "type": "string", "minLength": 1 },
+        "callCount": { "type": "integer", "minimum": 1 },
+        "statusCounts": { "$ref": "#/$defs/completeStatusCounts" },
+        "inputTokens": { "$ref": "#/$defs/nullableNonNegativeInteger" },
+        "outputTokens": { "$ref": "#/$defs/nullableNonNegativeInteger" },
+        "reasoningTokens": { "$ref": "#/$defs/nullableNonNegativeInteger" },
+        "averageFirstByteMs": { "$ref": "#/$defs/nullableNonNegativeNumber" },
+        "averageLatencyMs": { "$ref": "#/$defs/nullableNonNegativeNumber" }
+      }
+    },
+    "version": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "versionIdHash",
+        "versionNo",
+        "versionType",
+        "parentVersionIdHash",
+        "contentSha256",
+        "characterCount",
+        "createdByPatchIdHash"
+      ],
+      "properties": {
+        "versionIdHash": { "$ref": "#/$defs/sha256" },
+        "versionNo": { "type": "integer", "minimum": 1, "maximum": 3 },
+        "versionType": { "enum": ["main_draft", "edit"] },
+        "parentVersionIdHash": { "$ref": "#/$defs/nullableSha256" },
+        "contentSha256": { "$ref": "#/$defs/sha256" },
+        "characterCount": { "type": "integer", "minimum": 1 },
+        "createdByPatchIdHash": { "$ref": "#/$defs/nullableSha256" }
+      }
+    },
+    "patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "patchIdHash",
+        "toolCallIdHash",
+        "baseVersionIdHash",
+        "resultVersionIdHash",
+        "replacedSpanSha256",
+        "replacedSpanCharacterCount",
+        "replacementSpanSha256",
+        "replacementSpanCharacterCount",
+        "evidenceRefCount",
+        "diffSpanCount"
+      ],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1, "maximum": 2 },
+        "patchIdHash": { "$ref": "#/$defs/sha256" },
+        "toolCallIdHash": { "$ref": "#/$defs/sha256" },
+        "baseVersionIdHash": { "$ref": "#/$defs/sha256" },
+        "resultVersionIdHash": { "$ref": "#/$defs/sha256" },
+        "replacedSpanSha256": { "$ref": "#/$defs/sha256" },
+        "replacedSpanCharacterCount": { "type": "integer", "minimum": 1 },
+        "replacementSpanSha256": { "$ref": "#/$defs/sha256" },
+        "replacementSpanCharacterCount": { "type": "integer", "minimum": 0 },
+        "evidenceRefCount": { "type": "integer", "minimum": 0 },
+        "diffSpanCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "coverageFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "markerCount"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "markerCount": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "coverageOnlyTool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["toolName", "realObserved", "evidenceScope", "contracts", "tests"],
+      "properties": {
+        "toolName": {
+          "enum": ["search_project_memory", "record_issue", "propose_patch"]
+        },
+        "realObserved": { "const": false },
+        "evidenceScope": { "const": "contracts_and_tests_only" },
+        "contracts": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/coverageFile" }
+        },
+        "tests": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/coverageFile" }
+        }
+      }
+    },
+    "gateMaterialization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "datasetPath",
+        "datasetSha256",
+        "recordCount",
+        "splitCounts",
+        "freezeStatusCounts",
+        "formalEligibleCount",
+        "sourceMaterializedCount",
+        "initialVersionMaterializedCount",
+        "toolUseActuallyLocked",
+        "status",
+        "supportsToolSuperiorityConclusion"
+      ],
+      "properties": {
+        "datasetPath": { "const": "FSBP_Test/private/round-0820/tool-use-gate.jsonl" },
+        "datasetSha256": { "$ref": "#/$defs/sha256" },
+        "recordCount": { "const": 20 },
+        "splitCounts": { "$ref": "#/$defs/gateSplitCounts" },
+        "freezeStatusCounts": { "$ref": "#/$defs/gateFreezeStatusCounts" },
+        "formalEligibleCount": { "const": 0 },
+        "sourceMaterializedCount": { "const": 0 },
+        "initialVersionMaterializedCount": { "const": 0 },
+        "toolUseActuallyLocked": { "const": 0 },
+        "status": { "const": "unmaterialized_templates" },
+        "supportsToolSuperiorityConclusion": { "const": false }
+      }
+    },
+    "gateSplitCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dev", "frozen"],
+      "properties": {
+        "dev": { "const": 8 },
+        "frozen": { "const": 12 }
+      }
+    },
+    "gateFreezeStatusCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["development_fixture_pending_content", "pending_content_lock"],
+      "properties": {
+        "development_fixture_pending_content": { "const": 8 },
+        "pending_content_lock": { "const": 12 }
+      }
+    },
+    "conclusionBoundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provesInfrastructure",
+        "provesOneRealEndToEndCase",
+        "supportsToolSuperiorityConclusion",
+        "basis"
+      ],
+      "properties": {
+        "provesInfrastructure": { "const": true },
+        "provesOneRealEndToEndCase": { "const": true },
+        "supportsToolSuperiorityConclusion": { "const": false },
+        "basis": { "type": "string", "minLength": 1 }
+      }
+    },
+    "privacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rawSourceIncluded",
+        "translationIncluded",
+        "promptIncluded",
+        "fullToolArgumentsIncluded",
+        "fullToolResultsIncluded",
+        "endpointUrlIncluded",
+        "credentialIncluded",
+        "projectMemoryBodyIncluded",
+        "rawStableIdsIncluded"
+      ],
+      "properties": {
+        "rawSourceIncluded": { "const": false },
+        "translationIncluded": { "const": false },
+        "promptIncluded": { "const": false },
+        "fullToolArgumentsIncluded": { "const": false },
+        "fullToolResultsIncluded": { "const": false },
+        "endpointUrlIncluded": { "const": false },
+        "credentialIncluded": { "const": false },
+        "projectMemoryBodyIncluded": { "const": false },
+        "rawStableIdsIncluded": { "const": false }
+      }
+    }
+  }
+}

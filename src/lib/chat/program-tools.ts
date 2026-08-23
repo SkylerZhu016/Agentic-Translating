@@ -20,11 +20,53 @@ const MAX_LINE_CHARS = 2_000;
 const MAX_OUTPUT_CHARS = 48_000;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TIMEOUT_MS = 300_000;
+const COMMAND_ENV_ALLOWLIST = new Set([
+  'COMSPEC',
+  'HOME',
+  'LANG',
+  'LC_ALL',
+  'PATH',
+  'PATHEXT',
+  'SYSTEMROOT',
+  'TEMP',
+  'TERM',
+  'TMP',
+  'TZ',
+  'USERPROFILE',
+  'WINDIR',
+]);
 
 export interface ProgramToolResult {
   ok: boolean;
   /** Text fed back to the model as the tool result content. */
   content: string;
+}
+
+export function createProgramCommandEnvironment(
+  source: Record<string, string | undefined> = process.env,
+): NodeJS.ProcessEnv {
+  const entries: Array<[string, string]> = [];
+  for (const [name, value] of Object.entries(source)) {
+    if (value !== undefined && COMMAND_ENV_ALLOWLIST.has(name.toUpperCase())) {
+      entries.push([name, value]);
+    }
+  }
+  return Object.fromEntries(entries) as NodeJS.ProcessEnv;
+}
+
+export function createWindowsTaskkillSpec(
+  pid: number,
+  source: Record<string, string | undefined> = process.env,
+): { command: string; args: string[]; env: NodeJS.ProcessEnv } {
+  const systemRoot = source.SystemRoot ?? source.SYSTEMROOT ?? source.WINDIR;
+  if (!systemRoot || !path.win32.isAbsolute(systemRoot)) {
+    throw new Error('A trusted absolute SystemRoot is required to stop a Windows process tree.');
+  }
+  return {
+    command: path.win32.join(systemRoot, 'System32', 'taskkill.exe'),
+    args: ['/pid', String(pid), '/t', '/f'],
+    env: createProgramCommandEnvironment(source),
+  };
 }
 
 /** Resolve an existing path and confine its real target to the project root. */
@@ -193,6 +235,7 @@ async function executeRunCommand(args: Record<string, unknown>): Promise<Program
   return await new Promise<ProgramToolResult>((resolve) => {
     const child = spawn(shell, shellArgs, {
       cwd,
+      env: createProgramCommandEnvironment(),
       windowsHide: true,
       detached: process.platform !== 'win32',
     });
@@ -215,7 +258,9 @@ async function executeRunCommand(args: Record<string, unknown>): Promise<Program
           if (process.platform === 'win32') {
             // Wait for taskkill before resolving. A detached taskkill can race
             // with PID reuse and terminate a later, unrelated process.
-            spawnSync('taskkill', ['/pid', String(child.pid), '/t', '/f'], {
+            const taskkill = createWindowsTaskkillSpec(child.pid);
+            spawnSync(taskkill.command, taskkill.args, {
+              env: taskkill.env,
               windowsHide: true,
               stdio: 'ignore',
             });

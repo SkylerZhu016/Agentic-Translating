@@ -18,6 +18,9 @@ import { createRepositories, type Repositories } from '../../src/lib/db/reposito
 import { createSessionService } from '../../src/lib/services/session-service';
 import { parseSSEChunk, type SSEEvent } from '../../src/lib/contracts/sse';
 import type { LLMStreamEvent } from '../../src/lib/llm/client';
+import type { ConfigSnapshot } from '../../src/lib/contracts/types';
+import type { ConfigSnapshotVNext, ModelBinding } from '../../src/lib/contracts/vnext';
+import { encryptSecret } from '../../src/lib/security/secrets';
 
 // ── Hoisted mocks (must be defined before vi.mock which is hoisted) ────────
 const { mockChatCompletion, mockGetDb } = vi.hoisted(() => ({
@@ -113,6 +116,110 @@ describe('Translate SSE Route (fanout + retry)', () => {
     targetLang: 'Chinese',
   };
 
+  function createV3Session() {
+    const session = service.createSession(DEF_SOURCE);
+    const legacy = JSON.parse(session.config_snapshot) as ConfigSnapshot;
+    const endpoints = legacy.endpoints ?? (legacy.endpoint ? [legacy.endpoint] : []);
+    const firstAgent = legacy.agents[0];
+    const defaultWorker: ModelBinding = {
+      endpointId: firstAgent?.endpoint_id ?? null,
+      model: firstAgent?.model ?? '',
+      maxOutputTokens: 4_096,
+    };
+    const mainAgent: ModelBinding = {
+      endpointId: legacy.coordinator?.endpoint_id ?? defaultWorker.endpointId,
+      model: legacy.coordinator?.model ?? defaultWorker.model,
+      maxOutputTokens: 4_096,
+    };
+    const editingAgent: ModelBinding = {
+      endpointId:
+        legacy.coordinator?.chat_endpoint_id ?? mainAgent.endpointId,
+      model: legacy.coordinator?.chat_model ?? mainAgent.model,
+      maxOutputTokens: 4_096,
+    };
+    const modern: ConfigSnapshot & ConfigSnapshotVNext = {
+      ...legacy,
+      version: 3,
+      direction: 'en_to_zh',
+      promptBundleSnapshot: {
+        direction: 'en_to_zh',
+        promptLanguage: 'zh',
+        mainAgentSystemPrompt: '统筹翻译。',
+        workerBasePrompt: legacy.prompts.translator ?? '翻译原文。',
+        reviewPrompt: legacy.prompts.review ?? '审查译文。',
+        filterPrompt: legacy.prompts.filter ?? '筛选译文。',
+        orchestratePrompt: legacy.prompts.orchestrate ?? '统筹译文。',
+        assemblePrompt: legacy.prompts.assemble ?? '组装译文。',
+        editingPrompt: '编辑译文。',
+        toolDescriptions: {},
+        version: 1,
+      },
+      agentVariantSnapshots: legacy.agents.map((agent, index) => ({
+        id: agent.name,
+        archetypeId: `fixture-${index + 1}`,
+        direction: 'en_to_zh' as const,
+        catalogName: agent.name,
+        catalogDescription: 'Route test translator',
+        rolePrompt: agent.prompt_override ?? 'Translate faithfully.',
+        promptLanguage: 'zh' as const,
+        promptVersion: 1,
+        enabled: true,
+        endpointOverrideId: agent.endpoint_id,
+        modelOverride: agent.model,
+        sortOrder: agent.sort_order,
+      })),
+      endpointSnapshots: endpoints.map((endpoint) => ({
+        id: endpoint.id,
+        name: endpoint.name,
+        baseUrl: endpoint.base_url,
+        chatCompletionsPath:
+          endpoint.chat_completions_path ?? '/v1/chat/completions',
+        apiKey: encryptSecret(endpoint.api_key),
+        hasApiKey: Boolean(endpoint.api_key),
+        contextWindow: endpoint.context_window ?? 32_768,
+      })),
+      modelBindings: {
+        defaultWorker,
+        mainAgent,
+        reviewAgent: mainAgent,
+        filterAgent: mainAgent,
+        orchestrateAgent: mainAgent,
+        assembleAgent: mainAgent,
+        editingAgent,
+      },
+      presetRevisionSnapshot: null,
+      taskBrief: '',
+      constraints: {},
+      orchestrationPolicy: {
+        teamPolicy: 'fixed',
+        reviewMode: 'main_editor',
+        maxAgentCalls: Math.max(1, legacy.agents.length),
+        candidateAnnotationMode: 'body_only',
+      },
+    };
+    db.prepare(
+      'UPDATE sessions SET config_snapshot = ? WHERE id = ?',
+    ).run(JSON.stringify(modern), session.id);
+    return session;
+  }
+
+  function inflateLegacyTranslatorPrompt(sessionId: string): void {
+    const stored = repos.sessions.getById(sessionId)!;
+    const snapshot = JSON.parse(stored.config_snapshot) as ConfigSnapshot;
+    db.prepare(
+      'UPDATE sessions SET config_snapshot = ? WHERE id = ?',
+    ).run(
+      JSON.stringify({
+        ...snapshot,
+        prompts: {
+          ...snapshot.prompts,
+          translator: `Translate: ${'PRIVATE-PROMPT'.repeat(12_000)}`,
+        },
+      }),
+      sessionId,
+    );
+  }
+
   beforeEach(() => {
     vi.clearAllMocks();
 
@@ -175,13 +282,41 @@ describe('Translate SSE Route (fanout + retry)', () => {
   // =========================================================================
 
   describe('POST /api/sessions/[id]/translate', () => {
+    it('returns stable 422 for a legacy v2 snapshot', async () => {
+      const session = service.createSession(DEF_SOURCE);
+      const response = await translatePost(mockPostRequest(session.id), {
+        params: Promise.resolve({ id: session.id }),
+      });
+
+      expect(response.status).toBe(422);
+      expect(await response.json()).toEqual(expect.objectContaining({
+        error: 'preflight_snapshot_upgrade_required',
+        params: { snapshotVersion: 2 },
+      }));
+      expect(mockChatCompletion).not.toHaveBeenCalled();
+    });
+
+    it('blocks the exact physical fanout request before provider I/O', async () => {
+      const session = createV3Session();
+      inflateLegacyTranslatorPrompt(session.id);
+
+      const response = await translatePost(mockPostRequest(session.id), {
+        params: Promise.resolve({ id: session.id }),
+      });
+      const events = await collectSSEEvents(response);
+
+      expect(response.status).toBe(200);
+      expect(eventsByName(events, 'agent_error')).toHaveLength(2);
+      expect(mockChatCompletion).not.toHaveBeenCalled();
+    });
+
     it('emits full C1 event sequence on success (2 agents)', async () => {
       // Arrange: both agents succeed
       mockChatCompletion.mockImplementation(async (_ep, _req) => {
         return mockStream('translated text');
       });
 
-      const session = service.createSession(DEF_SOURCE);
+      const session = createV3Session();
       const req = mockPostRequest(session.id);
 
       // Act
@@ -231,7 +366,7 @@ describe('Translate SSE Route (fanout + retry)', () => {
     it('persists translation_results as complete in DB', async () => {
       mockChatCompletion.mockImplementation(async () => mockStream('你好世界'));
 
-      const session = service.createSession(DEF_SOURCE);
+      const session = createV3Session();
       const req = mockPostRequest(session.id);
 
       const response = await translatePost(req, {
@@ -264,7 +399,7 @@ describe('Translate SSE Route (fanout + retry)', () => {
         return mockStream('success text');
       });
 
-      const session = service.createSession(DEF_SOURCE);
+      const session = createV3Session();
       const req = mockPostRequest(session.id);
 
       const response = await translatePost(req, {
@@ -364,7 +499,7 @@ describe('Translate SSE Route (fanout + retry)', () => {
     });
 
     it('returns 409 when state is coordinating (invalid_state_transition)', async () => {
-      const session = service.createSession(DEF_SOURCE);
+      const session = createV3Session();
       // Transition to translated first, then coordinating
       service.transitionState(session.id, 'translating');
       service.transitionState(session.id, 'translated');
@@ -384,7 +519,7 @@ describe('Translate SSE Route (fanout + retry)', () => {
     it('allows re-translate from translated state', async () => {
       mockChatCompletion.mockImplementation(async () => mockStream('re-translated'));
 
-      const session = service.createSession(DEF_SOURCE);
+      const session = createV3Session();
       // Transition to translated first
       service.transitionState(session.id, 'translating');
       service.transitionState(session.id, 'translated');
@@ -406,7 +541,7 @@ describe('Translate SSE Route (fanout + retry)', () => {
     it('transitions session state from draft to translated', async () => {
       mockChatCompletion.mockImplementation(async () => mockStream('done'));
 
-      const session = service.createSession(DEF_SOURCE);
+      const session = createV3Session();
       expect(session.state).toBe('draft');
 
       const req = mockPostRequest(session.id);
@@ -440,7 +575,7 @@ describe('Translate SSE Route (fanout + retry)', () => {
         return stuckStream();
       });
 
-      const session = service.createSession(DEF_SOURCE);
+      const session = createV3Session();
       const req = mockPostRequest(session.id);
 
       const response = await translatePost(req, {
@@ -468,19 +603,20 @@ describe('Translate SSE Route (fanout + retry)', () => {
       expect(aborted).toBe(true);
     });
 
-    it('returns 400 when no agents in snapshot', async () => {
+    it('returns 422 when the v3 snapshot has no candidate binding', async () => {
       // Delete all agents before creating session, or manipulate snapshot
-      const session = service.createSession(DEF_SOURCE);
+      const session = createV3Session();
 
-      // Overwrite the snapshot with empty agents array
+      // Keep a complete v3 snapshot while removing the legacy route agents.
+      const stored = repos.sessions.getById(session.id)!;
+      const snapshot = JSON.parse(stored.config_snapshot) as ConfigSnapshot;
       db.prepare(
         "UPDATE sessions SET config_snapshot = ? WHERE id = ?",
       ).run(
         JSON.stringify({
-          endpoint: { id: 1, name: 'ep', base_url: 'https://x.com', api_key: 'sk', created_at: '' },
+          ...snapshot,
           agents: [],
-          coordinator: null,
-          prompts: {},
+          agentVariantSnapshots: [],
         }),
         session.id,
       );
@@ -490,9 +626,10 @@ describe('Translate SSE Route (fanout + retry)', () => {
         params: Promise.resolve({ id: session.id }),
       });
 
-      expect(response.status).toBe(400);
+      expect(response.status).toBe(422);
       const body = await response.json();
-      expect(body.error).toContain('No translator agents');
+      expect(body.error).toBe('preflight_binding_missing');
+      expect(mockChatCompletion).not.toHaveBeenCalled();
     });
   });
 
@@ -501,10 +638,50 @@ describe('Translate SSE Route (fanout + retry)', () => {
   // =========================================================================
 
   describe('POST /api/sessions/[id]/agents/[agentKey]/retry', () => {
+    it('returns stable 422 for a legacy v2 snapshot', async () => {
+      const session = service.createSession(DEF_SOURCE);
+      const response = await retryPost(
+        mockPostRequest(session.id, 'agent-alpha'),
+        {
+          params: Promise.resolve({
+            id: session.id,
+            agentKey: 'agent-alpha',
+          }),
+        },
+      );
+
+      expect(response.status).toBe(422);
+      expect(await response.json()).toEqual(expect.objectContaining({
+        error: 'preflight_snapshot_upgrade_required',
+        params: { snapshotVersion: 2 },
+      }));
+      expect(mockChatCompletion).not.toHaveBeenCalled();
+    });
+
+    it('blocks the exact physical retry request before provider I/O', async () => {
+      const session = createV3Session();
+      inflateLegacyTranslatorPrompt(session.id);
+
+      const response = await retryPost(
+        mockPostRequest(session.id, 'agent-alpha'),
+        {
+          params: Promise.resolve({
+            id: session.id,
+            agentKey: 'agent-alpha',
+          }),
+        },
+      );
+      const events = await collectSSEEvents(response);
+
+      expect(response.status).toBe(200);
+      expect(eventsByName(events, 'agent_error')).toHaveLength(1);
+      expect(mockChatCompletion).not.toHaveBeenCalled();
+    });
+
     it('retries only the specified agent_key', async () => {
       mockChatCompletion.mockImplementation(async () => mockStream('retry result'));
 
-      const session = service.createSession(DEF_SOURCE);
+      const session = createV3Session();
       service.transitionState(session.id, 'translating');
       service.transitionState(session.id, 'translated');
 
@@ -569,7 +746,7 @@ describe('Translate SSE Route (fanout + retry)', () => {
     });
 
     it('returns 400 when agent_key not in snapshot', async () => {
-      const session = service.createSession(DEF_SOURCE);
+      const session = createV3Session();
 
       const req = mockPostRequest(session.id, 'nonexistent-agent');
       const response = await retryPost(req, {
@@ -585,7 +762,7 @@ describe('Translate SSE Route (fanout + retry)', () => {
     });
 
     it('returns 409 from coordinating state', async () => {
-      const session = service.createSession(DEF_SOURCE);
+      const session = createV3Session();
       service.transitionState(session.id, 'translating');
       service.transitionState(session.id, 'translated');
       service.transitionState(session.id, 'coordinating');
@@ -623,7 +800,7 @@ describe('Translate SSE Route (fanout + retry)', () => {
         throw new Error(sensitiveProviderError);
       });
 
-      const session = service.createSession(DEF_SOURCE);
+      const session = createV3Session();
 
       const req = mockPostRequest(session.id, 'agent-alpha');
       const response = await retryPost(req, {

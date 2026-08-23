@@ -5,6 +5,7 @@ import type { ConfigSnapshot, Stage } from '../contracts/types'
 import type {
   AgentDirectionVariant,
   CandidateAnnotationMode,
+  ConfigSnapshotVNext,
   ModelBinding,
 } from '../contracts/vnext'
 import {
@@ -32,15 +33,45 @@ import {
 } from '../poetry/analysis'
 import { createRepositories } from '../db/repositories'
 import { createVNextRepositories } from '../db/vnext-repositories'
+import { createProjectRepositories } from '../db/project-repositories'
+import { createTranslationToolRepository } from '../db/translation-tool-repository'
+import {
+  createTranslationToolRuntime,
+  type TranslationToolRuntimeHandlers,
+} from './translation-tool-runtime'
+import {
+  projectEvidenceForInheritance,
+  TRANSLATION_TOOL_DEFINITIONS,
+} from './translation-tools'
+import {
+  writeDraftResultSchema,
+  type EvidenceInheritanceMode,
+  type EvidenceMaterial,
+  type ProjectMemorySearchResult,
+} from '../contracts/translation-tools'
 import { createWorkspaceModelProfilesRepo } from '../db/release-config-repositories'
-import { decryptSecret, encryptSecret } from '../security/secrets'
 import { RETRY_DELAYS_MS } from '../constants'
 import type { LlmCallUsage } from '../contracts/llm-call-records'
 import { createLlmCallRecordsService } from '../services/llm-call-records-service'
 import {
+  assertPhysicalPaidCallPreflight,
+  ensureStoredSessionPreflight,
+  SESSION_PREFLIGHT_DEFAULTS,
+} from '../services/session-preflight'
+import {
   appendSessionProjectContext,
   cloneSessionProjectContext,
 } from '../projects/session-context'
+import {
+  currentRuntimeEndpoint,
+  resolveRuntimeEndpoint,
+  withoutSnapshotCredentials,
+  type RuntimeEndpointConnection,
+} from '../services/runtime-endpoint-credentials'
+import {
+  redactCredentialValueForDb,
+  safeErrorMessageForPersistence,
+} from '../security/credential-redaction'
 
 const callAgentsArgsSchema = z.object({
   calls: z.array(z.object({
@@ -54,11 +85,6 @@ const writeDraftArgsSchema = z.object({
   text: z.string().min(1),
   reason: z.string().default(''),
   evidenceInvocationIds: z.array(z.string().min(1)).min(2),
-})
-
-const submitFinalArgsSchema = z.object({
-  versionId: z.number().int().positive(),
-  summary: z.string().default(''),
 })
 
 interface SessionRecord {
@@ -103,6 +129,9 @@ interface ResolvedEndpoint {
   chatCompletionsPath: string
   apiKey: string
   contextWindow: number | null
+  maxOutputTokens?: number
+  /** Runtime-only full connection reader; never persisted in the snapshot. */
+  currentEndpoint?: () => RuntimeEndpointConnection
 }
 
 export type VNextLlmOperation =
@@ -323,6 +352,7 @@ function loadCheckpointOutputs(
         body: row.body_output!,
         annotation: row.annotation_output,
         sourceAnalysis: analyzePoetrySource({
+          direction: snapshot.direction,
           sourceText: session.source_text,
           taskBrief: session.task_brief,
           constraints: snapshot.constraints,
@@ -339,6 +369,7 @@ function loadCheckpointOutputs(
       evidence: checkTranslationEvidence({
         direction: snapshot.direction ?? 'en_to_zh',
         sourceText: session.source_text,
+        taskBrief: session.task_brief,
         translatedText: row.body_output!,
         constraints: snapshot.constraints,
         reportLanguage: snapshot.promptBundleSnapshot?.promptLanguage,
@@ -361,7 +392,13 @@ function emitEvent(
   db.prepare(`
     INSERT INTO run_events (run_id, session_id, seq, event_type, payload_json)
     VALUES (?, ?, ?, ?, ?)
-  `).run(runId, sessionId, row.seq, eventType, JSON.stringify(payload))
+  `).run(
+    runId,
+    sessionId,
+    row.seq,
+    eventType,
+    JSON.stringify(redactCredentialValueForDb(db, payload)),
+  )
 }
 
 function updateRunPhase(
@@ -377,35 +414,21 @@ function updateRunPhase(
 }
 
 function resolveEndpoint(
+  db: Database.Database,
   snapshot: ConfigSnapshot,
   endpointId: number | null,
+  binding?: ModelBinding,
 ): ResolvedEndpoint {
-  const modern = snapshot.endpointSnapshots?.find(
-    (endpoint) => endpoint.id === endpointId,
-  )
-  if (modern) {
-    return {
-      id: modern.id,
-      name: modern.name,
-      baseUrl: modern.baseUrl,
-      chatCompletionsPath:
-        modern.chatCompletionsPath ?? '/v1/chat/completions',
-      apiKey: decryptSecret(modern.apiKey),
-      contextWindow: modern.contextWindow,
-    }
-  }
-  const legacy =
-    snapshot.endpoints?.find((endpoint) => endpoint.id === endpointId) ??
-    snapshot.endpoint
-  if (!legacy) throw new Error(`Endpoint ${endpointId ?? '(unset)'} is unavailable`)
+  // The binding is the frozen call identity. Do not infer its cap from other
+  // stages that happen to share an endpoint/model pair.
+  const maxOutputTokens = binding?.maxOutputTokens == null
+    ? SESSION_PREFLIGHT_DEFAULTS.maxOutputTokens
+    : Math.max(1, Math.floor(binding.maxOutputTokens))
+  const endpoint = resolveRuntimeEndpoint(db, snapshot, endpointId)
   return {
-    id: legacy.id,
-    name: legacy.name,
-    baseUrl: legacy.base_url,
-    chatCompletionsPath:
-      legacy.chat_completions_path ?? '/v1/chat/completions',
-    apiKey: decryptSecret(legacy.api_key),
-    contextWindow: legacy.context_window ?? null,
+    ...endpoint,
+    maxOutputTokens,
+    currentEndpoint: () => currentRuntimeEndpoint(db, endpoint.id),
   }
 }
 
@@ -424,6 +447,21 @@ function assertContextFits(
       `上下文估算为 ${estimate} tokens，超过端点上限 ${endpoint.contextWindow}；未对正文做任何裁剪。`,
     )
   }
+}
+
+function physicalPreflightMessages(
+  messages: ChatCompletionRequest['messages'],
+): Array<{ role: string; content: string }> {
+  return messages.map((message) => {
+    const wireMessage = message as unknown as Record<string, unknown>
+    const toolCalls = wireMessage.tool_calls
+    return {
+      role: message.role,
+      content:
+        message.content +
+        (toolCalls === undefined ? '' : `\n${JSON.stringify(toolCalls)}`),
+    }
+  })
 }
 
 const SAFE_LEDGER_ERROR_CODES = new Set([
@@ -552,6 +590,18 @@ export async function ledgeredFanOutCall(
   context: VNextLlmLedgerContext,
   retryCount: number,
 ): Promise<ChatCompletionResponse | AsyncIterable<LLMStreamEvent>> {
+  const maxTokens = request.maxTokens ?? endpoint.maxOutputTokens
+  assertPhysicalPaidCallPreflight({
+    stage: context.operation,
+    bindingRole: context.operation,
+    endpointId: endpoint.id,
+    model: request.model,
+    contextWindow: endpoint.contextWindow,
+    maxOutputTokens: maxTokens,
+    messages: physicalPreflightMessages(request.messages),
+    tools: request.tools,
+    attempted: retryCount + 1,
+  })
   const ledgerAttempt = beginLedgerAttempt(
     context,
     endpoint,
@@ -564,9 +614,17 @@ export async function ledgeredFanOutCall(
         baseUrl: endpoint.baseUrl,
         chatCompletionsPath: endpoint.chatCompletionsPath,
         apiKey: endpoint.apiKey,
+        ...(endpoint.currentEndpoint
+          ? { resolveRuntimeEndpoint: endpoint.currentEndpoint }
+          : {}),
       },
       {
         ...request,
+        ...(
+          request.maxTokens ?? endpoint.maxOutputTokens
+            ? { maxTokens: request.maxTokens ?? endpoint.maxOutputTokens }
+            : {}
+        ),
         onActivity() {
           markLedgerReceiving(ledgerAttempt)
           request.onActivity?.()
@@ -662,8 +720,19 @@ export async function complete(
         request.messages.map((message) => message.content).join('\n') +
           (request.tools ? JSON.stringify(request.tools) : ''),
         endpoint.contextWindow,
-        request.maxTokens,
+        request.maxTokens ?? endpoint.maxOutputTokens,
       )
+      assertPhysicalPaidCallPreflight({
+        stage: ledgerContext?.operation ?? 'vnext',
+        bindingRole: ledgerContext?.operation ?? 'vnext',
+        endpointId: endpoint.id,
+        model: request.model,
+        contextWindow: endpoint.contextWindow,
+        maxOutputTokens: maxTokens,
+        messages: physicalPreflightMessages(request.messages),
+        tools: request.tools,
+        attempted: attempt + 1,
+      })
       ledgerAttempt = beginLedgerAttempt(
         ledgerContext,
         endpoint,
@@ -675,6 +744,9 @@ export async function complete(
           baseUrl: endpoint.baseUrl,
           chatCompletionsPath: endpoint.chatCompletionsPath,
           apiKey: endpoint.apiKey,
+          ...(endpoint.currentEndpoint
+            ? { resolveRuntimeEndpoint: endpoint.currentEndpoint }
+            : {}),
         },
         {
           ...request,
@@ -844,7 +916,7 @@ export function inferRequiredDynamicArchetypes(
     constraints?.poetryMode !== 'off' &&
     (constraints?.poetryMode === 'on' || isPoetry)
   ) {
-    return ['semantic-fidelity', 'poetry-form']
+    return ['semantic-fidelity', 'target-naturalness', 'poetry-form']
   }
   if (/法律|合同|政策|法规|合规|legal|contract|policy|regulat/.test(combined)) {
     return ['semantic-fidelity', 'formal-regulated']
@@ -861,7 +933,7 @@ export function inferRequiredDynamicArchetypes(
   return ['semantic-fidelity', 'target-naturalness']
 }
 
-function enforceDynamicTeam(
+export function enforceDynamicTeam(
   session: SessionRecord,
   allowed: AgentDirectionVariant[],
   selected: TeamSelection[],
@@ -904,6 +976,23 @@ function enforceDynamicTeam(
   return result.slice(0, 4)
 }
 
+export function buildDynamicFallbackTeam(
+  session: SessionRecord,
+  allowed: AgentDirectionVariant[],
+  constraints: ConfigSnapshot['constraints'] = {},
+) {
+  return enforceDynamicTeam(
+    session,
+    allowed,
+    fallbackVariants(allowed).map((variant) => ({
+      variant,
+      additionalInstruction: '',
+      selectionReason: '动态组队未产生有效调用，启用保底组合',
+    })),
+    constraints,
+  )
+}
+
 async function selectTeam(
   db: Database.Database,
   runId: string,
@@ -941,8 +1030,9 @@ async function selectTeam(
 
   const binding = snapshot.modelBindings?.mainAgent
   if (!binding?.model) throw new Error('主 Agent 模型未配置')
-  const endpoint = resolveEndpoint(snapshot, binding.endpointId)
+  const endpoint = resolveEndpoint(db, snapshot, binding.endpointId, binding)
   const poetryAnalysis = analyzePoetrySource({
+    direction: snapshot.direction,
     sourceText: session.source_text,
     taskBrief: session.task_brief,
     constraints: snapshot.constraints,
@@ -1069,16 +1159,18 @@ async function selectTeam(
     })
   }
 
-  const fallback = fallbackVariants(allowed)
-  if (fallback.length < 2) throw new Error('保底编队缺少两个可用 Agent')
+  const enforcedFallback = buildDynamicFallbackTeam(
+    session,
+    allowed,
+    snapshot.constraints,
+  )
+  if (enforcedFallback.length < 2) {
+    throw new Error('保底编队缺少两个可用 Agent')
+  }
   emitEvent(db, runId, session.id, 'team.fallback', {
-    agentVariantIds: fallback.map((variant) => variant.id),
+    agentVariantIds: enforcedFallback.map((item) => item.variant.id),
   })
-  return fallback.map((variant) => ({
-    variant,
-    additionalInstruction: '',
-    selectionReason: '动态组队未产生有效调用，启用保底组合',
-  }))
+  return enforcedFallback
 }
 
 export function chooseContextAnalysisBindings(
@@ -1158,7 +1250,7 @@ async function runImageryPrepass(
       promptIsEnglish(snapshot) ? 'en' : 'zh',
       index,
     )
-    const endpoint = resolveEndpoint(snapshot, binding.endpointId)
+    const endpoint = resolveEndpoint(db, snapshot, binding.endpointId, binding)
     const invocationId: string = randomUUID()
     const snapshotWithRole = {
       ...variant,
@@ -1259,7 +1351,7 @@ async function runImageryPrepass(
         content,
       } satisfies ContextAnalysisResult
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
+      const message = safeErrorMessageForPersistence(db, error)
       const latencyMs = Math.round(performance.now() - startedAt)
       db.prepare(`
         UPDATE agent_invocations
@@ -1281,6 +1373,13 @@ async function runImageryPrepass(
   )
 }
 
+export function poetryPlanningEnabled(
+  sourceAnalysis: Pick<PoetrySourceAnalysis, 'isPoetry'>,
+  archetypeIds: string[],
+) {
+  return sourceAnalysis.isPoetry && archetypeIds.includes('poetry-form')
+}
+
 async function runPoetryPlanning(
   db: Database.Database,
   runId: string,
@@ -1289,21 +1388,24 @@ async function runPoetryPlanning(
   team: TeamSelection[],
 ): Promise<PoetryPlanResult | null> {
   const sourceAnalysis = analyzePoetrySource({
+    direction: snapshot.direction,
     sourceText: session.source_text,
     taskBrief: session.task_brief,
     constraints: snapshot.constraints,
   })
-  const selectedPoetryRole = team.some(
-    (item) => item.variant.archetypeId === 'poetry-form',
-  )
-  if (!sourceAnalysis.isPoetry || !selectedPoetryRole) return null
+  if (
+    !poetryPlanningEnabled(
+      sourceAnalysis,
+      team.map((item) => item.variant.archetypeId),
+    )
+  ) return null
 
   const baseVariant = (snapshot.agentVariantSnapshots ?? []).find(
     (variant) => variant.archetypeId === 'poetry-form',
   )
   const binding = snapshot.modelBindings?.mainAgent
   if (!baseVariant || !binding?.model) return null
-  const endpoint = resolveEndpoint(snapshot, binding.endpointId)
+  const endpoint = resolveEndpoint(db, snapshot, binding.endpointId, binding)
   const english = promptIsEnglish(snapshot)
   const sourceHasDash = /[—–]|——/.test(session.source_text)
   const sourceHasSemicolon = /[;；]/.test(session.source_text)
@@ -1315,8 +1417,8 @@ Do not recommend or introduce a dash or semicolon when it is absent from the sou
   const rolePrompt = english
     ? `You are the Prosody and Rhyme Planner for a difficult Chinese-to-English poetry translation.
 Do not translate the complete poem. Produce a concise, executable planning document for independent translators: identify form, stanza and line structure, syntactic continuation across line breaks, rhyme positions, rhyme scheme, acceptable exact or near-rhyme policy, rhythm priorities, and likely trade-offs.
-Target-language rhyme is expected by default for rhyming poetry: judge rhyme by English pronunciation (identical stressed vowel plus following consonants for perfect rhyme; near rhyme such as move/love is acceptable when meaning requires it). Propose a concrete rhyme scheme (e.g., AABB, ABAB, ABBA, AAAA, XAXA) and candidate rhyming words per line-end position, with at least two alternatives per position so translators keep freedom. If the source is unrhymed free verse or the user brief explicitly exempts rhyme, write "no target rhyme required" and describe source sound only as evidence; otherwise rhyme is a binding target. Rhyme is subordinate to meaning and is realized in a "sentences first, scheme second" order: settle each line for semantic accuracy and structural correspondence, letting line endings take their most faithful words without pre-committing to a scheme; then mark the sounds of the settled endings, find the rhyme pairs that already hold, and enumerate viable schemes (AAAA, AABB, ABAB, ABBA, AABA, AXBX, XAXA), preferring the one that changes the fewest settled endings at the least semantic cost; fill only the positions the scheme requires, with words that are simultaneously faithful; when a position cannot be filled without semantic damage, drop it (mark X, downgrading the scheme to partial or motif rhyme) rather than revising settled lines backward to force rhyme. Resolve unclear relations inside a line through grammar, voice, or prepositions rather than vague wording.
-Never turn an observed source rhyme into an unstated user requirement in the opposite direction: when the source rhymes, target rhyme is expected; when it does not, do not force one.
+Target-language rhyme is conditional, not a default hard target. Treat a fixed rhyme scheme as binding only when the user explicitly requests it or the source analysis marks the source rhyme as highly stable. Otherwise document rhyme as optional sound evidence and prefer free or partial rhyme. Judge English rhyme by pronunciation (identical stressed vowel plus following consonants for perfect rhyme; near rhyme such as move/love is acceptable when meaning requires it). For a binding rhyme task, propose a concrete rhyme scheme (e.g., AABB, ABAB, ABBA, AAAA, XAXA) and at least two possible ending words per position so translators keep freedom. Rhyme is subordinate to meaning and naturalness and is realized in a "sentences first, scheme second" order: settle each line for semantic accuracy and structural correspondence, letting line endings take their most faithful words without pre-committing to a scheme; then mark the sounds of the settled endings, find the rhyme pairs that already hold, and enumerate viable schemes (AAAA, AABB, ABAB, ABBA, AABA, AXBX, XAXA), preferring the one that changes the fewest settled endings at the least semantic cost; fill only the positions the scheme requires, with words that are simultaneously faithful; when a position cannot be filled without semantic damage or forced English, drop it (mark X, downgrading the scheme to partial or motif rhyme) rather than revising settled lines backward to force rhyme. Resolve unclear relations inside a line through grammar, voice, or prepositions rather than vague wording.
+Never turn observed rhyme into an unstated hard requirement. In Chinese-to-English poetry, prioritize compression, image juxtaposition, parallel movement, and idiomatic English syntax before any added end-rhyme.
 Structural correspondence: each source line maps to one or two target clauses (typically two). Neatness comes from that correspondence, not from hitting a fixed clause count, and a single source line must never split into more than two clauses. Clauses may be displayed one per line, or two per line joined by punctuation, whichever keeps the mapping visible.
 Before fixing a target line count, inventory the indispensable meaning units in each source line and test whether the proposed form can carry them. A one-to-one line mapping is optional unless the user requires it. State explicitly when one dense source line needs multiple shorter target lines, while preserving stanza correspondence and source order.
 Do not prescribe one mandatory set of ending words; offer alternatives and preserve room for genuinely different candidate translations. Never add unsupported meaning merely to force rhyme. A line break is not automatically a full stop: preserve continuation and enjambment when the source continues.
@@ -1325,7 +1427,8 @@ Lyric singability, melody fitting, and syllable-to-note alignment are outside th
 Write freely. Optional human notes may follow a standalone "---" line.`
     : `你是高难诗歌翻译的“诗体与韵律规划助手”。
 不要直接翻译全诗。请为多个独立译者形成简洁、可执行的规划：识别诗体、分节、诗行、跨行句法延续、韵位、韵式、普通话或平水韵规则、节奏优先级与可能的取舍。
-押韵诗歌默认要求目标语押韵：按普通话实际发音判定（韵母相同即押韵，前后鼻音 an/ang、en/eng、in/ing、un/ong 可通押，声调不必相同；平水韵同部但普通话读音不相近的不算）。给出具体的建议韵式（如 AABB、ABAB、ABBA、AAAA、XAXA）并为每个行末韵位提供至少两个候选韵脚字，保留译者的选择空间。原文为无韵自由诗或用户明确不要求押韵时，写明“目标译文不强制押韵”，源文声响只作辅助证据；否则押韵是必须完成的目标。押韵优先级低于语义，落实采用“先定句、后定韵”的顺序：先按语义准确与结构对应确定各句表达，行末字取语义最准确的词，不预先锁死韵式；再标出已定行末字的发音，找出已成立的韵对，从已成立韵对出发枚举可行韵式（AAAA、AABB、ABAB、ABBA、AABA、AXBX、XAXA），优先选择改动行末字最少、语义损伤最小的韵式；只在韵式要求的韵位补韵，补韵词必须同时达意；某韵位无法无损补韵时放弃该韵位（标 X，韵式降级为部分韵或母题韵），不反向修改已定句子凑韵。行内语义不清时用语法、语态、介词明确主宾关系，不用模糊说法掩盖。
+目标语押韵是条件目标，不是默认硬目标。只有用户明确要求，或源文分析标记原作韵式高度稳定时，固定韵式才具有约束力；其他情况把押韵降为可选声响证据，优先自由韵或部分韵。需要押韵时按普通话实际发音判定（韵母相同即押韵，前后鼻音 an/ang、en/eng、in/ing、un/ong 可通押，声调不必相同；平水韵同部但普通话读音不相近的不算），给出建议韵式和每个韵位至少两个候选韵脚字。押韵优先级低于语义与中文自然度，落实采用“先定句、后定韵”的顺序：先按语义准确与结构对应确定各句表达，行末字取语义最准确的词，不预先锁死韵式；再标出已定行末字的发音，找出已成立的韵对，从已成立韵对出发枚举可行韵式（AAAA、AABB、ABAB、ABBA、AABA、AXBX、XAXA），优先选择改动行末字最少、语义损伤最小的韵式；只在韵式要求的韵位补韵，补韵词必须同时达意；某韵位无法无损补韵或会形成生硬中文时放弃该韵位（标 X，韵式降级为部分韵或母题韵），不反向修改已定句子凑韵。行内语义不清时用语法、语态、介词明确主宾关系，不用模糊说法掩盖。
+不得把观察到的押韵自动升级为硬要求。英诗中译优先保留反复、问句、象征关系和朗读节奏，再考虑新增韵脚。
 结构对应：每个源诗行对应一到两个目标分句（通常两个）。整齐来自对应关系而非分句数量，单个源诗行绝不能拆成三个或更多分句。分句可以每行一个独立展示，也可以两个一行用标点连接，以对应关系清晰为准。
 确定目标行数前，先核对每个源诗行中不可丢失的语义单位，再判断目标形式能否容纳。用户没有要求逐行一一对应时，不要机械维持相同行数；一个信息密集的长诗行需要拆成多个短诗行时，应明确说明，同时保持分节对应和原有次序。
 不要预先锁死唯一一组韵脚字，应为每个韵位提供多个候选，保留多个候选译法的真实差异；不得为了押韵添加原文没有的含义。换行不自动等于句号：原文仍然延续时，应保留逗号、开放行或跨行延续。
@@ -1464,7 +1567,7 @@ ${punctuationInstruction}
       sourceAnalysis,
     }
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
+    const message = safeErrorMessageForPersistence(db, error)
     const latencyMs = Math.round(performance.now() - startedAt)
     db.prepare(`
       UPDATE agent_invocations
@@ -1485,24 +1588,37 @@ ${punctuationInstruction}
   }
 }
 
-function resolveVariantBinding(
+function variantModelBinding(
   snapshot: ConfigSnapshot,
   variant: AgentDirectionVariant,
-): { binding: ModelBinding; endpoint: ResolvedEndpoint } {
+): ModelBinding {
   const override =
     snapshot.presetRevisionSnapshot?.contract.agentBindingOverrides?.[variant.id]
-  const fallback = snapshot.modelBindings?.defaultWorker ?? {
+  const fallback: ModelBinding = snapshot.modelBindings?.defaultWorker ?? {
     endpointId: null,
     model: '',
   }
-  const binding = {
+  return {
     endpointId:
       override?.endpointId ?? variant.endpointOverrideId ?? fallback.endpointId,
     model: override?.model || variant.modelOverride || fallback.model,
     contextWindow: override?.contextWindow ?? fallback.contextWindow ?? null,
+    maxOutputTokens:
+      override?.maxOutputTokens ?? fallback.maxOutputTokens ?? null,
   }
+}
+
+function resolveVariantBinding(
+  db: Database.Database,
+  snapshot: ConfigSnapshot,
+  variant: AgentDirectionVariant,
+): { binding: ModelBinding; endpoint: ResolvedEndpoint } {
+  const binding = variantModelBinding(snapshot, variant)
   if (!binding.model) throw new Error(`Agent ${variant.catalogName} 未配置模型`)
-  return { binding, endpoint: resolveEndpoint(snapshot, binding.endpointId) }
+  return {
+    binding,
+    endpoint: resolveEndpoint(db, snapshot, binding.endpointId, binding),
+  }
 }
 
 async function callTeam(
@@ -1522,7 +1638,7 @@ async function callTeam(
     nextRetryCount: number
   }>()
   for (const item of team) {
-    const { binding, endpoint } = resolveVariantBinding(snapshot, item.variant)
+    const { binding, endpoint } = resolveVariantBinding(db, snapshot, item.variant)
     const invocationId = randomUUID()
     invocationIds.set(item.variant.id, invocationId)
     db.prepare(`
@@ -1574,6 +1690,7 @@ async function callTeam(
         apiKey: endpoint.apiKey,
       },
       model: binding.model,
+      maxTokens: endpoint.maxOutputTokens,
       messages: [
         { role: 'system', content: system },
         { role: 'user', content: user },
@@ -1594,7 +1711,9 @@ async function callTeam(
   const lastActivityEventAt = new Map<string, number>()
   const ledgerCaller: LLMCaller = (runtimeEndpoint, request) => {
     const state = ledgerByEndpoint.get(runtimeEndpoint)
-    if (!state) return chatCompletion(runtimeEndpoint, request)
+    if (!state) {
+      throw new Error('Worker request is missing its frozen endpoint preflight state.')
+    }
     const retryCount = state.nextRetryCount
     state.nextRetryCount += 1
     return ledgeredFanOutCall(
@@ -1690,6 +1809,7 @@ async function callTeam(
         const evidence = checkTranslationEvidence({
           direction: snapshot.direction ?? 'en_to_zh',
           sourceText: session.source_text,
+          taskBrief: session.task_brief,
           translatedText: semantic.body,
           constraints: snapshot.constraints,
           reportLanguage: snapshot.promptBundleSnapshot?.promptLanguage,
@@ -1707,15 +1827,32 @@ async function callTeam(
         })
       }
     } else {
+      const partial = result.content
+        ? parseSemanticAgentOutput(result.content)
+        : null
       db.prepare(`
         UPDATE agent_invocations
-        SET status='failed', error=?, latency_ms=?, updated_at=datetime('now')
+        SET status='failed', raw_output=?, body_output=?, annotation_output=?,
+            error=?, latency_ms=?, updated_at=datetime('now')
         WHERE id=?
-      `).run(result.error ?? 'Agent call failed', elapsed, invocationId)
+      `).run(
+        partial?.raw ?? null,
+        partial?.body ?? null,
+        partial?.annotation ?? null,
+        safeErrorMessageForPersistence(db, result.error ?? 'Agent call failed'),
+        elapsed,
+        invocationId,
+      )
       emitEvent(db, runId, session.id, 'agent.failed', {
         invocationId,
         agentVariantId: result.agentKey,
-        error: result.error ?? 'Agent call failed',
+        error: safeErrorMessageForPersistence(
+          db,
+          result.error ?? 'Agent call failed',
+        ),
+        partialRaw: partial?.raw ?? null,
+        partialBody: partial?.body ?? null,
+        partialAnnotation: partial?.annotation ?? null,
       })
     }
   }
@@ -1761,7 +1898,8 @@ async function createMainDraft(
   updateRunPhase(db, runId, 'draft')
   const binding = snapshot.modelBindings?.mainAgent
   if (!binding?.model) throw new Error('主 Agent 模型未配置')
-  const endpoint = resolveEndpoint(snapshot, binding.endpointId)
+  const endpoint = resolveEndpoint(db, snapshot, binding.endpointId, binding)
+  const mainInvocationId = randomUUID()
   const writeDraftTool: NonNullable<ChatCompletionRequest['tools']>[number] = {
     type: 'function',
     function: {
@@ -1774,11 +1912,12 @@ async function createMainDraft(
         additionalProperties: false,
         required: ['text', 'reason', 'evidenceInvocationIds'],
         properties: {
-          text: { type: 'string' },
-          reason: { type: 'string' },
+          text: { type: 'string', minLength: 1 },
+          reason: { type: 'string', minLength: 1 },
           evidenceInvocationIds: {
             type: 'array',
             minItems: 2,
+            uniqueItems: true,
             items: { type: 'string' },
           },
         },
@@ -1826,158 +1965,667 @@ async function createMainDraft(
       ),
     },
   ]
-  const response = await complete(
-    endpoint,
-    {
-      model: binding.model,
-      messages,
-      tools: [writeDraftTool],
-      toolChoice: {
-        type: 'function',
-        function: { name: 'write_draft' },
+  const validIds = new Set(candidates.map((candidate) => candidate.id))
+  db.prepare(`
+    INSERT INTO agent_invocations
+      (id, session_id, parent_run_id, agent_variant_id, agent_snapshot,
+       endpoint_id, model, additional_instruction, selection_reason, status)
+    VALUES (?, ?, ?, 'main-editor-fixed-pipeline', ?, ?, ?, '', ?, 'running')
+  `).run(
+    mainInvocationId,
+    session.id,
+    runId,
+    JSON.stringify({ roleKind: 'main_editor', mainEditorRunMode: 'fixed_pipeline' }),
+    endpoint.id,
+    binding.model,
+    'Frozen fixed-pipeline main editor mode',
+  )
+
+  try {
+    const response = await complete(
+      endpoint,
+      {
+        model: binding.model,
+        messages,
+        tools: [writeDraftTool],
+        toolChoice: {
+          type: 'function',
+          function: { name: 'write_draft' },
+        },
       },
+      {
+        db,
+        sessionId: session.id,
+        runId,
+        invocationId: mainInvocationId,
+        operation: 'main_draft',
+      },
+    )
+    assertRunMayContinue(db, session.id)
+    const toolCall = response.toolCalls?.find(
+      (call) => call.name === 'write_draft',
+    )
+    let args: unknown = null
+    try {
+      args = toolCall ? JSON.parse(toolCall.arguments) : null
+    } catch {
+      args = null
+    }
+    const runtime = createTranslationToolRuntime({
+      repository: createTranslationToolRepository(db),
+      handlers: {
+        inspectEvidence() {
+          throw new Error('inspect_evidence is unavailable in fixed-pipeline mode')
+        },
+        searchProjectMemory() {
+          throw new Error('search_project_memory is unavailable in fixed-pipeline mode')
+        },
+        requestReview() {
+          throw new Error('request_review is unavailable in fixed-pipeline mode')
+        },
+        writeDraft(toolArgs) {
+          if (
+            new Set(toolArgs.evidenceInvocationIds).size < 2 ||
+            toolArgs.evidenceInvocationIds.some((id) => !validIds.has(id))
+          ) {
+            throw new Error('write_draft 必须引用至少两个本次成功候选')
+          }
+          assertRunMayContinue(db, session.id)
+          emitEvent(db, runId, session.id, 'tool.called', {
+            name: 'write_draft',
+            providerToolCallId: toolCall?.id ?? null,
+            reason: toolArgs.reason,
+            evidenceInvocationIds: toolArgs.evidenceInvocationIds,
+          })
+          const previousVersion = db.prepare(`
+            SELECT id, version_no
+            FROM final_versions
+            WHERE session_id=?
+            ORDER BY version_no DESC, id DESC
+            LIMIT 1
+          `).get(session.id) as { id: number; version_no: number } | undefined
+          const versionNo = (previousVersion?.version_no ?? 0) + 1
+          const hash = createHash('sha256').update(toolArgs.text).digest('hex')
+          const result = db.prepare(`
+            INSERT INTO final_versions
+              (session_id, version_no, text, source, parent_version_id, content_hash)
+            VALUES (?, ?, ?, 'main_draft', ?, ?)
+          `).run(
+            session.id,
+            versionNo,
+            toolArgs.text,
+            previousVersion?.id ?? null,
+            hash,
+          )
+          const versionId = Number(result.lastInsertRowid)
+          db.prepare(
+            "UPDATE sessions SET final_version_id=?, state='assembled', updated_at=datetime('now') WHERE id=?",
+          ).run(versionId, session.id)
+          ensureRunControl(db, session.id)
+          db.prepare(`
+            UPDATE session_run_controls
+            SET candidates_stale=0, updated_at=datetime('now')
+            WHERE session_id=?
+          `).run(session.id)
+          emitEvent(db, runId, session.id, 'version.created', {
+            versionId,
+            versionNo,
+            source: 'main_draft',
+            reason: toolArgs.reason,
+            evidenceInvocationIds: toolArgs.evidenceInvocationIds,
+          })
+          emitEvent(db, runId, session.id, 'version.finalized', {
+            versionId,
+            versionNo,
+            source: 'main_draft',
+            method: 'fixed_pipeline_write_draft_transaction',
+          })
+          return { versionId, versionNo }
+        },
+      },
+    })
+    const executed = await runtime.execute({
+      name: 'write_draft',
+      args,
+      providerToolCallId: toolCall?.id ?? null,
+      logicalCallKey:
+        'fixed-write-draft:' +
+        createHash('sha256')
+          .update(toolCall?.arguments ?? 'missing')
+          .digest('hex'),
+      context: {
+        sessionId: session.id,
+        runId,
+        invocationId: mainInvocationId,
+        parentToolCallId: null,
+        stage: 'draft',
+        actor: 'main_agent',
+        depth: 0,
+        allowedInheritanceMode:
+          candidateAnnotationMode(snapshot) === 'body_and_annotation'
+            ? 'body_and_annotation'
+            : 'body_only',
+        knownEvidenceIds: [...validIds],
+        baseVersion: null,
+        providerSeed: null,
+        determinismLevel: 'provider_default',
+      },
+    })
+    const parsed = writeDraftArgsSchema.parse(args)
+    db.prepare(`
+      UPDATE agent_invocations
+      SET status='complete', raw_output=?, body_output=?,
+          annotation_output=NULL, updated_at=datetime('now')
+      WHERE id=? AND status='running'
+    `).run(parsed.text, parsed.text, mainInvocationId)
+    emitEvent(db, runId, session.id, 'tool.completed', {
+      name: 'write_draft',
+      toolCallId: executed.callId,
+      providerToolCallId: toolCall?.id ?? null,
+    })
+  } catch (error) {
+    emitEvent(db, runId, session.id, 'tool.failed', {
+      name: 'write_draft',
+      error: error instanceof Error ? error.message : String(error),
+    })
+    db.prepare(`
+      UPDATE agent_invocations
+      SET status=?, error=?, updated_at=datetime('now')
+      WHERE id=? AND status='running'
+    `).run(
+      error instanceof RunPausedError ? 'interrupted' : 'failed',
+      error instanceof RunPausedError
+        ? null
+        : safeErrorMessageForPersistence(db, error),
+      mainInvocationId,
+    )
+    throw error
+  }
+}
+
+const TOOL_ENABLED_MAIN_MAX_ROUNDS = 6
+
+function toolAnnotationMetadata(annotation: string | null, source: string) {
+  return annotation === null
+    ? null
+    : {
+        source,
+        version: 'semantic-boundary/v1',
+        hash: createHash('sha256').update(annotation).digest('hex'),
+      }
+}
+
+function toolMemoryKind(kind: string): ProjectMemorySearchResult['items'][number]['kind'] {
+  if (kind === 'term' || kind === 'proper_noun') return 'terminology'
+  if (kind === 'style_rule') return 'style'
+  if (kind === 'character_voice') return 'character'
+  if (kind === 'parallel_excerpt') return 'example'
+  if (kind === 'approved_decision' || kind === 'context_note') return 'fact'
+  return 'other'
+}
+
+function frozenToolProjectMemory(
+  db: Database.Database,
+  sessionId: string,
+): ProjectMemorySearchResult['items'] {
+  const context = createProjectRepositories(db).sessionProjectContexts
+    .getBySession(sessionId)
+  if (!context) return []
+  return context.resources.map(({ resourceId, revision }) => ({
+    id: revision.id,
+    kind: toolMemoryKind(revision.kind),
+    title: `${revision.kind}:${resourceId}`,
+    content: [
+      revision.content.sourceText,
+      revision.content.targetText,
+      revision.content.instruction,
+      revision.content.note,
+    ].filter((part): part is string => Boolean(part?.trim())).join('\n'),
+    score: null,
+    revisionId: revision.id,
+  }))
+}
+
+async function createToolEnabledMainDraft(
+  db: Database.Database,
+  runId: string,
+  session: SessionRecord,
+  snapshot: ConfigSnapshot,
+  candidates: InvocationResult[],
+  contextAnalyses: ContextAnalysisResult[],
+  poetryPlan: PoetryPlanResult | null = null,
+) {
+  assertRunMayContinue(db, session.id)
+  updateRunPhase(db, runId, 'draft')
+  const binding = snapshot.modelBindings?.mainAgent
+  if (!binding?.model) throw new Error('主 Agent 模型未配置')
+  const endpoint = resolveEndpoint(db, snapshot, binding.endpointId, binding)
+  const mainInvocationId = randomUUID()
+  const inheritanceMode: EvidenceInheritanceMode =
+    candidateAnnotationMode(snapshot) === 'body_and_annotation'
+      ? 'body_and_annotation'
+      : 'body_only'
+  const candidateIds = new Set(candidates.map((candidate) => candidate.id))
+  const persistedRawById = new Map(
+    (db.prepare(`
+      SELECT id, raw_output FROM agent_invocations
+      WHERE session_id=? AND status='complete' AND raw_output IS NOT NULL
+    `).all(session.id) as Array<{ id: string; raw_output: string }>).map(
+      (row) => [row.id, row.raw_output] as const,
+    ),
+  )
+  const materials: EvidenceMaterial[] = [
+    ...candidates.map((candidate) => ({
+      evidenceId: candidate.id,
+      sourceType: 'agent_invocation' as const,
+      sourceId: candidate.id,
+      raw: persistedRawById.get(candidate.id) ??
+        (candidate.annotation
+          ? `${candidate.body}\n---\n${candidate.annotation}`
+          : candidate.body),
+      body: candidate.body,
+      annotation: candidate.annotation,
+      annotationMetadata: toolAnnotationMetadata(
+        candidate.annotation,
+        `agent_invocations:${candidate.id}:annotation_output`,
+      ),
+    })),
+    ...contextAnalyses.map((analysis) => ({
+      evidenceId: analysis.id,
+      sourceType: 'agent_invocation' as const,
+      sourceId: analysis.id,
+      raw: analysis.content,
+      body: analysis.content,
+      annotation: null,
+      annotationMetadata: null,
+    })),
+    ...(poetryPlan ? [{
+      evidenceId: poetryPlan.id,
+      sourceType: 'agent_invocation' as const,
+      sourceId: poetryPlan.id,
+      raw: poetryPlan.raw,
+      body: poetryPlan.body,
+      annotation: poetryPlan.annotation,
+      annotationMetadata: toolAnnotationMetadata(
+        poetryPlan.annotation,
+        `agent_invocations:${poetryPlan.id}:annotation_output`,
+      ),
+    }] : []),
+  ]
+  const projectMemory = frozenToolProjectMemory(db, session.id)
+  materials.push(...projectMemory.map((item) => ({
+    evidenceId: item.id,
+    sourceType: 'project_memory' as const,
+    sourceId: item.revisionId ?? item.id,
+    raw: item.content,
+    body: item.content,
+    annotation: null,
+    annotationMetadata: null,
+  })))
+  const evidenceById = new Map(
+    materials.map((item) => [item.evidenceId, item] as const),
+  )
+  let draftResult: { versionId: number; versionNo: number } | null = null
+  let draftText: string | null = null
+
+  const handlers: TranslationToolRuntimeHandlers = {
+    inspectEvidence(args) {
+      return args.evidenceIds.map((evidenceId) => {
+        const material = evidenceById.get(evidenceId)
+        if (!material) throw new Error(`Unknown evidence: ${evidenceId}`)
+        return material
+      })
+    },
+    searchProjectMemory(args) {
+      const terms = args.query.toLowerCase().split(/\s+/u).filter(Boolean)
+      const allowedKinds = args.kinds ? new Set(args.kinds) : null
+      return {
+        items: projectMemory
+          .filter((item) => !allowedKinds || allowedKinds.has(item.kind))
+          .map((item) => {
+            const searchable = `${item.title}\n${item.content}`.toLowerCase()
+            const hits = terms.filter((term) => searchable.includes(term)).length
+            return { ...item, score: terms.length ? hits / terms.length : 0 }
+          })
+          .filter((item) => item.score > 0)
+          .sort((left, right) => right.score - left.score)
+          .slice(0, args.maxResults),
+      }
+    },
+    async requestReview(args, childContext) {
+      const reviewBinding = snapshot.modelBindings?.reviewAgent ?? binding
+      if (!reviewBinding?.model) throw new Error('只读审校子 Agent 模型未配置')
+      const reviewEndpoint = resolveEndpoint(
+        db,
+        snapshot,
+        reviewBinding.endpointId,
+        reviewBinding,
+      )
+      const invocationId = randomUUID()
+      const cited = args.evidenceIds.map((id) => {
+        const material = evidenceById.get(id)
+        if (!material) throw new Error(`Unknown evidence: ${id}`)
+        return material
+      })
+      const projected = projectEvidenceForInheritance(
+        cited,
+        childContext.allowedInheritanceMode,
+      )
+      db.prepare(`
+        INSERT INTO agent_invocations
+          (id, session_id, parent_run_id, agent_variant_id, agent_snapshot,
+           endpoint_id, model, additional_instruction, selection_reason, status)
+        VALUES (?, ?, ?, 'tool-review-subagent', ?, ?, ?, '', ?, 'running')
+      `).run(
+        invocationId,
+        session.id,
+        runId,
+        JSON.stringify({
+          roleKind: 'tool_review',
+          readOnly: true,
+          parentToolCallId: childContext.parentToolCallId,
+        }),
+        reviewEndpoint.id,
+        reviewBinding.model,
+        'Bounded read-only request_review tool call',
+      )
+      const startedAt = performance.now()
+      try {
+        const response = await complete(reviewEndpoint, {
+          model: reviewBinding.model,
+          messages: [
+            {
+              role: 'system',
+              content:
+                'You are a read-only translation reviewer. Answer only the focused question from the supplied segment and evidence. You have no mutating tools. Optional annotation may follow a standalone --- line.',
+            },
+            {
+              role: 'user',
+              content: JSON.stringify({
+                question: args.question,
+                segment: args.segment,
+                evidence: projected,
+              }),
+            },
+          ],
+        }, {
+          db,
+          sessionId: session.id,
+          runId,
+          invocationId,
+          operation: 'stage_review',
+        })
+        const semantic = parseSemanticAgentOutput(response.content)
+        if (!semantic.body) throw new Error('只读审校子 Agent 返回空正文')
+        db.prepare(`
+          UPDATE agent_invocations
+          SET status='complete', raw_output=?, body_output=?,
+              annotation_output=?, latency_ms=?, updated_at=datetime('now')
+          WHERE id=? AND status='running'
+        `).run(
+          semantic.raw,
+          semantic.body,
+          semantic.annotation,
+          Math.round(performance.now() - startedAt),
+          invocationId,
+        )
+        const evidence: EvidenceMaterial = {
+          evidenceId: invocationId,
+          sourceType: 'agent_invocation',
+          sourceId: invocationId,
+          raw: semantic.raw,
+          body: semantic.body,
+          annotation: semantic.annotation,
+          annotationMetadata: toolAnnotationMetadata(
+            semantic.annotation,
+            `agent_invocations:${invocationId}:annotation_output`,
+          ),
+        }
+        evidenceById.set(invocationId, evidence)
+        return { reviewInvocationId: invocationId, evidence }
+      } catch (error) {
+        db.prepare(`
+          UPDATE agent_invocations
+          SET status='failed', error=?, latency_ms=?, updated_at=datetime('now')
+          WHERE id=? AND status='running'
+        `).run(
+          safeErrorMessageForPersistence(db, error),
+          Math.round(performance.now() - startedAt),
+          invocationId,
+        )
+        throw error
+      }
+    },
+    writeDraft(args) {
+      if (
+        new Set(args.evidenceInvocationIds).size < 2 ||
+        args.evidenceInvocationIds.some((id) => !candidateIds.has(id))
+      ) {
+        throw new Error('write_draft 必须引用至少两个本次成功候选')
+      }
+      assertRunMayContinue(db, session.id)
+      // The runtime owns the surrounding SQLite transaction and completes the
+      // write_draft trace in that same transaction.
+      const previous = db.prepare(`
+        SELECT id, version_no FROM final_versions
+        WHERE session_id=? ORDER BY version_no DESC, id DESC LIMIT 1
+      `).get(session.id) as { id: number; version_no: number } | undefined
+      const versionNo = (previous?.version_no ?? 0) + 1
+      const hash = createHash('sha256').update(args.text).digest('hex')
+      const inserted = db.prepare(`
+        INSERT INTO final_versions
+          (session_id, version_no, text, source, parent_version_id, content_hash)
+        VALUES (?, ?, ?, 'main_draft', ?, ?)
+      `).run(session.id, versionNo, args.text, previous?.id ?? null, hash)
+      const versionId = Number(inserted.lastInsertRowid)
+      db.prepare(
+        "UPDATE sessions SET final_version_id=?, state='assembled', updated_at=datetime('now') WHERE id=?",
+      ).run(versionId, session.id)
+      ensureRunControl(db, session.id)
+      db.prepare(`
+        UPDATE session_run_controls
+        SET candidates_stale=0, updated_at=datetime('now') WHERE session_id=?
+      `).run(session.id)
+      emitEvent(db, runId, session.id, 'version.created', {
+        versionId,
+        versionNo,
+        source: 'main_draft',
+        reason: args.reason,
+        evidenceInvocationIds: args.evidenceInvocationIds,
+        mainEditorRunMode: 'tool_enabled',
+      })
+      emitEvent(db, runId, session.id, 'version.finalized', {
+        versionId,
+        versionNo,
+        source: 'main_draft',
+        method: 'tool_enabled_write_draft_transaction',
+      })
+      return { versionId, versionNo }
+    },
+  }
+  const runtime = createTranslationToolRuntime({
+    repository: createTranslationToolRepository(db),
+    handlers,
+  })
+  const exposedTools = TRANSLATION_TOOL_DEFINITIONS.filter(
+    (tool) => tool.function.name !== 'replace_text',
+  ) as NonNullable<ChatCompletionRequest['tools']>
+  const writeOnly = exposedTools.filter(
+    (tool) => tool.function.name === 'write_draft',
+  )
+  const manifest = candidates.map((candidate, index) => ({
+    evidenceId: candidate.id,
+    candidate: index + 1,
+    role: candidate.variant.catalogName,
+  }))
+  const messages: ChatCompletionRequest['messages'] = [
+    {
+      role: 'system',
+      content:
+        `${snapshot.promptBundleSnapshot?.mainAgentSystemPrompt ?? ''}\n\n` +
+        promptText(
+          snapshot,
+          '你可以在有界循环中检查证据、检索冻结项目记忆、请求最多两次只读审校、记录问题或提出补丁提议。必须以 write_draft 结束，并引用至少两个候选调用 ID。propose_patch 只记录提议，不会自动应用。',
+          'You may inspect evidence, search frozen project memory, request at most two read-only reviews, record issues, or propose a patch in a bounded loop. You must finish with write_draft and cite at least two candidate invocation IDs. propose_patch records a proposal and never applies it.',
+        ),
     },
     {
+      role: 'user',
+      content: JSON.stringify({
+        taskBrief: session.task_brief || '',
+        sourceText: session.source_text,
+        evidenceInheritanceMode: inheritanceMode,
+        candidateManifest: manifest,
+        contextAnalysisEvidenceIds: contextAnalyses.map((item) => item.id),
+        poetryPlanEvidenceId: poetryPlan?.id ?? null,
+        frozenProjectMemoryIds: projectMemory.map((item) => item.id),
+      }),
+    },
+  ]
+  const latest = db.prepare(`
+    SELECT id, text FROM final_versions
+    WHERE session_id=? ORDER BY version_no DESC, id DESC LIMIT 1
+  `).get(session.id) as { id: number; text: string } | undefined
+  db.prepare(`
+    INSERT INTO agent_invocations
+      (id, session_id, parent_run_id, agent_variant_id, agent_snapshot,
+       endpoint_id, model, additional_instruction, selection_reason, status)
+    VALUES (?, ?, ?, 'main-editor-tool-enabled', ?, ?, ?, '', ?, 'running')
+  `).run(
+    mainInvocationId,
+    session.id,
+    runId,
+    JSON.stringify({ roleKind: 'main_editor', mainEditorRunMode: 'tool_enabled' }),
+    endpoint.id,
+    binding.model,
+    'Frozen tool-enabled main editor mode',
+  )
+
+  try {
+    for (let round = 0; round < TOOL_ENABLED_MAIN_MAX_ROUNDS; round += 1) {
+    assertRunMayContinue(db, session.id)
+    const finalRound = round === TOOL_ENABLED_MAIN_MAX_ROUNDS - 1
+    const response = await complete(endpoint, {
+      model: binding.model,
+      messages,
+      tools: finalRound ? writeOnly : exposedTools,
+      toolChoice: finalRound
+        ? { type: 'function', function: { name: 'write_draft' } }
+        : 'auto',
+    }, {
       db,
       sessionId: session.id,
       runId,
+      invocationId: mainInvocationId,
       operation: 'main_draft',
-    },
-  )
-  assertRunMayContinue(db, session.id)
-  const toolCall = response.toolCalls?.find((call) => call.name === 'write_draft')
-  let args: unknown = null
-  try {
-    args = toolCall ? JSON.parse(toolCall.arguments) : null
-  } catch {
-    args = null
-  }
-  const parsed = writeDraftArgsSchema.safeParse(args)
-  const validIds = new Set(candidates.map((candidate) => candidate.id))
-  if (
-    !parsed.success ||
-    new Set(parsed.data.evidenceInvocationIds).size < 2 ||
-    parsed.data.evidenceInvocationIds.some((id) => !validIds.has(id))
-  ) {
-    emitEvent(db, runId, session.id, 'tool.failed', {
-      name: 'write_draft',
-      error: 'write_draft 必须引用至少两个本次成功候选',
     })
-    throw new Error('主 Agent 未能提交带有两个有效候选证据的第一版成稿')
-  }
-  emitEvent(db, runId, session.id, 'tool.called', {
-    name: 'write_draft',
-    reason: parsed.data.reason,
-    evidenceInvocationIds: parsed.data.evidenceInvocationIds,
-  })
-  const previousVersion = db.prepare(`
-    SELECT id, version_no
-    FROM final_versions
-    WHERE session_id=?
-    ORDER BY version_no DESC, id DESC
-    LIMIT 1
-  `).get(session.id) as { id: number; version_no: number } | undefined
-  const versionNo = (previousVersion?.version_no ?? 0) + 1
-  const hash = createHash('sha256').update(parsed.data.text).digest('hex')
-  const result = db.prepare(`
-    INSERT INTO final_versions
-      (session_id, version_no, text, source, parent_version_id, content_hash)
-    VALUES (?, ?, ?, 'main_draft', ?, ?)
-  `).run(
-    session.id,
-    versionNo,
-    parsed.data.text,
-    previousVersion?.id ?? null,
-    hash,
-  )
-  const versionId = Number(result.lastInsertRowid)
-  emitEvent(db, runId, session.id, 'version.created', {
-    versionId,
-    versionNo,
-    source: 'main_draft',
-    reason: parsed.data.reason,
-    evidenceInvocationIds: parsed.data.evidenceInvocationIds,
-  })
-
-  const submitTool: NonNullable<ChatCompletionRequest['tools']>[number] = {
-    type: 'function',
-    function: {
-      name: 'submit_final',
-      description:
-        snapshot.promptBundleSnapshot?.toolDescriptions.submit_final ??
-        'Mark a text version as the final version.',
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['versionId', 'summary'],
-        properties: {
-          versionId: { type: 'integer' },
-          summary: { type: 'string' },
-        },
-      },
-    },
-  }
-  const submitResponse = await complete(endpoint, {
-    model: binding.model,
-    messages: [
-      {
-        role: 'system',
-          content:
-            `${snapshot.promptBundleSnapshot?.mainAgentSystemPrompt ?? ''}\n\n` +
-            promptText(
-              snapshot,
-              '证据化初稿已保存。请对该版本调用 submit_final。',
-              'The evidence-backed draft is saved. Use submit_final for that version.',
-            ),
-      },
-      {
+    const calls = response.toolCalls ?? []
+    if (calls.length === 0) {
+      messages.push({ role: 'assistant', content: response.content })
+      messages.push({
         role: 'user',
-        content: `versionId=${versionId}\n\n${parsed.data.text}`,
-      },
-    ],
-    tools: [submitTool],
-    toolChoice: {
-      type: 'function',
-      function: { name: 'submit_final' },
-    },
-  }, {
-    db,
-    sessionId: session.id,
-    runId,
-    operation: 'submit',
-  })
-  assertRunMayContinue(db, session.id)
-  const submitCall = submitResponse.toolCalls?.find(
-    (call) => call.name === 'submit_final',
-  )
-  let submitArgs: unknown = null
-  try {
-    submitArgs = submitCall ? JSON.parse(submitCall.arguments) : null
-  } catch {
-    submitArgs = null
+        content: finalRound
+          ? 'write_draft is mandatory now.'
+          : 'Continue with the available tools and finish with write_draft.',
+      })
+      continue
+    }
+    messages.push({
+      role: 'assistant',
+      content: response.content || '',
+      tool_calls: calls.map((call) => ({
+        id: call.id,
+        type: 'function',
+        function: { name: call.name, arguments: call.arguments },
+      })),
+    } as unknown as ChatCompletionRequest['messages'][number])
+    const ordered = [
+      ...calls.filter((call) => call.name !== 'write_draft'),
+      ...calls.filter((call) => call.name === 'write_draft').slice(0, 1),
+    ]
+    for (const [callIndex, call] of ordered.entries()) {
+      let args: unknown = null
+      try {
+        args = JSON.parse(call.arguments)
+      } catch {
+        args = null
+      }
+      const validId = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(call.id)
+        ? call.id
+        : randomUUID()
+      let content: string
+      try {
+        const executed = await runtime.execute({
+          name: call.name,
+          args,
+          providerToolCallId: call.id,
+          logicalCallKey:
+            (call.name === 'write_draft' ? 'write-draft:' :
+              `round-${round}-call-${callIndex}-${call.name}:`) +
+            createHash('sha256').update(call.arguments).digest('hex'),
+          context: {
+            sessionId: session.id,
+            runId,
+            invocationId: mainInvocationId,
+            parentToolCallId: null,
+            stage: 'draft',
+            actor: 'main_agent',
+            depth: 0,
+            allowedInheritanceMode: inheritanceMode,
+            knownEvidenceIds: [...evidenceById.keys()],
+            baseVersion: latest ?? null,
+            providerSeed: null,
+            determinismLevel: 'provider_default',
+          },
+        })
+        content = JSON.stringify(executed.result)
+        if (call.name === 'write_draft') {
+          draftResult = writeDraftResultSchema.parse(executed.result)
+          draftText = writeDraftArgsSchema.parse(args).text
+        }
+        emitEvent(db, runId, session.id, 'tool.called', {
+          name: call.name,
+          toolCallId: executed.callId,
+        })
+      } catch (error) {
+        content = `Error: ${safeErrorMessageForPersistence(db, error)}`
+        emitEvent(db, runId, session.id, 'tool.failed', {
+          name: call.name,
+          toolCallId: validId,
+          error: content,
+        })
+      }
+      messages.push({
+        role: 'tool',
+        tool_call_id: call.id,
+        content,
+      })
+      if (call.name === 'write_draft' && draftResult) {
+        db.prepare(`
+          UPDATE agent_invocations
+          SET status='complete', raw_output=?, body_output=?,
+              annotation_output=NULL, updated_at=datetime('now')
+          WHERE id=? AND status='running'
+        `).run(draftText, draftText, mainInvocationId)
+        return
+      }
+    }
+    }
+    throw new Error('tool_enabled 主 Agent 未在有界循环内调用 write_draft')
+  } catch (error) {
+    db.prepare(`
+      UPDATE agent_invocations
+      SET status=?, error=?, updated_at=datetime('now')
+      WHERE id=? AND status='running'
+    `).run(
+      error instanceof RunPausedError ? 'interrupted' : 'failed',
+      error instanceof RunPausedError
+        ? null
+        : safeErrorMessageForPersistence(db, error),
+      mainInvocationId,
+    )
+    throw error
   }
-  const submit = submitFinalArgsSchema.safeParse(submitArgs)
-  if (!submit.success || submit.data.versionId !== versionId) {
-    emitEvent(db, runId, session.id, 'tool.failed', {
-      name: 'submit_final',
-      error: 'submit_final 引用了无效版本',
-    })
-    throw new Error('第一版已保存，但主 Agent 未正确提交最终版本')
-  }
-  db.prepare(
-    "UPDATE sessions SET final_version_id=?, state='assembled', updated_at=datetime('now') WHERE id=?",
-  ).run(versionId, session.id)
-  ensureRunControl(db, session.id)
-  db.prepare(`
-    UPDATE session_run_controls
-    SET candidates_stale=0, updated_at=datetime('now')
-    WHERE session_id=?
-  `).run(session.id)
-  emitEvent(db, runId, session.id, 'tool.called', {
-    name: 'submit_final',
-    versionId,
-    summary: submit.data.summary,
-  })
 }
 
 const REVIEW_LENSES = [
@@ -2010,16 +2658,21 @@ const REVIEW_LENSES = [
   },
 ] as const
 
-function combineIndependentReviews(
+export function combineIndependentReviews(
+  db: Database.Database,
   promptLanguage: 'zh' | 'en',
   completed: Array<{
-    lens: (typeof REVIEW_LENSES)[number]
+    lens: Pick<(typeof REVIEW_LENSES)[number], 'labelZh' | 'labelEn'>
     raw: string
     body: string
     annotation: string | null
   }>,
-  failures: Array<{ lensId: string; error: string }>,
+  failures: Array<{ lensId: string; error: unknown }>,
 ) {
+  const safeFailures = failures.map((failure) => ({
+    lensId: failure.lensId,
+    error: safeErrorMessageForPersistence(db, failure.error),
+  }))
   const body = completed
     .map(({ lens, body: auditBody }) =>
       promptLanguage === 'en'
@@ -2034,11 +2687,11 @@ function combineIndependentReviews(
         ? `${lens.labelEn}:\n${annotation}`
         : `${lens.labelZh}：\n${annotation}`,
     )
-  if (failures.length > 0) {
+  if (safeFailures.length > 0) {
     notes.push(
       promptLanguage === 'en'
-        ? `Unavailable audit passes:\n${failures.map((item) => `${item.lensId}: ${item.error}`).join('\n')}`
-        : `未完成的独立审查：\n${failures.map((item) => `${item.lensId}：${item.error}`).join('\n')}`,
+        ? `Unavailable audit passes:\n${safeFailures.map((item) => `${item.lensId}: ${item.error}`).join('\n')}`
+        : `未完成的独立审查：\n${safeFailures.map((item) => `${item.lensId}：${item.error}`).join('\n')}`,
     )
   }
   const annotation = notes.length > 0 ? notes.join('\n\n') : null
@@ -2110,9 +2763,7 @@ async function runIndependentReviewAudits(params: {
       completed.push(result.value)
       return
     }
-    const error = result.reason instanceof Error
-      ? result.reason.message
-      : String(result.reason)
+    const error = safeErrorMessageForPersistence(db, result.reason)
     failures.push({ lensId: REVIEW_LENSES[index].id, error })
     emitEvent(db, runId, session.id, 'stage.audit.failed', {
       stage: 'review',
@@ -2128,7 +2779,7 @@ async function runIndependentReviewAudits(params: {
         : `独立审查至少需要两个成功结果；本次仅完成 ${completed.length} 个。`,
     )
   }
-  return combineIndependentReviews(promptLanguage, completed, failures)
+  return combineIndependentReviews(db, promptLanguage, completed, failures)
 }
 
 async function runFourStages(
@@ -2173,7 +2824,7 @@ async function runFourStages(
     emitEvent(db, runId, session.id, 'stage.started', { stage })
     const binding = stageBinding(snapshot, stage)
     if (!binding?.model) throw new Error(`${stage} 阶段模型未配置`)
-    const endpoint = resolveEndpoint(snapshot, binding.endpointId)
+    const endpoint = resolveEndpoint(db, snapshot, binding.endpointId, binding)
     emitEvent(db, runId, session.id, 'stage.binding.resolved', {
       stage,
       endpointId: binding.endpointId,
@@ -2267,7 +2918,7 @@ async function runFourStages(
         annotation: semantic.annotation,
       })
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
+      const message = safeErrorMessageForPersistence(db, error)
       const diagnosticId = randomUUID()
       db.prepare(`
         INSERT INTO stage_outputs
@@ -2456,15 +3107,29 @@ async function executeRun(
         poetryPlan,
       )
     } else {
-      await createMainDraft(
-        db,
-        runId,
-        session,
-        snapshot,
-        candidates,
-        contextAnalyses,
-        poetryPlan,
-      )
+      const mainEditorRunMode =
+        snapshot.orchestrationPolicy?.mainEditorRunMode ?? 'fixed_pipeline'
+      if (mainEditorRunMode === 'tool_enabled') {
+        await createToolEnabledMainDraft(
+          db,
+          runId,
+          session,
+          snapshot,
+          candidates,
+          contextAnalyses,
+          poetryPlan,
+        )
+      } else {
+        await createMainDraft(
+          db,
+          runId,
+          session,
+          snapshot,
+          candidates,
+          contextAnalyses,
+          poetryPlan,
+        )
+      }
     }
     db.prepare(`
       UPDATE orchestration_runs
@@ -2499,7 +3164,7 @@ async function executeRun(
       })
       return
     }
-    const message = error instanceof Error ? error.message : String(error)
+    const message = safeErrorMessageForPersistence(db, error)
     db.prepare(`
       UPDATE orchestration_runs
       SET status='failed', error=?, completed_at=datetime('now')
@@ -2566,7 +3231,6 @@ function withCurrentStageConfiguration(
       baseUrl: endpoint.base_url,
       chatCompletionsPath:
         endpoint.chat_completions_path ?? '/v1/chat/completions',
-      apiKey: encryptSecret(endpoint.api_key),
       hasApiKey: Boolean(endpoint.api_key),
       contextWindow: endpoint.context_window ?? null,
     })),
@@ -2627,6 +3291,9 @@ async function executeDraftRegeneration(
               baseSnapshot.orchestrationPolicy?.teamPolicy ?? 'dynamic',
             reviewMode:
               baseSnapshot.orchestrationPolicy?.reviewMode ?? 'main_editor',
+            mainEditorRunMode:
+              baseSnapshot.orchestrationPolicy?.mainEditorRunMode ??
+              'fixed_pipeline',
             maxAgentCalls:
               baseSnapshot.orchestrationPolicy?.maxAgentCalls ?? 5,
             candidateAnnotationMode: annotationModeOverride,
@@ -2674,15 +3341,29 @@ async function executeDraftRegeneration(
         false,
       )
     } else {
-      await createMainDraft(
-        db,
-        runId,
-        session,
-        snapshot,
-        candidates,
-        contextAnalyses,
-        poetryPlan,
-      )
+      const mainEditorRunMode =
+        snapshot.orchestrationPolicy?.mainEditorRunMode ?? 'fixed_pipeline'
+      if (mainEditorRunMode === 'tool_enabled') {
+        await createToolEnabledMainDraft(
+          db,
+          runId,
+          session,
+          snapshot,
+          candidates,
+          contextAnalyses,
+          poetryPlan,
+        )
+      } else {
+        await createMainDraft(
+          db,
+          runId,
+          session,
+          snapshot,
+          candidates,
+          contextAnalyses,
+          poetryPlan,
+        )
+      }
     }
     db.prepare(`
       UPDATE orchestration_runs
@@ -2704,7 +3385,7 @@ async function executeDraftRegeneration(
       })
       return
     }
-    const message = error instanceof Error ? error.message : String(error)
+    const message = safeErrorMessageForPersistence(db, error)
     db.prepare(`
       UPDATE orchestration_runs
       SET status='failed', error=?, completed_at=datetime('now')
@@ -2731,6 +3412,18 @@ export function startVNextDraftRegeneration(
     'SELECT * FROM sessions WHERE id=?',
   ).get(sessionId) as SessionRecord | undefined
   if (!session) throw new Error('session_not_found')
+  const frozenPreflightSnapshot = ensureStoredSessionPreflight(db, session)
+  session.config_snapshot = JSON.stringify(frozenPreflightSnapshot)
+  if (configMode === 'current') {
+    ensureStoredSessionPreflight(
+      db,
+      session,
+      withCurrentStageConfiguration(
+        db,
+        frozenPreflightSnapshot as unknown as ConfigSnapshot,
+      ) as unknown as ConfigSnapshotVNext,
+    )
+  }
   const hasRecoverableFinalVersion = Boolean(session.final_version_id)
   if (
     !['translated', 'assembled', 'refining'].includes(session.state) &&
@@ -2773,6 +3466,10 @@ export function restartVNextSession(
     preset_revision_id?: string | null
   }) | undefined
   if (!source) throw new Error('session_not_found')
+  const frozenPreflightSnapshot = ensureStoredSessionPreflight(db, source)
+  source.config_snapshot = JSON.stringify(
+    withoutSnapshotCredentials(frozenPreflightSnapshot),
+  )
   const newSessionId = randomUUID()
   db.transaction(() => {
     db.prepare(`
@@ -2804,16 +3501,18 @@ export function startVNextRun(
   sessionId: string,
   configMode: 'frozen' | 'current' = 'frozen',
 ): { runId: string; reused: boolean } {
+  const session = db.prepare(
+    'SELECT * FROM sessions WHERE id=?',
+  ).get(sessionId) as SessionRecord | undefined
+  if (!session) throw new Error('session_not_found')
+  const frozenPreflightSnapshot = ensureStoredSessionPreflight(db, session)
+  session.config_snapshot = JSON.stringify(frozenPreflightSnapshot)
   const existing = db.prepare(`
     SELECT id FROM orchestration_runs
     WHERE session_id=? AND status IN ('queued','running')
     ORDER BY created_at DESC LIMIT 1
   `).get(sessionId) as { id: string } | undefined
   if (existing) return { runId: existing.id, reused: true }
-  const session = db.prepare(
-    'SELECT * FROM sessions WHERE id=?',
-  ).get(sessionId) as SessionRecord | undefined
-  if (!session) throw new Error('session_not_found')
   if (!['draft', 'translated', 'translating', 'coordinating'].includes(session.state)) {
     throw new Error(`invalid_session_state:${session.state}`)
   }
@@ -2822,10 +3521,7 @@ export function startVNextRun(
     if (session.state !== 'translated') {
       throw new Error('current_main_binding_requires_completed_candidates')
     }
-    const frozenSnapshot = JSON.parse(
-      session.config_snapshot,
-    ) as ConfigSnapshot
-    if (frozenSnapshot.version !== 3) throw new Error('not_vnext_session')
+    const frozenSnapshot = frozenPreflightSnapshot
     const direction = frozenSnapshot.direction ?? 'en_to_zh'
     const profile = createWorkspaceModelProfilesRepo(db).get(direction)
     if (!profile?.mainAgent.endpointId || !profile.mainAgent.model) {
@@ -2836,7 +3532,7 @@ export function startVNextRun(
       (endpoint) => endpoint.id === profile.mainAgent.endpointId,
     )
     if (!selectedEndpoint) throw new Error('current_main_endpoint_unavailable')
-    snapshotOverride = {
+    const currentSnapshot = {
       ...frozenSnapshot,
       endpointSnapshots: endpoints.map((endpoint) => ({
         id: endpoint.id,
@@ -2844,7 +3540,6 @@ export function startVNextRun(
         baseUrl: endpoint.base_url,
         chatCompletionsPath:
           endpoint.chat_completions_path ?? '/v1/chat/completions',
-        apiKey: encryptSecret(endpoint.api_key),
         hasApiKey: Boolean(endpoint.api_key),
         contextWindow: endpoint.context_window ?? null,
       })),
@@ -2863,6 +3558,11 @@ export function startVNextRun(
         assembleAgent: profile.assembleAgent,
       },
     }
+    snapshotOverride = ensureStoredSessionPreflight(
+      db,
+      session,
+      currentSnapshot,
+    ) as unknown as ConfigSnapshot
   }
   ensureRunControl(db, sessionId)
   db.prepare(`
@@ -2901,6 +3601,47 @@ interface InvocationRetryRow {
   status: string
 }
 
+type InvocationRetryVariant = AgentDirectionVariant & {
+  roleKind?: string
+  analysisIndex?: number
+}
+
+function resolveInvocationRetryBinding(
+  snapshot: ConfigSnapshot,
+  source: InvocationRetryRow,
+  variant: InvocationRetryVariant,
+): ModelBinding {
+  let frozenBinding: ModelBinding | undefined
+  if (variant.roleKind === 'context_analysis') {
+    const configured =
+      snapshot.presetRevisionSnapshot?.contract.contextAnalysisBindings
+    const candidates = chooseContextAnalysisBindings(configured, [
+      snapshot.modelBindings?.defaultWorker,
+      snapshot.modelBindings?.reviewAgent,
+      snapshot.modelBindings?.mainAgent,
+      snapshot.modelBindings?.editingAgent,
+    ])
+    frozenBinding = candidates[Math.max(0, (variant.analysisIndex ?? 1) - 1)]
+  } else if (variant.roleKind === 'poetry_plan') {
+    frozenBinding = snapshot.modelBindings?.mainAgent
+  } else {
+    frozenBinding = variantModelBinding(snapshot, variant)
+  }
+
+  // The invocation row freezes endpoint/model. Only inherit limits from the
+  // same role binding when that identity still matches the retried call.
+  if (
+    frozenBinding?.endpointId === source.endpoint_id &&
+    frozenBinding.model === source.model
+  ) {
+    return frozenBinding
+  }
+  return {
+    endpointId: source.endpoint_id,
+    model: source.model,
+  }
+}
+
 async function executeInvocationRetry(
   db: Database.Database,
   runId: string,
@@ -2909,14 +3650,12 @@ async function executeInvocationRetry(
   session: SessionRecord,
   snapshot: ConfigSnapshot,
 ) {
-  const variant = JSON.parse(source.agent_snapshot) as AgentDirectionVariant & {
-    roleKind?: string
-    analysisIndex?: number
-  }
+  const variant = JSON.parse(source.agent_snapshot) as InvocationRetryVariant
   const isContextAnalysis = variant.roleKind === 'context_analysis'
   const isPoetryPlan = variant.roleKind === 'poetry_plan'
   const isAuxiliary = isContextAnalysis || isPoetryPlan
-  const endpoint = resolveEndpoint(snapshot, source.endpoint_id)
+  const retryBinding = resolveInvocationRetryBinding(snapshot, source, variant)
+  const endpoint = resolveEndpoint(db, snapshot, source.endpoint_id, retryBinding)
   const system = isAuxiliary
     ? variant.rolePrompt
     : `${snapshot.promptBundleSnapshot?.workerBasePrompt ?? ''}\n\n` +
@@ -2930,6 +3669,7 @@ async function executeInvocationRetry(
     : isPoetryPlan
       ? (() => {
           const analysis = analyzePoetrySource({
+            direction: snapshot.direction,
             sourceText: session.source_text,
             taskBrief: session.task_brief,
             constraints: snapshot.constraints,
@@ -3011,6 +3751,7 @@ async function executeInvocationRetry(
           apiKey: endpoint.apiKey,
         },
         model: source.model,
+        maxTokens: endpoint.maxOutputTokens,
         messages: [
           { role: 'system', content: system },
           { role: 'user', content: user },
@@ -3078,6 +3819,7 @@ async function executeInvocationRetry(
       const evidence = checkTranslationEvidence({
         direction: snapshot.direction ?? 'en_to_zh',
         sourceText: session.source_text,
+        taskBrief: session.task_brief,
         translatedText: semantic.body,
         constraints: snapshot.constraints,
         reportLanguage: snapshot.promptBundleSnapshot?.promptLanguage,
@@ -3138,7 +3880,7 @@ async function executeInvocationRetry(
       replacedInvocationId: source.id,
     })
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
+    const message = safeErrorMessageForPersistence(db, error)
     db.prepare(`
       UPDATE agent_invocations
       SET status='failed', error=?, updated_at=datetime('now')
@@ -3176,7 +3918,11 @@ export function startVNextInvocationRetry(
     'SELECT * FROM sessions WHERE id=?',
   ).get(sessionId) as SessionRecord | undefined
   if (!session) throw new Error('session_not_found')
-  const frozenSnapshot = JSON.parse(session.config_snapshot) as ConfigSnapshot
+  const frozenSnapshot = ensureStoredSessionPreflight(
+    db,
+    session,
+  ) as unknown as ConfigSnapshot
+  session.config_snapshot = JSON.stringify(frozenSnapshot)
   let snapshot = frozenSnapshot
   if (frozenSnapshot.version !== 3) throw new Error('not_vnext_session')
   const frozenSource = db.prepare(`
@@ -3213,7 +3959,6 @@ export function startVNextInvocationRetry(
         baseUrl: endpoint.base_url,
         chatCompletionsPath:
           endpoint.chat_completions_path ?? '/v1/chat/completions',
-        apiKey: encryptSecret(endpoint.api_key),
         hasApiKey: Boolean(endpoint.api_key),
         contextWindow: endpoint.context_window ?? null,
       })),
@@ -3225,13 +3970,18 @@ export function startVNextInvocationRetry(
             : frozenSnapshot.modelBindings!.defaultWorker,
       },
     }
-    const resolved = resolveVariantBinding(snapshot, variant)
+    const resolved = resolveVariantBinding(db, snapshot, variant)
     source = {
       ...frozenSource,
       agent_snapshot: JSON.stringify(variant),
       endpoint_id: resolved.endpoint.id,
       model: resolved.binding.model,
     }
+    snapshot = ensureStoredSessionPreflight(
+      db,
+      session,
+      snapshot as unknown as ConfigSnapshotVNext,
+    ) as unknown as ConfigSnapshot
   }
   const active = db.prepare(`
     SELECT 1 FROM orchestration_runs
@@ -3246,6 +3996,18 @@ export function startVNextInvocationRetry(
   ).id
   const runId = randomUUID()
   const newInvocationId = randomUUID()
+  const retryVariant = JSON.parse(source.agent_snapshot) as InvocationRetryVariant
+  const retryBinding = resolveInvocationRetryBinding(
+    snapshot,
+    source,
+    retryVariant,
+  )
+  const retryEndpoint = resolveEndpoint(
+    db,
+    snapshot,
+    source.endpoint_id,
+    retryBinding,
+  )
   db.transaction(() => {
     db.prepare(`
       INSERT INTO orchestration_runs
@@ -3273,8 +4035,8 @@ export function startVNextInvocationRetry(
       JSON.stringify({
         endpointId: source.endpoint_id,
         model: source.model,
-        contextWindow:
-          resolveEndpoint(snapshot, source.endpoint_id).contextWindow,
+        contextWindow: retryEndpoint.contextWindow,
+        maxOutputTokens: retryEndpoint.maxOutputTokens,
       }),
     )
     emitEvent(db, runId, sessionId, 'tool.called', {

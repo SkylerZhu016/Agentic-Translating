@@ -114,9 +114,8 @@ function seedVNext(db: Database.Database): void {
       })
     }
 
-    db.prepare(
-      "INSERT OR IGNORE INTO workspace_drafts (direction) VALUES ('en_to_zh'), ('zh_to_en')",
-    ).run()
+    // Workspace drafts are user state. Keeping this table empty until the
+    // first actual save lets DELETE remain durable across later seed() calls.
     db.prepare(
       "INSERT OR IGNORE INTO settings (key, value) VALUES ('workspace_direction', 'en_to_zh')",
     ).run()

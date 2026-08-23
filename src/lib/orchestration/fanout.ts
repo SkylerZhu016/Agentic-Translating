@@ -13,6 +13,7 @@ import {
   HARD_CONCURRENCY_CAP,
   RETRY_DELAYS_MS,
   AGENT_TIMEOUT_MS,
+  AGENT_MAX_DURATION_MS,
 } from '../constants';
 import { writeRunArtifact } from '../storage/run-artifacts';
 import type {
@@ -24,6 +25,7 @@ import {
   isAsyncIterable,
   LLMError,
   AbortedError,
+  IncompleteOutputError,
 } from '../llm/client';
 
 // =============================================================================
@@ -38,6 +40,8 @@ export interface AgentRuntime {
   model: string;
   messages: Array<{ role: string; content: string }>;
   timeoutMs?: number;
+  /** Frozen per-call output ceiling established by session preflight. */
+  maxTokens?: number;
 }
 
 /** Result for a single agent after fan-out execution */
@@ -153,8 +157,17 @@ function isRetryableError(error: unknown): boolean {
 /**
  * Sleep for the given number of milliseconds.
  */
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted || ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(done, ms);
+    function done() {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', done);
+      resolve();
+    }
+    signal.addEventListener('abort', done, { once: true });
+  });
 }
 
 // =============================================================================
@@ -171,6 +184,7 @@ async function runOneAgent(
   retryDelaysMs: readonly number[] = RETRY_DELAYS_MS,
 ): Promise<AgentResult> {
   const maxRetries = retryDelaysMs.length;
+  const hardDeadline = performance.now() + AGENT_MAX_DURATION_MS;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     // Check if already aborted before making the call
@@ -181,6 +195,7 @@ async function runOneAgent(
       };
     }
 
+    let accumulatedContent = '';
     try {
       // Track concurrency
       if (counter) {
@@ -191,11 +206,24 @@ async function runOneAgent(
       }
 
       // Build request
+      const remainingMs = Math.floor(hardDeadline - performance.now());
+      if (remainingMs <= 0) {
+        throw new LLMError(
+          'timeout',
+          'Upstream model call exceeded the 900-second orchestration deadline',
+          { retryable: false },
+        );
+      }
       const request: ChatCompletionRequest = {
         model: agent.model,
         messages: agent.messages,
         stream: true,
-        timeoutMs: agent.timeoutMs ?? AGENT_TIMEOUT_MS,
+        timeoutMs: Math.min(
+          agent.timeoutMs ?? AGENT_TIMEOUT_MS,
+          remainingMs,
+        ),
+        maxDurationMs: remainingMs,
+        ...(agent.maxTokens ? { maxTokens: agent.maxTokens } : {}),
         onActivity: () => callbacks.onAgentActivity?.(agent.agentKey),
         signal,
       };
@@ -216,8 +244,6 @@ async function runOneAgent(
       }
 
       // Stream tokens
-      let accumulatedContent = '';
-
       for await (const event of response) {
         if (event.type === 'text') {
           accumulatedContent += event.content;
@@ -238,8 +264,10 @@ async function runOneAgent(
       // spend the whole budget on reasoning_content and return no body.
       if (!accumulatedContent.trim() && attempt < maxRetries) {
         const delayMs = retryDelaysMs[attempt];
-        await sleep(delayMs);
-        continue;
+        if (performance.now() + delayMs < hardDeadline) {
+          await sleep(delayMs, signal);
+          continue;
+        }
       }
 
       const result: AgentResult = {
@@ -253,6 +281,20 @@ async function runOneAgent(
       callbacks.onAgentComplete?.(agent.agentKey, result);
       return result;
     } catch (error: unknown) {
+      if (
+        error instanceof IncompleteOutputError &&
+        error.partialContent.length > accumulatedContent.length
+      ) {
+        accumulatedContent = error.partialContent;
+      }
+      if (accumulatedContent && sessionId) {
+        writeRunArtifact(
+          sessionId,
+          `draft-${agent.agentKey}-partial`,
+          accumulatedContent,
+        );
+      }
+
       // Check for abort
       if (signal.aborted || error instanceof AbortedError) {
         return {
@@ -263,9 +305,15 @@ async function runOneAgent(
       }
 
       // Check if retryable and we have retries left
-      if (isRetryableError(error) && attempt < maxRetries) {
-        const delayMs = retryDelaysMs[attempt];
-        await sleep(delayMs);
+      const delayMs = retryDelaysMs[attempt] ?? 0;
+      const enoughTimeForRetry =
+        performance.now() + delayMs < hardDeadline;
+      if (
+        isRetryableError(error) &&
+        attempt < maxRetries &&
+        enoughTimeForRetry
+      ) {
+        await sleep(delayMs, signal);
         continue; // retry
       }
 
@@ -278,6 +326,7 @@ async function runOneAgent(
       const result: AgentResult = {
         agentKey: agent.agentKey,
         status: 'error',
+        ...(accumulatedContent ? { content: accumulatedContent } : {}),
         error: errorMessage,
       };
       return result;

@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import path from 'node:path'
 
@@ -47,6 +47,19 @@ function scan(directory, relativeBase = '') {
     const relative = path.join(relativeBase, entry.name)
     const segments = relative.split(path.sep)
     const absolute = path.join(directory, entry.name)
+    let metadata
+    try {
+      // lstat is deliberate: stat/read-first handling would follow symlinks and
+      // Windows junctions before the release boundary can reject them.
+      metadata = lstatSync(absolute)
+    } catch {
+      violations.push(`uninspectable path: ${relative}`)
+      continue
+    }
+    if (entry.isSymbolicLink() || metadata.isSymbolicLink()) {
+      violations.push(`symbolic link or junction: ${relative}`)
+      continue
+    }
     const fsbpIndex = segments.indexOf('FSBP_Test')
     const isPrivateFsbpPath =
       fsbpIndex >= 0 &&
@@ -69,7 +82,7 @@ function scan(directory, relativeBase = '') {
     if (forbiddenNames.has(entry.name)) {
       violations.push(`forbidden file: ${relative}`)
     }
-    const size = statSync(absolute).size
+    const size = metadata.size
     if (size <= 2 * 1024 * 1024 && /\.(?:js|mjs|cjs|json|txt|md|env)$/i.test(entry.name)) {
       const text = readFileSync(absolute, 'utf8')
       for (const pattern of sensitivePatterns) {
@@ -85,6 +98,15 @@ function scan(directory, relativeBase = '') {
 for (const scanRoot of scanRoots) {
   if (!existsSync(scanRoot)) {
     throw new Error(`Release tree does not exist: ${scanRoot}`)
+  }
+  const scanRootMetadata = lstatSync(scanRoot)
+  if (scanRootMetadata.isSymbolicLink()) {
+    violations.push(`symbolic link or junction: ${path.basename(scanRoot)}`)
+    continue
+  }
+  if (!scanRootMetadata.isDirectory()) {
+    violations.push(`release root is not a directory: ${path.basename(scanRoot)}`)
+    continue
   }
   scan(scanRoot, path.basename(scanRoot))
 }

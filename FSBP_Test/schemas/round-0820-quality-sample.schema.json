@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentic-translating.local/schemas/round-0820-quality-sample.schema.json",
+  "title": "Round 0820 Frozen Quality Gate Sample",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "id",
+    "direction",
+    "category",
+    "sourceText",
+    "taskBrief",
+    "source",
+    "selectionReason",
+    "contentHash"
+  ],
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+    "direction": { "enum": ["en_to_zh", "zh_to_en"] },
+    "category": { "enum": ["poetry", "literary", "cultural_argument", "nonliterary"] },
+    "sourceText": { "type": "string", "minLength": 1 },
+    "contextBefore": { "type": "string" },
+    "contextAfter": { "type": "string" },
+    "taskBrief": { "type": "string", "minLength": 1 },
+    "source": {
+      "type": "object",
+      "required": ["author", "title", "rightsBasis"],
+      "properties": {
+        "author": { "type": "string", "minLength": 1 },
+        "title": { "type": "string", "minLength": 1 },
+        "year": { "type": ["integer", "null"] },
+        "url": { "type": ["string", "null"] },
+        "rightsBasis": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": true
+    },
+    "selectionReason": { "type": "string", "minLength": 1 },
+    "contentHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "retrievalSnapshot": { "type": ["object", "null"] }
+  }
+}

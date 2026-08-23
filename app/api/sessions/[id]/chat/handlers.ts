@@ -21,10 +21,27 @@ import { runChatTurn } from '@/src/lib/chat/tool-loop'
 import { buildChatContext } from '@/src/lib/context/stage-context'
 import { encodeSSE } from '@/src/lib/contracts/sse'
 import type { ConfigSnapshot, SessionState } from '@/src/lib/contracts/types'
+import type { ModelBinding } from '@/src/lib/contracts/vnext'
 import { createHash, randomUUID } from 'crypto'
 import { buildDiffSpans } from '@/src/lib/editing/diff-spans'
-import { decryptSecret } from '@/src/lib/security/secrets'
-import { semanticBody } from '@/src/lib/protocol/semantic-output'
+import {
+  parseSemanticAgentOutput,
+  semanticBody,
+} from '@/src/lib/protocol/semantic-output'
+import { createProjectRepositories } from '@/src/lib/db/project-repositories'
+import { createTranslationToolRepository } from '@/src/lib/db/translation-tool-repository'
+import { createTranslationToolRuntime } from '@/src/lib/orchestration/translation-tool-runtime'
+import {
+  projectEvidenceForInheritance,
+  TRANSLATION_DOMAIN_TOOL_DEFINITIONS,
+} from '@/src/lib/orchestration/translation-tools'
+import type {
+  EvidenceInheritanceMode,
+  EvidenceMaterial,
+  ProjectMemorySearchResult,
+} from '@/src/lib/contracts/translation-tools'
+import { ledgeredChatCompletion } from '@/src/lib/services/llm-call-ledger'
+import { isAsyncIterable } from '@/src/lib/llm/client'
 import {
   beginChatActivity,
   endChatActivity,
@@ -38,6 +55,18 @@ import {
   logSafeDiagnostic,
   publicDiagnosticError,
 } from '@/src/lib/security/diagnostic-error'
+import {
+  assertPhysicalPaidCallPreflight,
+  ensurePaidChatOperationPreflight,
+  loadStoredSessionSnapshotForChat,
+  sessionPreflightErrorDto,
+} from '@/src/lib/services/session-preflight'
+import {
+  currentRuntimeEndpoint,
+  frozenEndpointMetadata,
+  runtimeEndpointCredentialErrorDto,
+} from '@/src/lib/services/runtime-endpoint-credentials'
+import { safeErrorMessageForPersistence } from '@/src/lib/security/credential-redaction'
 
 // =============================================================================
 // Types
@@ -91,6 +120,144 @@ function buildUserMessage(body: ChatRequestBody): string {
     )
   }
   return body.message
+}
+
+function annotationMetadata(annotation: string | null, source: string) {
+  return annotation === null
+    ? null
+    : {
+        source,
+        version: 'semantic-boundary/v1',
+        hash: createHash('sha256').update(annotation).digest('hex'),
+      }
+}
+
+function tableHasColumns(
+  db: Database.Database,
+  table: string,
+  required: string[],
+): boolean {
+  const columns = new Set(
+    (db.prepare(`PRAGMA table_info('${table}')`).all() as Array<{
+      name: string
+    }>).map((column) => column.name),
+  )
+  return required.every((column) => columns.has(column))
+}
+
+function frozenToolEvidence(
+  db: Database.Database,
+  sessionId: string,
+): EvidenceMaterial[] {
+  const canReadInvocationEvidence = tableHasColumns(
+    db,
+    'agent_invocations',
+    [
+    'id',
+    'session_id',
+    'status',
+    'raw_output',
+    'body_output',
+    'annotation_output',
+    'created_at',
+    ],
+  )
+  const invocations = (canReadInvocationEvidence
+    ? db.prepare(`
+        SELECT id, raw_output, body_output, annotation_output
+        FROM agent_invocations
+        WHERE session_id = ? AND status = 'complete' AND body_output IS NOT NULL
+        ORDER BY created_at, id
+      `).all(sessionId)
+    : []) as Array<{
+    id: string
+    raw_output: string | null
+    body_output: string
+    annotation_output: string | null
+  }>
+  const canReadStageEvidence = tableHasColumns(db, 'stage_outputs', [
+    'id',
+    'session_id',
+    'stage',
+    'status',
+    'raw_output',
+  ])
+  const stages = (canReadStageEvidence
+    ? db.prepare(`
+        SELECT id, stage, raw_output
+        FROM stage_outputs
+        WHERE session_id = ? AND status = 'complete' AND raw_output IS NOT NULL
+        ORDER BY id
+      `).all(sessionId)
+    : []) as Array<{
+    id: number
+    stage: string
+    raw_output: string
+  }>
+  return [
+    ...invocations.map((row) => ({
+      evidenceId: row.id,
+      sourceType: 'agent_invocation' as const,
+      sourceId: row.id,
+      raw: row.raw_output ?? row.body_output,
+      body: row.body_output,
+      annotation: row.annotation_output,
+      annotationMetadata: annotationMetadata(
+        row.annotation_output,
+        `agent_invocations:${row.id}:annotation_output`,
+      ),
+    })),
+    ...stages.map((row) => {
+      const parsed = parseSemanticAgentOutput(row.raw_output)
+      const evidenceId = `stage:${row.stage}:${row.id}`
+      return {
+        evidenceId,
+        sourceType: 'stage_output' as const,
+        sourceId: evidenceId,
+        raw: parsed.raw,
+        body: parsed.body,
+        annotation: parsed.annotation,
+        annotationMetadata: annotationMetadata(
+          parsed.annotation,
+          `stage_outputs:${row.id}:semantic_annotation`,
+        ),
+      }
+    }),
+  ]
+}
+
+function memoryKind(kind: string): ProjectMemorySearchResult['items'][number]['kind'] {
+  if (kind === 'term' || kind === 'proper_noun') return 'terminology'
+  if (kind === 'style_rule') return 'style'
+  if (kind === 'character_voice') return 'character'
+  if (kind === 'parallel_excerpt') return 'example'
+  if (kind === 'approved_decision' || kind === 'context_note') return 'fact'
+  return 'other'
+}
+
+function frozenProjectMemory(
+  db: Database.Database,
+  sessionId: string,
+): ProjectMemorySearchResult['items'] {
+  const context = createProjectRepositories(db).sessionProjectContexts
+    .getBySession(sessionId)
+  if (!context) return []
+  return context.resources.map(({ resourceId, revision }) => {
+    const content = [
+      revision.content.sourceText,
+      revision.content.targetText,
+      revision.content.instruction,
+      revision.content.note,
+    ].filter((part): part is string => Boolean(part?.trim())).join('\n')
+    return {
+      id: revision.id,
+      kind: memoryKind(revision.kind),
+      title: `${revision.kind}:${resourceId}`,
+      content,
+      score: null,
+      revisionId: revision.id,
+    }
+  })
 }
 
 export function buildRevisionReferenceMessage(params: {
@@ -178,56 +345,108 @@ export function expectedStrictReplacement(
   )
 }
 
-export function resolveChatConfig(snapshot: ConfigSnapshot): {
+export interface ResolvedChatConfig {
+  bindingRole: 'editingAgent' | 'reviewAgent'
   endpointId: number
   baseUrl: string
   chatCompletionsPath?: string
   apiKey: string
   model: string
   contextWindow: number | null
-} | null {
-  const editingBinding = snapshot.modelBindings?.editingAgent
-  if (editingBinding?.model) {
-    const endpoint = snapshot.endpointSnapshots?.find(
-      (candidate) => candidate.id === editingBinding.endpointId,
-    )
-    if (endpoint) {
-      return {
-        endpointId: endpoint.id,
-        baseUrl: endpoint.baseUrl,
-        chatCompletionsPath:
-          endpoint.chatCompletionsPath ?? '/v1/chat/completions',
-        apiKey: decryptSecret(endpoint.apiKey),
-        model: editingBinding.model,
-        contextWindow: endpoint.contextWindow ?? null,
-      }
+  maxOutputTokens: number | null
+}
+
+function resolveVNextBindingConfig(
+  snapshot: ConfigSnapshot,
+  binding: ModelBinding | undefined,
+  bindingRole: ResolvedChatConfig['bindingRole'],
+  db?: Database.Database,
+): ResolvedChatConfig | null {
+  if (!binding?.model || binding.endpointId == null) return null
+  if (db) {
+    const endpoint = currentRuntimeEndpoint(db, binding.endpointId)
+    return {
+      bindingRole,
+      endpointId: endpoint.id,
+      baseUrl: endpoint.baseUrl,
+      chatCompletionsPath: endpoint.chatCompletionsPath,
+      apiKey: endpoint.apiKey,
+      model: binding.model,
+      contextWindow: binding.contextWindow ?? endpoint.contextWindow ?? null,
+      maxOutputTokens: binding.maxOutputTokens ?? null,
     }
   }
+  const endpoint = snapshot.endpointSnapshots?.find(
+    (candidate) => candidate.id === binding.endpointId,
+  )
+  if (!endpoint) return null
+  return {
+    bindingRole,
+    endpointId: endpoint.id,
+    baseUrl: endpoint.baseUrl,
+    chatCompletionsPath:
+      endpoint.chatCompletionsPath ?? '/v1/chat/completions',
+    apiKey: '',
+    model: binding.model,
+    contextWindow: binding.contextWindow ?? endpoint.contextWindow ?? null,
+    maxOutputTokens: binding.maxOutputTokens ?? null,
+  }
+}
+
+export function resolveChatConfig(
+  snapshot: ConfigSnapshot,
+  db?: Database.Database,
+): ResolvedChatConfig | null {
+  const editingBinding = snapshot.modelBindings?.editingAgent
+  const vnext = resolveVNextBindingConfig(
+    snapshot,
+    editingBinding,
+    'editingAgent',
+    db,
+  )
+  if (vnext) return vnext
   const coordinator = snapshot.coordinator
   if (!coordinator) return null
 
-  const endpointConfig =
-    snapshot.endpoints?.find(
-      (endpoint) => endpoint.id === coordinator.chat_endpoint_id,
-    ) ??
-    snapshot.endpoints?.find(
-      (endpoint) => endpoint.id === coordinator.endpoint_id,
-    ) ??
-    snapshot.endpoint
+  const endpointId =
+    coordinator.chat_endpoint_id ?? coordinator.endpoint_id ?? snapshot.endpoint?.id ?? null
+  const endpointConfig = db && endpointId != null
+    ? currentRuntimeEndpoint(db, endpointId)
+    : frozenEndpointMetadata(snapshot, endpointId)
   if (!endpointConfig) return null
 
   const model = coordinator.chat_model || coordinator.model
   if (!model) return null
 
   return {
+    bindingRole: 'editingAgent',
     endpointId: endpointConfig.id,
-    baseUrl: endpointConfig.base_url,
-    chatCompletionsPath:
-      endpointConfig.chat_completions_path ?? '/v1/chat/completions',
-    apiKey: decryptSecret(endpointConfig.api_key),
+    baseUrl: endpointConfig.baseUrl,
+    chatCompletionsPath: endpointConfig.chatCompletionsPath,
+    apiKey:
+      'apiKey' in endpointConfig && typeof endpointConfig.apiKey === 'string'
+        ? endpointConfig.apiKey
+        : '',
     model,
-    contextWindow: endpointConfig.context_window ?? null,
+    contextWindow: endpointConfig.contextWindow,
+    maxOutputTokens: null,
   }
+}
+
+/** The exact frozen binding used by request_review in chat tool turns. */
+export function resolveChatReviewConfig(
+  snapshot: ConfigSnapshot,
+  editingConfig: ResolvedChatConfig,
+): ResolvedChatConfig | null {
+  if (snapshot.version !== 3) return editingConfig
+  const reviewBinding = snapshot.modelBindings?.reviewAgent
+  return reviewBinding
+    ? resolveVNextBindingConfig(snapshot, reviewBinding, 'reviewAgent')
+    : resolveVNextBindingConfig(
+        snapshot,
+        snapshot.modelBindings?.editingAgent,
+        'editingAgent',
+      )
 }
 
 // =============================================================================
@@ -290,21 +509,57 @@ export function createHandlers(db: Database.Database) {
     // 4. Resolve chat config from snapshot
     let snapshot: ConfigSnapshot
     try {
-      snapshot = JSON.parse(session.config_snapshot) as ConfigSnapshot
-    } catch {
+      snapshot = loadStoredSessionSnapshotForChat(db, session)
+    } catch (error) {
+      const preflightError = sessionPreflightErrorDto(error)
+      if (preflightError) {
+        return NextResponse.json(preflightError.body, {
+          status: preflightError.status,
+        })
+      }
       return NextResponse.json(
         { error: 'invalid_snapshot', message: 'Failed to parse session config snapshot' },
         { status: 500 },
       )
     }
 
-    const chatConfig = resolveChatConfig(snapshot)
+    let chatConfig: ResolvedChatConfig | null
+    try {
+      chatConfig = resolveChatConfig(snapshot, db)
+    } catch (error) {
+      const credentialError = runtimeEndpointCredentialErrorDto(error)
+      if (credentialError) {
+        return NextResponse.json(credentialError.body, {
+          status: credentialError.status,
+        })
+      }
+      throw error
+    }
     if (!chatConfig) {
       return NextResponse.json(
         { error: 'no_chat_config', message: 'No chat endpoint or model configured in session snapshot' },
         { status: 400 },
       )
     }
+    const toolAuditEnabled =
+      tableHasColumns(db, 'orchestration_runs', [
+        'id', 'session_id', 'kind', 'status', 'phase', 'started_at',
+        'completed_at', 'error',
+      ]) &&
+      tableHasColumns(db, 'agent_invocations', [
+        'id', 'session_id', 'parent_run_id', 'agent_variant_id',
+        'agent_snapshot', 'endpoint_id', 'model', 'additional_instruction',
+        'selection_reason', 'status', 'raw_output', 'body_output',
+        'annotation_output', 'error', 'updated_at',
+      ]) &&
+      tableHasColumns(db, 'agent_tool_calls', [
+        'id', 'session_id', 'run_id', 'input_json', 'output_json', 'status',
+        'provider_tool_call_id', 'logical_call_key', 'schema_version',
+        'handler_version', 'evidence_ids_json', 'determinism_level',
+      ]) &&
+      tableHasColumns(db, 'review_issues', [
+        'id', 'session_id', 'run_id', 'status',
+      ])
 
     // 5. Get current text
     const latestVersion = repos.finalVersions.getLatestBySession(sessionId)
@@ -381,8 +636,8 @@ export function createHandlers(db: Database.Database) {
       contextMessages[0].content =
         `${bundle.editingPrompt}\n\n` +
         (bundle.promptLanguage === 'en'
-          ? `Current complete translation:\n${currentText}\n\nAvailable editing tool: replace_text. Every textual change must use the tool.`
-          : `当前最新完整译文：\n${currentText}\n\n可用编辑工具：replace_text。任何文本修改都必须调用工具。`)
+          ? `Current complete translation:\n${currentText}\n\n${toolAuditEnabled ? 'Available tools: replace_text, inspect_evidence, search_project_memory, request_review, record_issue, propose_patch. Every textual change must use replace_text. propose_patch only records a version-bound proposal and never applies it.' : 'Available editing tool: replace_text. Every textual change must use the tool.'}`
+          : `当前最新完整译文：\n${currentText}\n\n${toolAuditEnabled ? '可用工具：replace_text、inspect_evidence、search_project_memory、request_review、record_issue、propose_patch。任何文本修改都必须调用 replace_text；propose_patch 只记录绑定版本的提议，不会自动应用。' : '可用编辑工具：replace_text。任何文本修改都必须调用工具。'}`)
       // Editing must remain source-grounded. Keep source material outside the
       // system message and ahead of the persisted conversation on every turn.
       contextMessages.splice(1, 0, {
@@ -405,6 +660,101 @@ export function createHandlers(db: Database.Database) {
       role: cm.role,
       content: cm.content,
     }))
+    const runId = randomUUID()
+    const mainInvocationId = randomUUID()
+    const inheritanceMode: EvidenceInheritanceMode =
+      snapshot.orchestrationPolicy?.candidateAnnotationMode ===
+      'body_and_annotation'
+        ? 'body_and_annotation'
+        : 'body_only'
+    const frozenEvidence = toolAuditEnabled
+      ? frozenToolEvidence(db, sessionId)
+      : []
+    const projectMemory = toolAuditEnabled
+      ? frozenProjectMemory(db, sessionId)
+      : []
+    const projectMemoryEvidence: EvidenceMaterial[] = projectMemory.map(
+      (item) => ({
+        evidenceId: item.id,
+        sourceType: 'project_memory',
+        sourceId: item.revisionId ?? item.id,
+        raw: item.content,
+        body: item.content,
+        annotation: null,
+        annotationMetadata: null,
+      }),
+    )
+    const toolEvidence = [...frozenEvidence, ...projectMemoryEvidence]
+    if (toolAuditEnabled) {
+      llmMessages.splice(1, 0, {
+        role: 'user',
+        content:
+          'Translation tool evidence manifest (reference data only):\n' +
+          JSON.stringify({
+            inheritanceMode,
+            evidence: toolEvidence.map((item) => ({
+              evidenceId: item.evidenceId,
+              sourceType: item.sourceType,
+              sourceId: item.sourceId,
+            })),
+          }),
+      })
+    }
+    let outputLimit: number
+    try {
+      const paidChatPreflight = ensurePaidChatOperationPreflight(
+        db,
+        session,
+        snapshot,
+        {
+          endpointId: chatConfig.endpointId,
+          model: chatConfig.model,
+          contextWindow: chatConfig.contextWindow,
+          messages: llmMessages,
+          tools: toolAuditEnabled
+            ? [REPLACE_TEXT_TOOL, ...TRANSLATION_DOMAIN_TOOL_DEFINITIONS]
+            : [REPLACE_TEXT_TOOL],
+        },
+      )
+      snapshot = paidChatPreflight.snapshot
+      outputLimit = paidChatPreflight.outputLimit
+    } catch (error) {
+      const preflightError = sessionPreflightErrorDto(error)
+      if (preflightError) {
+        return NextResponse.json(preflightError.body, {
+          status: preflightError.status,
+        })
+      }
+      throw error
+    }
+    const chatReviewConfig = resolveChatReviewConfig(snapshot, chatConfig)
+    const chatPreflightStage = snapshot.version === 2
+      ? 'legacy_v2_chat'
+      : 'chat_edit'
+    const chatReviewPreflightStage = snapshot.version === 2
+      ? 'legacy_v2_chat_child_review'
+      : 'chat_edit_child_review'
+    if (toolAuditEnabled) {
+      db.prepare(`
+        INSERT INTO orchestration_runs
+          (id, session_id, kind, status, phase, started_at)
+        VALUES (?, ?, 'chat_edit', 'running', 'edit', datetime('now'))
+      `).run(runId, sessionId)
+      db.prepare(`
+        INSERT INTO agent_invocations
+          (id, session_id, parent_run_id, agent_variant_id, agent_snapshot,
+           endpoint_id, model, additional_instruction, selection_reason, status)
+        VALUES (?, ?, ?, 'editing-agent', ?, ?, ?, '', ?, 'running')
+      `).run(
+        mainInvocationId,
+        sessionId,
+        runId,
+        JSON.stringify({ roleKind: 'chat_edit', actor: 'main_agent' }),
+        chatConfig.endpointId,
+        chatConfig.model,
+        'User-initiated translation chat turn',
+      )
+    }
 
     // 8. Create SSE stream
     const encoder = new TextEncoder()
@@ -461,6 +811,203 @@ export function createHandlers(db: Database.Database) {
           old_string: string
           new_string: string
         }> = []
+        let turnSucceeded = false
+
+        const domainRuntime = toolAuditEnabled
+          ? createTranslationToolRuntime({
+          repository: createTranslationToolRepository(db),
+          handlers: {
+            inspectEvidence(args) {
+              const byId = new Map(
+                toolEvidence.map(
+                  (item) => [item.evidenceId, item] as const,
+                ),
+              )
+              return args.evidenceIds.map((evidenceId) => {
+                const material = byId.get(evidenceId)
+                if (!material) throw new Error(`Unknown evidence: ${evidenceId}`)
+                return material
+              })
+            },
+            searchProjectMemory(args) {
+              const terms = args.query.toLowerCase().split(/\s+/u)
+                .filter(Boolean)
+              const allowedKinds = args.kinds ? new Set(args.kinds) : null
+              const items = projectMemory
+                .filter((item) => !allowedKinds || allowedKinds.has(item.kind))
+                .map((item) => {
+                  const searchable = `${item.title}\n${item.content}`
+                    .toLowerCase()
+                  const hits = terms.filter((term) => searchable.includes(term)).length
+                  return {
+                    ...item,
+                    score: terms.length > 0 ? hits / terms.length : 0,
+                  }
+                })
+                .filter((item) => item.score > 0)
+                .sort((left, right) => right.score - left.score)
+                .slice(0, args.maxResults)
+              return { items }
+            },
+            async requestReview(args, childContext) {
+              if (!chatReviewConfig) {
+                throw new Error('Frozen chat review binding is unavailable.')
+              }
+              const reviewOutputLimit =
+                chatReviewConfig.maxOutputTokens ?? outputLimit
+              const invocationId = randomUUID()
+              const byId = new Map(
+                toolEvidence.map((item) => [item.evidenceId, item] as const),
+              )
+              // Resolve every ID before inserting an invocation or issuing a
+              // paid request. A partial evidence set is never silently sent.
+              const cited = args.evidenceIds.map((evidenceId) => {
+                const material = byId.get(evidenceId)
+                if (!material) throw new Error(`Unknown evidence: ${evidenceId}`)
+                return material
+              })
+              const projected = projectEvidenceForInheritance(
+                cited,
+                childContext.allowedInheritanceMode,
+              )
+              db.prepare(`
+                INSERT INTO agent_invocations
+                  (id, session_id, parent_run_id, agent_variant_id,
+                   agent_snapshot, endpoint_id, model, additional_instruction,
+                   selection_reason, status)
+                VALUES (?, ?, ?, 'chat-review-subagent', ?, ?, ?, '', ?, 'running')
+              `).run(
+                invocationId,
+                sessionId,
+                runId,
+                JSON.stringify({
+                  roleKind: 'tool_review',
+                  readOnly: true,
+                  bindingRole: chatReviewConfig.bindingRole,
+                  parentToolCallId: childContext.parentToolCallId,
+                }),
+                chatReviewConfig.endpointId,
+                chatReviewConfig.model,
+                'Bounded read-only request_review tool call',
+              )
+              const startedAt = performance.now()
+              try {
+                const reviewMessages: Array<{
+                  role: 'system' | 'user'
+                  content: string
+                }> = [
+                  {
+                    role: 'system',
+                    content:
+                      'You are a read-only translation reviewer. Answer the focused question using only the supplied segment and evidence. Do not propose or apply unrelated edits. Free text is allowed; optional human annotation may follow a standalone --- line.',
+                  },
+                  {
+                    role: 'user',
+                    content: JSON.stringify({
+                      question: args.question,
+                      segment: args.segment,
+                      evidence: projected,
+                    }),
+                  },
+                ]
+                assertPhysicalPaidCallPreflight({
+                  stage: chatReviewPreflightStage,
+                  bindingRole: chatReviewConfig.bindingRole,
+                  endpointId: chatReviewConfig.endpointId,
+                  model: chatReviewConfig.model,
+                  contextWindow: chatReviewConfig.contextWindow,
+                  maxOutputTokens: reviewOutputLimit,
+                  messages: reviewMessages,
+                  attempted: 1,
+                })
+                const response = await ledgeredChatCompletion(
+                  {
+                    baseUrl: chatReviewConfig.baseUrl,
+                    chatCompletionsPath:
+                      chatReviewConfig.chatCompletionsPath,
+                    apiKey: chatReviewConfig.apiKey,
+                  },
+                  {
+                    model: chatReviewConfig.model,
+                    stream: false,
+                    maxTokens: reviewOutputLimit,
+                    signal: turnAbortController.signal,
+                    messages: reviewMessages,
+                  },
+                  {
+                    db,
+                    sessionId,
+                    runId,
+                    invocationId,
+                    endpointId: chatReviewConfig.endpointId,
+                    operation: 'tool_review',
+                    requireCurrentCredential: true,
+                  },
+                )
+                if (isAsyncIterable(response)) {
+                  throw new Error('Read-only review unexpectedly returned a stream.')
+                }
+                const semantic = parseSemanticAgentOutput(response.content)
+                if (!semantic.body) throw new Error('Read-only review returned an empty body.')
+                db.prepare(`
+                  UPDATE agent_invocations
+                  SET status='complete', raw_output=?, body_output=?,
+                      annotation_output=?, latency_ms=?, updated_at=datetime('now')
+                  WHERE id=? AND status='running'
+                `).run(
+                  semantic.raw,
+                  semantic.body,
+                  semantic.annotation,
+                  Math.round(performance.now() - startedAt),
+                  invocationId,
+                )
+                return {
+                  reviewInvocationId: invocationId,
+                  evidence: {
+                    evidenceId: invocationId,
+                    sourceType: 'agent_invocation' as const,
+                    sourceId: invocationId,
+                    raw: semantic.raw,
+                    body: semantic.body,
+                    annotation: semantic.annotation,
+                    annotationMetadata: annotationMetadata(
+                      semantic.annotation,
+                      `agent_invocations:${invocationId}:annotation_output`,
+                    ),
+                  },
+                }
+              } catch (error) {
+                const persistedError = safeErrorMessageForPersistence(db, error)
+                db.prepare(`
+                  UPDATE agent_invocations
+                  SET status='failed', error=?, latency_ms=?, updated_at=datetime('now')
+                  WHERE id=? AND status='running'
+                `).run(
+                  persistedError,
+                  Math.round(performance.now() - startedAt),
+                  invocationId,
+                )
+                // Never forward a review-provider error string into the main
+                // editing provider's next tool-result message. The invocation
+                // retains a redacted diagnostic; the cross-provider transcript
+                // receives only this stable failure code.
+                throw new Error('request_review_failed')
+              }
+            },
+            replaceText(args, context) {
+              if (!context.baseVersion) throw new Error('Current version is unavailable.')
+              const index = context.baseVersion.text.indexOf(args.old_string)
+              return {
+                newText:
+                  context.baseVersion.text.slice(0, index) +
+                  args.new_string +
+                  context.baseVersion.text.slice(index + args.old_string.length),
+                diffSummary: `replace_text:${args.old_string.length}->${args.new_string.length}`,
+              }
+            },
+          },
+          })
+          : undefined
 
         try {
           const result = await runChatTurn({
@@ -472,12 +1019,49 @@ export function createHandlers(db: Database.Database) {
             model: chatConfig.model,
             messages: llmMessages,
             currentText,
-            tools: [REPLACE_TEXT_TOOL],
+            tools: toolAuditEnabled
+              ? [REPLACE_TEXT_TOOL, ...TRANSLATION_DOMAIN_TOOL_DEFINITIONS]
+              : [REPLACE_TEXT_TOOL],
+            domainRuntime,
+            domainContext: toolAuditEnabled ? {
+              sessionId,
+              runId,
+              invocationId: mainInvocationId,
+              parentToolCallId: null,
+              stage: 'edit',
+              actor: 'main_agent',
+              depth: 0,
+              allowedInheritanceMode: inheritanceMode,
+              knownEvidenceIds: toolEvidence.map((item) => item.evidenceId),
+              baseVersion: latestVersion
+                ? { id: latestVersion.id, text: currentText }
+                : null,
+              providerSeed: null,
+              determinismLevel: 'provider_default',
+            } : undefined,
             contextWindow: chatConfig.contextWindow,
+            maxTokens: outputLimit,
             ledger: {
               db,
               sessionId,
+              ...(toolAuditEnabled
+                ? { runId, invocationId: mainInvocationId }
+                : {}),
               endpointId: chatConfig.endpointId,
+              requireCurrentCredential: true,
+            },
+            beforePhysicalCall: ({ messages, tools, maxTokens, attempted }) => {
+              assertPhysicalPaidCallPreflight({
+                stage: chatPreflightStage,
+                bindingRole: chatConfig.bindingRole,
+                endpointId: chatConfig.endpointId,
+                model: chatConfig.model,
+                contextWindow: chatConfig.contextWindow,
+                maxOutputTokens: maxTokens,
+                messages,
+                tools,
+                attempted,
+              })
             },
             callbacks: {
               onActivity: () => {
@@ -525,6 +1109,21 @@ export function createHandlers(db: Database.Database) {
                   appliedToolCalls.length = 0
                   enqueue(encodeSSE('tool_result', { ok: false }))
                 }
+              },
+              onDomainToolResult: (name, ok, payload, toolCallId) => {
+                markChatActivityProgress(
+                  sessionId,
+                  'thinking',
+                  Date.now(),
+                  activityLeaseId,
+                )
+                if (name === 'replace_text') return
+                enqueue(encodeSSE('tool_result', {
+                  name,
+                  ok,
+                  tool_call_id: toolCallId,
+                  result: payload,
+                }))
               },
               onProtocolFallback: () => {
                 didProtocolFallback = true
@@ -694,6 +1293,7 @@ export function createHandlers(db: Database.Database) {
             })
 
             txn()
+            turnSucceeded = true
 
             enqueue(
               encodeSSE('message_complete', {
@@ -734,6 +1334,37 @@ export function createHandlers(db: Database.Database) {
             )
           }
         } finally {
+          if (toolAuditEnabled) {
+            db.prepare(`
+              UPDATE agent_invocations
+              SET status=?, raw_output=?, body_output=?,
+                  annotation_output=NULL, error=?, updated_at=datetime('now')
+              WHERE id=? AND status='running'
+            `).run(
+              turnSucceeded ? 'complete' : turnAbortController.signal.aborted
+                ? 'interrupted'
+                : 'failed',
+              turnSucceeded ? fullText : null,
+              turnSucceeded ? fullText : null,
+              turnSucceeded || turnAbortController.signal.aborted
+                ? null
+                : 'chat_turn_failed',
+              mainInvocationId,
+            )
+            db.prepare(`
+              UPDATE orchestration_runs
+              SET status=?, error=?, completed_at=datetime('now')
+              WHERE id=? AND status='running'
+            `).run(
+              turnSucceeded ? 'complete' : turnAbortController.signal.aborted
+                ? 'cancelled'
+                : 'failed',
+              turnSucceeded || turnAbortController.signal.aborted
+                ? null
+                : 'chat_turn_failed',
+              runId,
+            )
+          }
           finishTurn()
           if (!isAborted) {
             enqueue(encodeSSE('done', {}))

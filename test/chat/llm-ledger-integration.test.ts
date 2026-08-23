@@ -115,7 +115,7 @@ describe('chat and revision-suggestion LLM call ledger integration', () => {
       const result = await runChatTurn({
         endpoint: {
           baseUrl: 'https://ledger-secret.example.invalid/v1',
-          apiKey: 'sk-ledger-secret-value',
+          apiKey: 'sk-stale-snapshot-value',
         },
         model: 'DeepSeek V4 Flash: Go',
         messages: [
@@ -123,7 +123,12 @@ describe('chat and revision-suggestion LLM call ledger integration', () => {
           { role: 'user', content: 'USER_PROMPT_MUST_NEVER_ENTER_LEDGER' },
         ],
         currentText: 'old text',
-        ledger: { db, sessionId, endpointId },
+        ledger: {
+          db,
+          sessionId,
+          endpointId,
+          requireCurrentCredential: true,
+        },
       })
 
       expect(result).toMatchObject({
@@ -131,6 +136,11 @@ describe('chat and revision-suggestion LLM call ledger integration', () => {
         kind: 'edited',
         newText: 'new text',
       })
+      expect(vi.mocked(chatCompletion).mock.calls).toHaveLength(2)
+      for (const [runtimeEndpoint] of vi.mocked(chatCompletion).mock.calls) {
+        expect(runtimeEndpoint.apiKey).toBe('sk-ledger-secret-value')
+        expect(runtimeEndpoint.apiKey).not.toBe('sk-stale-snapshot-value')
+      }
       const recorded = rows(db)
       expect(recorded).toHaveLength(2)
       expect(recorded.map((row) => ({
@@ -273,6 +283,7 @@ describe('chat and revision-suggestion LLM call ledger integration', () => {
         taskBrief: 'TASK_BRIEF_MUST_NEVER_ENTER_LEDGER',
         currentTranslation: 'TRANSLATION_MUST_NEVER_ENTER_LEDGER',
         userRequest: 'USER_REQUEST_MUST_NEVER_ENTER_LEDGER',
+        preflightPhysicalCall: () => ({ outputLimit: 4_096 }),
         ledger: { db, sessionId, endpointId },
       })
 
@@ -510,7 +521,7 @@ describe('chat and revision-suggestion LLM call ledger integration', () => {
     }
   })
 
-  it('never lets an unavailable ledger change a provider result', async () => {
+  it('keeps provider execution independent when only best-effort ledger storage is unavailable', async () => {
     const brokenDb = new Database(':memory:')
     brokenDb.close()
     vi.mocked(chatCompletion).mockResolvedValue({ content: 'still succeeds' })
@@ -536,5 +547,60 @@ describe('chat and revision-suggestion LLM call ledger integration', () => {
       kind: 'message',
       text: 'still succeeds',
     })
+    expect(vi.mocked(chatCompletion)).toHaveBeenCalledOnce()
+  })
+
+  it('fails before provider I/O when a required current endpoint credential cannot be read', async () => {
+    const brokenDb = new Database(':memory:')
+    brokenDb.close()
+    vi.mocked(chatCompletion).mockResolvedValue({ content: 'must not run' })
+
+    await expect(runChatTurn({
+      endpoint: {
+        baseUrl: 'https://example.invalid',
+        apiKey: 'sk-stale-snapshot-value',
+      },
+      model: 'safe-model',
+      messages: [{ role: 'user', content: 'hello' }],
+      currentText: 'unchanged',
+      stream: false,
+      ledger: {
+        db: brokenDb,
+        sessionId: 'missing-session',
+        endpointId: 999,
+        requireCurrentCredential: true,
+      },
+    })).rejects.toThrow()
+    expect(vi.mocked(chatCompletion)).not.toHaveBeenCalled()
+  })
+
+  it('does not create a queued ledger row when strict credential validation fails', async () => {
+    const { db, endpointId, sessionId } = createLedgerDb()
+    try {
+      db.prepare('DELETE FROM endpoints WHERE id=?').run(endpointId)
+
+      await expect(ledgeredChatCompletion(
+        {
+          baseUrl: 'https://example.invalid',
+          apiKey: 'sk-stale-snapshot-value',
+        },
+        {
+          model: 'safe-model',
+          messages: [{ role: 'user', content: 'hello' }],
+          stream: false,
+        },
+        {
+          db,
+          sessionId,
+          endpointId,
+          operation: 'chat_edit',
+          requireCurrentCredential: true,
+        },
+      )).rejects.toMatchObject({ code: 'runtime_endpoint_deleted' })
+      expect(rows(db)).toEqual([])
+      expect(vi.mocked(chatCompletion)).not.toHaveBeenCalled()
+    } finally {
+      db.close()
+    }
   })
 })

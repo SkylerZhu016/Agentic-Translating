@@ -18,6 +18,7 @@ import {
   type Endpoint,
 } from './api'
 import { Field, Select, type NotifyFn } from './shared'
+import { localizeDiagnosticError, useI18n } from '@/src/i18n'
 
 export interface CoordinatorPanelProps {
   coordinator: CoordinatorConfig | null
@@ -26,6 +27,7 @@ export interface CoordinatorPanelProps {
 }
 
 export function CoordinatorPanel({ coordinator, endpoints, notify }: CoordinatorPanelProps) {
+  const { t } = useI18n()
   const [endpointId, setEndpointId] = useState<number | null>(coordinator?.endpoint_id ?? null)
   const [model, setModel] = useState(coordinator?.model ?? '')
   const [chatEndpointId, setChatEndpointId] = useState<number | null>(
@@ -42,7 +44,7 @@ export function CoordinatorPanel({ coordinator, endpoints, notify }: Coordinator
 
   function buildPayload(): CoordinatorPutPayload | null {
     if (model.trim().length === 0) {
-      setError('请输入统筹模型名')
+      setError(t('legacy.coordinator.error.model'))
       return null
     }
     setError(null)
@@ -66,10 +68,14 @@ export function CoordinatorPanel({ coordinator, endpoints, notify }: Coordinator
         setDontShowAgain(false)
         setFlashOpen(true)
       } else {
-        notify('统筹配置已保存', { tone: 'inverted' })
+        notify(t('legacy.coordinator.saved'), { tone: 'inverted' })
       }
     } catch (e) {
-      notify('保存失败', { message: isApiError(e) ? e.message : '网络错误，请重试' })
+      notify(t('config.error.save'), {
+        message: isApiError(e)
+          ? localizeDiagnosticError(t, e.payload, t('config.error.tryLater'))
+          : t('config.error.networkRetry'),
+      })
     } finally {
       setSaving(false)
     }
@@ -78,7 +84,7 @@ export function CoordinatorPanel({ coordinator, endpoints, notify }: Coordinator
   async function confirmFlash() {
     if (!dontShowAgain) {
       setFlashOpen(false)
-      notify('统筹配置已保存', { tone: 'inverted' })
+      notify(t('legacy.coordinator.saved'), { tone: 'inverted' })
       return
     }
     const payload = buildPayload()
@@ -93,27 +99,31 @@ export function CoordinatorPanel({ coordinator, endpoints, notify }: Coordinator
         suppress_warnings: ['flash_coordinator'],
       })
       setFlashOpen(false)
-      notify('统筹配置已保存，flash 警告将不再提示', { tone: 'inverted' })
+      notify(t('legacy.coordinator.savedSuppressed'), { tone: 'inverted' })
     } catch (e) {
-      notify('抑制警告失败', { message: isApiError(e) ? e.message : '网络错误，请重试' })
+      notify(t('legacy.coordinator.suppressFailed'), {
+        message: isApiError(e)
+          ? localizeDiagnosticError(t, e.payload, t('config.error.tryLater'))
+          : t('config.error.networkRetry'),
+      })
     } finally {
       setSuppressing(false)
     }
   }
 
   return (
-    <Card overline="Coordinator" title="统筹">
+    <Card overline={t('legacy.coordinator.overline')} title={t('legacy.coordinator.title')}>
       <div className="space-y-4">
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-          <Field label="统筹端点">
+          <Field label={t('legacy.coordinator.endpoint')}>
             <Select
-              aria-label="统筹端点"
+              aria-label={t('legacy.coordinator.endpoint')}
               value={endpointId == null ? '' : String(endpointId)}
               onChange={(e) =>
                 setEndpointId(e.target.value === '' ? null : Number(e.target.value))
               }
             >
-              <option value="">未指定</option>
+              <option value="">{t('legacy.coordinator.unspecified')}</option>
               {endpoints.map((ep) => (
                 <option key={ep.id} value={String(ep.id)}>
                   {ep.name}
@@ -121,7 +131,7 @@ export function CoordinatorPanel({ coordinator, endpoints, notify }: Coordinator
               ))}
             </Select>
           </Field>
-          <Field label="统筹模型" error={error}>
+          <Field label={t('legacy.coordinator.model')} error={error}>
             <Input
               testId={TID.coordinator.modelInput}
               value={model}
@@ -129,19 +139,19 @@ export function CoordinatorPanel({ coordinator, endpoints, notify }: Coordinator
                 setModel(e.target.value)
                 if (error != null) setError(null)
               }}
-              placeholder="如 gpt-4o"
+              placeholder={t('legacy.agent.modelPlaceholder')}
               className="font-mono"
             />
           </Field>
-          <Field label="聊天端点（可选）">
+          <Field label={t('legacy.coordinator.chatEndpoint')}>
             <Select
-              aria-label="聊天端点"
+              aria-label={t('legacy.coordinator.chatEndpointAria')}
               value={chatEndpointId == null ? '' : String(chatEndpointId)}
               onChange={(e) =>
                 setChatEndpointId(e.target.value === '' ? null : Number(e.target.value))
               }
             >
-              <option value="">未指定</option>
+              <option value="">{t('legacy.coordinator.unspecified')}</option>
               {endpoints.map((ep) => (
                 <option key={ep.id} value={String(ep.id)}>
                   {ep.name}
@@ -149,12 +159,15 @@ export function CoordinatorPanel({ coordinator, endpoints, notify }: Coordinator
               ))}
             </Select>
           </Field>
-          <Field label="聊天模型（可选）" hint="用于对话式修改；留空则由服务端回落默认。">
+          <Field
+            label={t('legacy.coordinator.chatModel')}
+            hint={t('legacy.coordinator.chatModelHint')}
+          >
             <Input
-              aria-label="聊天模型"
+              aria-label={t('legacy.coordinator.chatModelAria')}
               value={chatModel}
               onChange={(e) => setChatModel(e.target.value)}
-              placeholder="留空则使用默认"
+              placeholder={t('legacy.coordinator.chatModelPlaceholder')}
               className="font-mono"
             />
           </Field>
@@ -162,11 +175,11 @@ export function CoordinatorPanel({ coordinator, endpoints, notify }: Coordinator
 
         <div className="flex items-center justify-between gap-3">
           <p className="text-xs leading-5 text-ink-4">
-            统筹模型驱动审查、筛选、编排、组装四阶段。
+            {t('legacy.coordinator.description')}
           </p>
           <Button size="sm" onClick={() => void save()} disabled={saving}>
             {saving && <Spinner size="sm" />}
-            保存
+            {t('common.save')}
           </Button>
         </div>
       </div>
@@ -175,20 +188,20 @@ export function CoordinatorPanel({ coordinator, endpoints, notify }: Coordinator
       <Modal
         open={flashOpen}
         onClose={() => setFlashOpen(false)}
-        title="统筹模型建议"
+        title={t('legacy.coordinator.warningTitle')}
         testId={TID.coordinator.flashWarning}
         footer={
           <Button size="sm" onClick={() => void confirmFlash()} disabled={suppressing}>
             {suppressing && <Spinner size="sm" />}
-            确定
+            {t('legacy.coordinator.confirm')}
           </Button>
         }
       >
         <p className="text-sm font-medium leading-6 text-ink">
-          不推荐使用flash模型进行统筹
+          {t('legacy.coordinator.warningHeading')}
         </p>
         <p className="mt-1.5 text-xs leading-5 text-ink-3">
-          flash 级模型偏快但推理较弱，四阶段统筹（审查/筛选/编排/组装）更依赖稳定的长文推理能力，建议改用旗舰级模型。
+          {t('legacy.coordinator.warningDescription')}
         </p>
         <label className="mt-3 flex cursor-pointer items-center gap-2">
           <input
@@ -198,7 +211,7 @@ export function CoordinatorPanel({ coordinator, endpoints, notify }: Coordinator
             onChange={(e) => setDontShowAgain(e.target.checked)}
             className="h-4 w-4 accent-ink"
           />
-          <span className="text-sm text-ink-2">不再提示</span>
+          <span className="text-sm text-ink-2">{t('legacy.coordinator.dontShowAgain')}</span>
         </label>
       </Modal>
     </Card>

@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentic-translating.local/schemas/round-0820-result.schema.json",
+  "title": "Round 0820 Terminal Condition Result",
+  "type": "object",
+  "required": [
+    "outcomeId",
+    "outcomeKey",
+    "roundId",
+    "namespace",
+    "runId",
+    "datasetName",
+    "experiment",
+    "sampleId",
+    "direction",
+    "condition",
+    "status",
+    "completedAt"
+  ],
+  "properties": {
+    "outcomeId": { "type": "string", "format": "uuid" },
+    "outcomeKey": { "type": "string", "minLength": 1 },
+    "roundId": { "const": "round-0820" },
+    "namespace": { "const": "fsbp" },
+    "runId": { "type": "string", "minLength": 1 },
+    "datasetName": { "type": "string", "minLength": 1 },
+    "experiment": { "enum": ["translation_quality", "annotation_isolation"] },
+    "sampleId": { "type": "string", "minLength": 1 },
+    "direction": { "enum": ["en_to_zh", "zh_to_en"] },
+    "category": { "type": ["string", "null"] },
+    "sourceText": { "type": "string", "minLength": 1 },
+    "taskBrief": { "type": "string" },
+    "condition": { "enum": ["direct", "multi_raw", "multi_fsbp"] },
+    "status": { "enum": ["complete", "failed", "precheck_failed", "cancelled", "incomplete_output"] },
+    "model": { "type": "string" },
+    "text": { "type": "string", "minLength": 1 },
+    "raw": { "type": "string", "minLength": 1 },
+    "sourceTaskKey": { "type": "string" },
+    "candidateSetHash": { "type": ["string", "null"], "pattern": "^[a-f0-9]{64}$" },
+    "candidateSnapshotHash": { "type": ["string", "null"], "pattern": "^[a-f0-9]{64}$" },
+    "pairId": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "comparisonControlHash": { "type": ["string", "null"], "pattern": "^[a-f0-9]{64}$" },
+    "allowedDifference": { "const": "downstream_inherited_view_only" },
+    "inheritedView": { "enum": ["raw", "body"] },
+    "errorCode": { "type": "string" },
+    "error": { "type": "string" },
+    "partialRaw": { "type": "string" },
+    "partialBody": { "type": "string" },
+    "partialAnnotation": { "type": ["string", "null"] },
+    "finishReason": { "type": ["string", "null"] },
+    "truncated": { "type": "boolean" },
+    "targetedError": { "type": ["string", "null"] },
+    "errorEvidence": { "type": ["string", "null"] },
+    "annotationInfluence": { "type": ["string", "null"] },
+    "confirmationStatus": { "type": ["string", "null"] },
+    "completedAt": { "type": "string", "format": "date-time" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "complete" } } },
+      "then": { "required": ["text", "raw", "sourceTaskKey"] },
+      "else": { "required": ["errorCode", "error"] }
+    },
+    {
+      "if": { "properties": { "condition": { "enum": ["multi_raw", "multi_fsbp"] } } },
+      "then": { "required": ["pairId", "allowedDifference", "inheritedView"] }
+    },
+    {
+      "if": { "properties": { "status": { "const": "incomplete_output" } } },
+      "then": {
+        "required": ["partialRaw", "partialBody", "finishReason", "truncated"],
+        "properties": {
+          "finishReason": { "const": "length" },
+          "truncated": { "const": true }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

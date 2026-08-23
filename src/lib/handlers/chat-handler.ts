@@ -9,4 +9,6 @@
 export {
   buildRevisionReferenceMessage,
   createHandlers as createChatHandlers,
+  resolveChatConfig,
+  resolveChatReviewConfig,
 } from '@/app/api/sessions/[id]/chat/handlers'

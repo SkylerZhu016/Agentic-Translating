@@ -7,7 +7,6 @@ import {
   type ChatCompletionResponse,
   type LLMStreamEvent,
 } from '../llm/client'
-import { createRepositories } from '../db/repositories'
 import {
   endpointCapabilityProfileSchema,
   type CapabilityCheckRequest,
@@ -16,6 +15,7 @@ import {
 } from './contracts'
 import { createOnboardingRepository } from './repository'
 import { beginBestEffortLlmCall } from '../services/llm-call-ledger'
+import { currentRuntimeEndpoint } from '../services/runtime-endpoint-credentials'
 
 export const CAPABILITY_PROFILE_TTL_MS = 24 * 60 * 60 * 1_000
 
@@ -42,27 +42,37 @@ interface ProbeEndpoint {
   baseUrl: string
   chatCompletionsPath: string
   apiKey: string
-}
-
-function redactErrorText(value: string, secrets: string[]): string {
-  let redacted = value.replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]')
-  for (const secret of secrets) {
-    if (!secret) continue
-    redacted = redacted.split(secret).join('[REDACTED]')
+  resolveRuntimeEndpoint: () => {
+    baseUrl: string
+    chatCompletionsPath: string
+    apiKey: string
   }
-  return redacted.replace(/[\r\n]+/g, ' ').slice(0, 1_000)
 }
 
-function describeProbeError(error: unknown, apiKey: string): string {
-  const message = redactErrorText(
-    error instanceof Error ? error.message : String(error),
-    [apiKey],
-  )
+function describeProbeError(error: unknown, _apiKey: string): string {
   if (error instanceof LLMError) {
     const status = error.status == null ? '' : `:http_${error.status}`
-    return `${error.code}${status}: ${message}`.slice(0, 1_000)
+    return `${error.code}${status}`
   }
-  return message || 'unknown_probe_error'
+  if (
+    error && typeof error === 'object' && 'code' in error &&
+    typeof (error as { code?: unknown }).code === 'string'
+  ) {
+    return String((error as { code: string }).code).slice(0, 120)
+  }
+  return 'probe_failed'
+}
+
+function rethrowRuntimeEndpointFailure(error: unknown): void {
+  const code = error && typeof error === 'object' && 'code' in error
+    ? (error as { code?: unknown }).code
+    : null
+  if (
+    code === 'runtime_endpoint_deleted' ||
+    code === 'runtime_endpoint_disabled' ||
+    code === 'runtime_endpoint_key_unavailable' ||
+    code === 'runtime_endpoint_address_invalid'
+  ) throw error
 }
 
 function result(
@@ -188,6 +198,7 @@ async function probeChatAndUsage(
     }
   } catch (error) {
     ledger.fail(error)
+    rethrowRuntimeEndpointFailure(error)
     const description = describeProbeError(error, endpoint.apiKey)
     return {
       chat: result(false, description),
@@ -255,6 +266,7 @@ async function probeStreaming(
     return { streaming: result(true), firstByteMs }
   } catch (error) {
     ledger.fail(error)
+    rethrowRuntimeEndpointFailure(error)
     return {
       streaming: result(false, describeProbeError(error, endpoint.apiKey)),
       firstByteMs,
@@ -328,6 +340,7 @@ async function probeTools(
       : result(false, 'tool_call_not_returned')
   } catch (error) {
     ledger.fail(error)
+    rethrowRuntimeEndpointFailure(error)
     return result(false, describeProbeError(error, endpoint.apiKey))
   }
 }
@@ -338,8 +351,16 @@ export async function runEndpointCapabilityCheck(
   input: CapabilityCheckRequest = {},
   dependencies: CapabilityDoctorDependencies = {},
 ): Promise<EndpointCapabilityProfile> {
-  const endpointRow = createRepositories(db).endpoints.getById(endpointId)
-  if (!endpointRow) throw new EndpointCapabilityNotFoundError(endpointId)
+  let liveEndpoint: ReturnType<typeof currentRuntimeEndpoint>
+  try {
+    liveEndpoint = currentRuntimeEndpoint(db, endpointId)
+  } catch (error) {
+    if (
+      error && typeof error === 'object' && 'code' in error &&
+      (error as { code?: unknown }).code === 'runtime_endpoint_deleted'
+    ) throw new EndpointCapabilityNotFoundError(endpointId)
+    throw error
+  }
 
   const discoverModels = dependencies.discoverModels ?? discoverEndpointModels
   const complete = dependencies.complete ?? chatCompletion
@@ -348,10 +369,10 @@ export async function runEndpointCapabilityCheck(
   const createDiagnosticId =
     dependencies.createDiagnosticId ?? (() => crypto.randomUUID())
   const endpoint: ProbeEndpoint = {
-    baseUrl: endpointRow.base_url,
-    chatCompletionsPath:
-      endpointRow.chat_completions_path ?? '/v1/chat/completions',
-    apiKey: endpointRow.api_key,
+    baseUrl: liveEndpoint.baseUrl,
+    chatCompletionsPath: liveEndpoint.chatCompletionsPath,
+    apiKey: liveEndpoint.apiKey,
+    resolveRuntimeEndpoint: () => currentRuntimeEndpoint(db, endpointId),
   }
 
   let discoveredModels: Array<{ id: string }> = []
@@ -361,9 +382,11 @@ export async function runEndpointCapabilityCheck(
       baseUrl: endpoint.baseUrl,
       chatCompletionsPath: endpoint.chatCompletionsPath,
       apiKey: endpoint.apiKey,
+      resolveRuntimeEndpoint: endpoint.resolveRuntimeEndpoint,
     })
     models = { supported: true, count: discoveredModels.length, error: null }
   } catch (error) {
+    rethrowRuntimeEndpointFailure(error)
     models = {
       supported: false,
       count: null,

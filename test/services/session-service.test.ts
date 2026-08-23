@@ -90,6 +90,9 @@ describe('SessionService', () => {
       expect(snap.prompts.translator).toBe('Translate {{text}} to {{lang}}')
       expect(snap.prompts.review).toBe('Review this translation')
       expect(snap.endpoint).not.toBeNull()
+      expect(s.config_snapshot).not.toContain('sk-test')
+      expect(snap.endpoint).not.toHaveProperty('api_key')
+      expect(snap.endpoints[0]).not.toHaveProperty('api_key')
     })
 
     it('throws SourceRequiredError on empty source text', () => {

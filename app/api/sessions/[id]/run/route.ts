@@ -4,6 +4,7 @@ import { NextResponse } from 'next/server'
 import { getDb } from '@/src/lib/db'
 import { migrate } from '@/src/lib/db/migrate'
 import { startVNextRun } from '@/src/lib/orchestration/vnext-runner'
+import { sessionPreflightErrorDto } from '@/src/lib/services/session-preflight'
 import { z } from 'zod'
 
 const bodySchema = z.object({
@@ -27,6 +28,12 @@ export async function POST(
     const result = startVNextRun(db, id, parsed.data.configMode)
     return NextResponse.json(result, { status: result.reused ? 200 : 202 })
   } catch (error) {
+    const preflightError = sessionPreflightErrorDto(error)
+    if (preflightError) {
+      return NextResponse.json(preflightError.body, {
+        status: preflightError.status,
+      })
+    }
     const message = error instanceof Error ? error.message : String(error)
     if (message === 'session_not_found') {
       return NextResponse.json({ error: message }, { status: 404 })

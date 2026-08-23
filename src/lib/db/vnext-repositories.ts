@@ -57,6 +57,7 @@ interface WorkspaceDraftRow {
   selected_preset_revision_id: string | null
   allowed_agent_variant_ids: string
   review_mode: WorkspaceDraft['reviewMode']
+  main_editor_run_mode: NonNullable<WorkspaceDraft['mainEditorRunMode']>
   prompt_bundle_revision_id: string | null
   constraints_json: string
   updated_at: string
@@ -142,6 +143,7 @@ function mapDraft(row: WorkspaceDraftRow): WorkspaceDraft {
     selectedPresetRevisionId: row.selected_preset_revision_id,
     allowedAgentVariantIds: parseJson<string[]>(row.allowed_agent_variant_ids, []),
     reviewMode: row.review_mode,
+    mainEditorRunMode: row.main_editor_run_mode ?? 'fixed_pipeline',
     promptBundleRevisionId: row.prompt_bundle_revision_id ?? null,
     constraints: parseJson(row.constraints_json, {}),
     updatedAt: row.updated_at,
@@ -349,12 +351,14 @@ export function createWorkspaceDraftsRepo(db: Database.Database) {
     INSERT INTO workspace_drafts
       (direction, source_text, task_brief, selected_project_id,
        selected_preset_revision_id,
-       allowed_agent_variant_ids, review_mode, prompt_bundle_revision_id,
+       allowed_agent_variant_ids, review_mode, main_editor_run_mode,
+       prompt_bundle_revision_id,
        constraints_json, updated_at)
     VALUES
       (@direction, @source_text, @task_brief, @selected_project_id,
        @selected_preset_revision_id,
-       @allowed_agent_variant_ids, @review_mode, @prompt_bundle_revision_id,
+       @allowed_agent_variant_ids, @review_mode, @main_editor_run_mode,
+       @prompt_bundle_revision_id,
        @constraints_json, datetime('now'))
     ON CONFLICT(direction) DO UPDATE SET
       source_text=excluded.source_text,
@@ -363,19 +367,14 @@ export function createWorkspaceDraftsRepo(db: Database.Database) {
       selected_preset_revision_id=excluded.selected_preset_revision_id,
       allowed_agent_variant_ids=excluded.allowed_agent_variant_ids,
       review_mode=excluded.review_mode,
+      main_editor_run_mode=excluded.main_editor_run_mode,
       prompt_bundle_revision_id=excluded.prompt_bundle_revision_id,
       constraints_json=excluded.constraints_json,
       updated_at=datetime('now')
   `)
-  const clearStmt = db.prepare(`
-    UPDATE workspace_drafts SET source_text='', task_brief='',
-      selected_project_id=NULL, selected_preset_revision_id=NULL,
-      allowed_agent_variant_ids='[]',
-      review_mode='main_editor', prompt_bundle_revision_id=NULL,
-      constraints_json='{}',
-      updated_at=datetime('now')
-    WHERE direction=?
-  `)
+  const clearStmt = db.prepare(
+    'DELETE FROM workspace_drafts WHERE direction=?',
+  )
   const clearIfMatchesTxn = db.transaction((
     expected: Omit<WorkspaceDraft, 'updatedAt'>,
     automaticallyIncludedAgentVariantIds: string[],
@@ -394,6 +393,8 @@ export function createWorkspaceDraftsRepo(db: Database.Database) {
       current.selectedProjectId === expected.selectedProjectId &&
       current.selectedPresetRevisionId === expected.selectedPresetRevisionId &&
       current.reviewMode === expected.reviewMode &&
+      (current.mainEditorRunMode ?? 'fixed_pipeline') ===
+        (expected.mainEditorRunMode ?? 'fixed_pipeline') &&
       (current.promptBundleRevisionId ?? null) ===
         (expected.promptBundleRevisionId ?? null) &&
       sameStringSet(currentAgentVariantIds, submittedAgentVariantIds) &&
@@ -416,6 +417,7 @@ export function createWorkspaceDraftsRepo(db: Database.Database) {
         selected_preset_revision_id: draft.selectedPresetRevisionId,
         allowed_agent_variant_ids: JSON.stringify(draft.allowedAgentVariantIds),
         review_mode: draft.reviewMode,
+        main_editor_run_mode: draft.mainEditorRunMode ?? 'fixed_pipeline',
         prompt_bundle_revision_id: draft.promptBundleRevisionId ?? null,
         constraints_json: JSON.stringify(draft.constraints ?? {}),
       }),

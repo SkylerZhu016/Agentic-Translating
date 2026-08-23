@@ -12,6 +12,8 @@ vi.mock('../../src/lib/llm/client', async (importOriginal) => {
 import { chatCompletion } from '../../src/lib/llm/client'
 import { generateRevisionSuggestion } from '../../src/lib/chat/revision-suggestions'
 
+const allowPhysicalCall = () => ({ outputLimit: 2_048 })
+
 describe('revision suggestion lenses', () => {
   beforeEach(() => {
     vi.mocked(chatCompletion).mockReset()
@@ -55,6 +57,7 @@ describe('revision suggestion lenses', () => {
       taskBrief: '保持叙事语气。',
       currentTranslation: '凌晨那些小小的钟点开始变大。劳苦的头脑没有安宁。',
       userRequest: '读起来有点拗口，只改最明显的地方。',
+      preflightPhysicalCall: allowPhysicalCall,
     })
 
     expect(result).toEqual({
@@ -92,7 +95,7 @@ describe('revision suggestion lenses', () => {
       calls.every(([, request]) =>
         request.model === 'DeepSeek V4 Flash: Go' &&
         request.stream === true &&
-        request.maxTokens === 131_072,
+        request.maxTokens === 2_048,
       ),
     ).toBe(true)
   })
@@ -120,6 +123,7 @@ describe('revision suggestion lenses', () => {
       taskBrief: 'Preserve the poem\'s tone.',
       currentTranslation: 'My affairs and letters are left to loneliness.',
       userRequest: 'The ending still feels a little flat.',
+      preflightPhysicalCall: allowPhysicalCall,
     })
 
     expect(result.feedback).toContain('too abstract')
@@ -127,6 +131,76 @@ describe('revision suggestion lenses', () => {
     expect(
       vi.mocked(chatCompletion).mock.calls[0][1].messages[0].content,
     ).toContain('finished English')
+  })
+
+  it('runs the exact three message sets through preflight before each physical request', async () => {
+    vi.mocked(chatCompletion).mockImplementation(async (_endpoint, request) => {
+      const system = request.messages[0]?.content ?? ''
+      if (system.includes('把两份隔离意见整理成')) return { content: '最终反馈' }
+      if (system.includes('独立的中文成品读者')) return { content: '读者报告' }
+      if (system.includes('双语核验者')) return { content: '核验报告' }
+      throw new Error('unexpected prompt')
+    })
+    const inspected: Array<{
+      operation: string
+      attempted: number
+      combined: string
+    }> = []
+
+    await generateRevisionSuggestion({
+      endpoint: { baseUrl: 'https://example.invalid', apiKey: 'test-key' },
+      model: 'fixture-model',
+      promptLanguage: 'zh',
+      sourceText: 'source sentinel',
+      taskBrief: 'brief sentinel',
+      currentTranslation: 'translation sentinel',
+      userRequest: 'request sentinel',
+      preflightPhysicalCall(call) {
+        inspected.push({
+          operation: call.operation,
+          attempted: call.attempted,
+          combined: call.messages.map((message) => message.content).join('\n'),
+        })
+        return { outputLimit: 1_536 }
+      },
+    })
+
+    expect(inspected.map((call) => call.attempted)).toEqual([1, 2, 3])
+    expect(inspected[0].combined).not.toContain('source sentinel')
+    expect(inspected[1].combined).toContain('source sentinel')
+    expect(inspected[2].combined).toContain('读者报告')
+    expect(inspected[2].combined).toContain('核验报告')
+    expect(
+      vi.mocked(chatCompletion).mock.calls.every(
+        ([, request]) => request.maxTokens === 1_536,
+      ),
+    ).toBe(true)
+  })
+
+  it('does not send the arbiter request when its physical-call preflight blocks', async () => {
+    vi.mocked(chatCompletion).mockImplementation(async (_endpoint, request) => {
+      const system = request.messages[0]?.content ?? ''
+      return {
+        content: system.includes('独立的中文成品读者')
+          ? '读者报告'
+          : '核验报告',
+      }
+    })
+
+    await expect(generateRevisionSuggestion({
+      endpoint: { baseUrl: 'https://example.invalid', apiKey: 'test-key' },
+      model: 'fixture-model',
+      promptLanguage: 'zh',
+      sourceText: 'source',
+      taskBrief: 'brief',
+      currentTranslation: 'translation',
+      userRequest: 'request',
+      preflightPhysicalCall(call) {
+        if (call.attempted === 3) throw new Error('arbiter_preflight_blocked')
+        return { outputLimit: 1_024 }
+      },
+    })).rejects.toThrow('arbiter_preflight_blocked')
+    expect(chatCompletion).toHaveBeenCalledTimes(2)
   })
 
   it('v16 prompts protect deliberate strangeness and require verbatim prohibitions', async () => {
@@ -150,6 +224,7 @@ describe('revision suggestion lenses', () => {
       taskBrief: '保持叙事语气。',
       currentTranslation: '凌晨那些小小的钟点开始变大。',
       userRequest: '读起来有点拗口。',
+      preflightPhysicalCall: allowPhysicalCall,
     })
     const zhCalls = vi.mocked(chatCompletion).mock.calls
     const zhReader = zhCalls.find(([, r]) =>
@@ -190,6 +265,7 @@ describe('revision suggestion lenses', () => {
       taskBrief: 'Preserve the poem\'s tone.',
       currentTranslation: 'My affairs are left to loneliness.',
       userRequest: 'The ending feels flat.',
+      preflightPhysicalCall: allowPhysicalCall,
     })
     const enCalls = vi.mocked(chatCompletion).mock.calls
     const enReader = enCalls.find(([, r]) =>

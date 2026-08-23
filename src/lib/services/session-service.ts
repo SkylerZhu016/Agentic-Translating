@@ -15,11 +15,17 @@ import {
   assertTransition,
 } from '../guards'
 import type {
+  ConfigSnapshotVNext,
+  MainEditorRunMode,
   ModelBinding,
   ReviewMode,
   TranslationConstraints,
   TranslationDirection,
 } from '../contracts/vnext'
+import {
+  assertSessionPreflight,
+  runSessionPreflight,
+} from './session-preflight'
 import { createVNextRepositories } from '../db/vnext-repositories'
 import {
   createProjectRepositories,
@@ -36,8 +42,8 @@ import type {
   FinalVersionRow,
   ChatMessageRow,
 } from '../contracts/types'
-import { encryptSecret } from '../security/secrets'
 import type { FrozenProjectResource } from '../contracts/projects'
+import { withoutSnapshotCredentials } from './runtime-endpoint-credentials'
 
 // ===========================================================================
 // Custom Errors
@@ -82,6 +88,7 @@ export interface CreateSessionInput {
   direction?: TranslationDirection
   taskBrief?: string
   reviewMode?: ReviewMode
+  mainEditorRunMode?: MainEditorRunMode
   presetRevisionId?: string | null
   promptBundleRevisionId?: string | null
   projectId?: string | null
@@ -123,7 +130,14 @@ function buildConfigSnapshot(repos: Repositories): ConfigSnapshot {
   for (const p of promptsList) {
     prompts[p.kind] = p.content
   }
-  return deepClone({ version: 2, endpoint, endpoints, agents, coordinator, prompts })
+  return deepClone(withoutSnapshotCredentials({
+    version: 2,
+    endpoint,
+    endpoints,
+    agents,
+    coordinator,
+    prompts,
+  })) as ConfigSnapshot
 }
 
 function tableExists(db: Database.Database, table: string): boolean {
@@ -161,6 +175,10 @@ function sessionRequestHash(input: CreateSessionInput): string {
     direction: input.direction ?? 'en_to_zh',
     taskBrief: input.taskBrief ?? '',
     reviewMode: input.reviewMode ?? 'main_editor',
+    // Preserve historical fixed-pipeline idempotency hashes; only the new
+    // opt-in mode changes the request identity.
+    mainEditorRunMode:
+      input.mainEditorRunMode === 'tool_enabled' ? 'tool_enabled' : undefined,
     presetRevisionId: input.presetRevisionId ?? null,
     promptBundleRevisionId: input.promptBundleRevisionId ?? null,
     projectId: input.projectId ?? null,
@@ -192,6 +210,7 @@ function legacySessionMatchesRequest(
 
   const direction = input.direction ?? 'en_to_zh'
   const reviewMode = input.reviewMode ?? 'main_editor'
+  const mainEditorRunMode = input.mainEditorRunMode ?? 'fixed_pipeline'
   const presetRevisionId = input.presetRevisionId ?? null
   if (
     session.source_text !== input.sourceText ||
@@ -201,6 +220,8 @@ function legacySessionMatchesRequest(
     (session.task_brief ?? snapshot.taskBrief ?? '') !== (input.taskBrief ?? '') ||
     (session.review_mode ?? snapshot.orchestrationPolicy?.reviewMode ??
       'main_editor') !== reviewMode ||
+    (snapshot.orchestrationPolicy?.mainEditorRunMode ?? 'fixed_pipeline') !==
+      mainEditorRunMode ||
     (session.preset_revision_id ??
       snapshot.presetRevisionSnapshot?.id ??
       null) !== presetRevisionId ||
@@ -435,16 +456,6 @@ export function createSessionService(
       // 2. Deep-clone current config into snapshot
       const snapshot = buildConfigSnapshot(repos)
       if (vnext) {
-        snapshot.endpoint = snapshot.endpoint
-          ? {
-              ...snapshot.endpoint,
-              api_key: encryptSecret(snapshot.endpoint.api_key),
-            }
-          : null
-        snapshot.endpoints = snapshot.endpoints?.map((endpoint) => ({
-          ...endpoint,
-          api_key: encryptSecret(endpoint.api_key),
-        }))
         const selectedPromptRevision = input.promptBundleRevisionId
           ? db.prepare(
               `SELECT r.payload_json, f.direction
@@ -582,7 +593,6 @@ export function createSessionService(
             baseUrl: endpoint.base_url,
             chatCompletionsPath:
               endpoint.chat_completions_path ?? '/v1/chat/completions',
-            apiKey: encryptSecret(endpoint.api_key),
             hasApiKey: endpoint.api_key.length > 0,
             contextWindow: endpoint.context_window ?? null,
           })),
@@ -608,6 +618,10 @@ export function createSessionService(
               input.reviewMode ??
               presetRevision?.contract.reviewMode ??
               'main_editor',
+            mainEditorRunMode:
+              input.mainEditorRunMode ??
+              presetRevision?.contract.mainEditorRunMode ??
+              'fixed_pipeline',
             maxAgentCalls: presetRevision?.contract.maxAgentCalls ?? 5,
             candidateAnnotationMode:
               presetRevision?.contract.candidateAnnotationMode ?? 'body_only',
@@ -682,6 +696,16 @@ export function createSessionService(
       // session and children, then freeze the selected resource subset.
       const txn = db.transaction(() => {
         const projectFreezePlan = resolveProjectFreezePlan()
+        if (snapshot.version === 3) {
+          const preflight = runSessionPreflight({
+            sourceText: input.sourceText,
+            taskBrief: input.taskBrief,
+            projectContextTokens: projectFreezePlan?.tokenEstimate ?? 0,
+            snapshot: snapshot as unknown as ConfigSnapshotVNext,
+          })
+          Object.assign(snapshot, { preflight })
+          assertSessionPreflight(preflight)
+        }
         repos.sessions.insert({
           id,
           source_text: input.sourceText,

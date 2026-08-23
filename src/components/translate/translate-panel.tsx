@@ -24,6 +24,7 @@ import { useDirection } from '@/src/components/direction/DirectionProvider'
 import { onSessionChanged } from '@/src/components/coordinator/session-bus'
 import type {
   AgentDirectionVariant,
+  MainEditorRunMode,
   ReviewMode,
   TranslationConstraints,
   WorkspaceDraft,
@@ -34,6 +35,11 @@ import type {
   ProjectSnapshot,
   TranslationProject,
 } from '@/src/lib/contracts/projects'
+import { useI18n } from '@/src/i18n/LocaleProvider'
+import {
+  DEFAULT_POETRY_CONSTRAINTS,
+  hasMeaningfulDraft,
+} from './workspace-draft-state'
 
 export interface TranslatePanelProps {
   className?: string
@@ -52,38 +58,41 @@ interface ProjectSelectionSummary {
   frozen: boolean
 }
 
-const DEFAULT_POETRY_CONSTRAINTS: TranslationConstraints = {
-  poetryMode: 'auto',
-  poetryTargetForm: 'preserve',
-  chineseRhymeSystem: 'mandarin',
-  englishRhymeMode: 'natural',
-  rhymePositions: 'auto',
-  firstLineRhyme: 'auto',
-  rhymeChange: 'source',
-  poetryPriority: 'balanced',
-  rhymeEvidence: true,
-}
-
-function hasNonDefaultPoetryConstraints(
-  constraints: TranslationConstraints | undefined,
-): boolean {
-  if (!constraints) return false
-  const merged = {
-    ...DEFAULT_POETRY_CONSTRAINTS,
-    ...constraints,
-  }
-  return (
-    Object.entries(DEFAULT_POETRY_CONSTRAINTS).some(
-      ([key, value]) =>
-        merged[key as keyof TranslationConstraints] !== value,
-    ) ||
-    Object.keys(constraints).some(
-      (key) => !(key in DEFAULT_POETRY_CONSTRAINTS),
-    )
+async function findPresetIdForRevision(
+  presetList: WorkflowPreset[],
+  revisionId: string | null,
+): Promise<string> {
+  if (!revisionId) return ''
+  const outcomes = await Promise.allSettled(
+    presetList.map(async (preset) => {
+      const response = await fetch(
+        `/api/workflow-presets/${encodeURIComponent(preset.id)}`,
+      )
+      if (!response.ok) {
+        throw new Error(`workspace_preset_lookup_failed:${response.status}`)
+      }
+      const detail = await response.json() as {
+        revisions: WorkflowPresetRevision[]
+      }
+      return detail.revisions.some((revision) => revision.id === revisionId)
+        ? preset.id
+        : null
+    }),
   )
+  const match = outcomes.find(
+    (outcome): outcome is PromiseFulfilledResult<string> =>
+      outcome.status === 'fulfilled' && outcome.value != null,
+  )
+  if (match) return match.value
+  const failure = outcomes.find(
+    (outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected',
+  )
+  if (failure) throw failure.reason
+  throw new Error('workspace_preset_revision_unresolved')
 }
 
 export function TranslatePanel({ className = '', onAllCompleteChange }: TranslatePanelProps) {
+  const { t, formatDate, formatNumber } = useI18n()
   const searchParams = useSearchParams()
   const { direction, registerDraftController } = useDirection()
   const {
@@ -94,6 +103,9 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     langPair,
     globalError,
     retryingKey,
+    preflight,
+    preflightErrorCode,
+    preflightActions,
     busy,
     summary,
     allComplete,
@@ -124,6 +136,8 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
   const [restoredProjectState, setRestoredProjectState] =
     useState<RestoredTranslationState | null>(null)
   const [reviewMode, setReviewMode] = useState<ReviewMode>('main_editor')
+  const [mainEditorRunMode, setMainEditorRunMode] =
+    useState<MainEditorRunMode>('fixed_pipeline')
   const [constraints, setConstraints] = useState<TranslationConstraints>(
     DEFAULT_POETRY_CONSTRAINTS,
   )
@@ -144,13 +158,35 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
   const [restoredSession, setRestoredSession] = useState(false)
   const [recoverableDraft, setRecoverableDraft] =
     useState<WorkspaceDraft | null>(null)
+  const [draftLoadError, setDraftLoadError] = useState<string | null>(null)
+  const [draftLoadRevision, setDraftLoadRevision] = useState(0)
+  const [draftSaveError, setDraftSaveError] = useState<string | null>(null)
+  const [presetLookupError, setPresetLookupError] = useState<string | null>(null)
+  const [presetSelectionBusy, setPresetSelectionBusy] = useState(false)
+  const [draftResolutionBusy, setDraftResolutionBusy] = useState(false)
+  const [submitPreparing, setSubmitPreparing] = useState(false)
   const [retryAllOpen, setRetryAllOpen] = useState(false)
   const [timelineOpen, setTimelineOpen] = useState(false)
   const pendingDraftSavesRef = useRef<Set<Promise<void>>>(new Set())
+  const draftSaveQueueRef = useRef<Promise<void>>(Promise.resolve())
   const draftSaveTimerRef = useRef<number | null>(null)
   const submitPreparingRef = useRef(false)
+  const draftResolutionBusyRef = useRef(false)
+  const presetSelectionBusyRef = useRef(false)
+  const presetLookupErrorRef = useRef<string | null>(null)
+  const presetLookupTokenRef = useRef(0)
+  const directionRef = useRef(direction)
+  const recoverableDraftRef = useRef<WorkspaceDraft | null>(null)
+  directionRef.current = direction
+  recoverableDraftRef.current = recoverableDraft
+  const updatePresetLookupError = useCallback((error: string | null) => {
+    presetLookupErrorRef.current = error
+    setPresetLookupError(error)
+  }, [])
   const routeSessionId = searchParams.get('session')
   const freshWorkspace = searchParams.get('fresh') === '1' && !routeSessionId
+  const draftInteractionLocked =
+    busy || restoredSession || submitPreparing || draftResolutionBusy
 
   useEffect(() => {
     if (!routeSessionId) return
@@ -163,16 +199,23 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
 
   useEffect(() => {
     let cancelled = false
+    const presetLookupToken = ++presetLookupTokenRef.current
     setDraftLoaded(false)
+    setDraftLoadError(null)
+    updatePresetLookupError(null)
+    presetSelectionBusyRef.current = false
+    setPresetSelectionBusy(false)
+    setRecoverableDraft(null)
     const activeSessionId = routeSessionId
     void Promise.all([
       activeSessionId
         ? restoreSession(activeSessionId)
-        : fetch(`/api/workspace-drafts/${direction}`).then((response) =>
-            response.ok
-              ? response.json() as Promise<WorkspaceDraft | null>
-              : null,
-          ),
+        : fetch(`/api/workspace-drafts/${direction}`).then((response) => {
+            if (!response.ok) {
+              throw new Error(`workspace_draft_load_failed:${response.status}`)
+            }
+            return response.json() as Promise<WorkspaceDraft | null>
+          }),
       fetch(`/api/agent-catalog?direction=${direction}`).then((response) =>
         response.ok
           ? response.json() as Promise<{ variants: AgentDirectionVariant[] }>
@@ -217,16 +260,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
         !activeSessionId && draftOrSession
           ? (draftOrSession as WorkspaceDraft)
           : null
-      const hasSavedDraft = Boolean(
-        savedDraft &&
-          (
-            savedDraft.sourceText.trim() ||
-            savedDraft.taskBrief.trim() ||
-            savedDraft.selectedProjectId ||
-            savedDraft.selectedPresetRevisionId ||
-            hasNonDefaultPoetryConstraints(savedDraft.constraints)
-          ),
-      )
+      const hasSavedDraft = hasMeaningfulDraft(savedDraft, variants)
       setRecoverableDraft(
         freshWorkspace && hasSavedDraft ? savedDraft : null,
       )
@@ -242,6 +276,9 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
       setSelectedProjectId(visibleState?.selectedProjectId ?? null)
       setRestoredProjectState(restoredState)
       setReviewMode(visibleState?.reviewMode ?? 'main_editor')
+      setMainEditorRunMode(
+        visibleState?.mainEditorRunMode ?? 'fixed_pipeline',
+      )
       setConstraints({
         ...DEFAULT_POETRY_CONSTRAINTS,
         ...(visibleState?.constraints ?? {}),
@@ -269,34 +306,50 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
           ? (visibleState as WorkspaceDraft).selectedPresetRevisionId
           : null
       if (draftRevisionId) {
-        void Promise.all(
-          presetList.map(async (preset) => {
-            const response = await fetch(
-              `/api/workflow-presets/${encodeURIComponent(preset.id)}`,
-            )
-            if (!response.ok) return null
-            const detail = await response.json() as {
-              revisions: WorkflowPresetRevision[]
+        void findPresetIdForRevision(presetList, draftRevisionId)
+          .then((presetId) => {
+            if (
+              !cancelled &&
+              presetLookupToken === presetLookupTokenRef.current
+            ) {
+              setSelectedPresetId(presetId)
+              updatePresetLookupError(null)
             }
-            return detail.revisions.some(
-              (revision) => revision.id === draftRevisionId,
-            )
-              ? preset.id
-              : null
-          }),
-        ).then((matches) => {
-          if (!cancelled) {
-            setSelectedPresetId(matches.find(Boolean) ?? '')
-          }
-        })
+          })
+          .catch((error: unknown) => {
+            if (
+              !cancelled &&
+              presetLookupToken === presetLookupTokenRef.current
+            ) {
+              updatePresetLookupError(
+                error instanceof Error
+                  ? error.message
+                  : 'workspace_preset_lookup_failed',
+              )
+            }
+          })
       }
       setRestoredSession(Boolean(activeSessionId))
+      setDraftLoadError(null)
+      setDraftLoaded(true)
+    }).catch((error: unknown) => {
+      if (cancelled) return
+      setDraftLoadError(
+        error instanceof Error ? error.message : 'workspace_draft_load_failed',
+      )
       setDraftLoaded(true)
     })
     return () => {
       cancelled = true
     }
-  }, [direction, freshWorkspace, restoreSession, routeSessionId])
+  }, [
+    direction,
+    draftLoadRevision,
+    freshWorkspace,
+    restoreSession,
+    routeSessionId,
+    updatePresetLookupError,
+  ])
 
   useEffect(() => {
     if (sessionId) setRestoredSession(true)
@@ -320,7 +373,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     void Promise.all([
       fetch(`/api/projects/${encodeURIComponent(selectedProjectId)}`).then(
         async (response) => {
-          if (!response.ok) throw new Error('无法读取项目详情')
+          if (!response.ok) throw new Error(t('translate.project.detailError'))
           return response.json() as Promise<{
             project: TranslationProject
             resourceCount: number
@@ -331,7 +384,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
       fetch(
         `/api/projects/${encodeURIComponent(selectedProjectId)}/snapshots`,
       ).then(async (response) => {
-        if (!response.ok) throw new Error('无法读取项目快照')
+        if (!response.ok) throw new Error(t('translate.project.snapshotError'))
         return response.json() as Promise<{ snapshots: ProjectSnapshot[] }>
       }),
     ])
@@ -359,7 +412,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
         if (!cancelled) {
           setSelectedProjectSummary(null)
           setProjectSummaryError(
-            error instanceof Error ? error.message : '无法读取项目摘要',
+            error instanceof Error ? error.message : t('translate.project.summaryError'),
           )
         }
       })
@@ -370,7 +423,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     return () => {
       cancelled = true
     }
-  }, [restoredProjectState, selectedProjectId])
+  }, [restoredProjectState, selectedProjectId, t])
 
   const removeFreshMarker = useCallback(() => {
     const url = new URL(window.location.href)
@@ -379,55 +432,204 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
   }, [])
 
   const restoreSavedDraft = useCallback(() => {
-    if (!recoverableDraft) return
+    if (!recoverableDraft || draftResolutionBusyRef.current) return
+    const lookupDirection = direction
+    const presetLookupToken = ++presetLookupTokenRef.current
+    updatePresetLookupError(null)
     setSource(recoverableDraft.sourceText)
     setTaskBrief(recoverableDraft.taskBrief)
     setSelectedProjectId(recoverableDraft.selectedProjectId)
     setRestoredProjectState(null)
     setReviewMode(recoverableDraft.reviewMode)
+    setMainEditorRunMode(
+      recoverableDraft.mainEditorRunMode ?? 'fixed_pipeline',
+    )
     setConstraints({
       ...DEFAULT_POETRY_CONSTRAINTS,
       ...(recoverableDraft.constraints ?? {}),
     })
     setAllowedAgentVariantIds(recoverableDraft.allowedAgentVariantIds)
     setSelectedPresetRevisionId(recoverableDraft.selectedPresetRevisionId)
+    setSelectedPresetId('')
+    void findPresetIdForRevision(
+      presets,
+      recoverableDraft.selectedPresetRevisionId,
+    ).then((presetId) => {
+      if (
+        presetLookupToken === presetLookupTokenRef.current &&
+        directionRef.current === lookupDirection
+      ) {
+        setSelectedPresetId(presetId)
+        updatePresetLookupError(null)
+      }
+    }).catch((error: unknown) => {
+      if (
+        presetLookupToken === presetLookupTokenRef.current &&
+        directionRef.current === lookupDirection
+      ) {
+        updatePresetLookupError(
+          error instanceof Error
+            ? error.message
+            : 'workspace_preset_lookup_failed',
+        )
+      }
+    })
     setPromptBundleRevisionId(
       recoverableDraft.promptBundleRevisionId ?? null,
     )
     setRecoverableDraft(null)
     removeFreshMarker()
-  }, [recoverableDraft, removeFreshMarker])
+  }, [
+    direction,
+    presets,
+    recoverableDraft,
+    removeFreshMarker,
+    updatePresetLookupError,
+  ])
+
+  const ignoreSavedDraft = useCallback(async () => {
+    if (
+      !recoverableDraft ||
+      draftResolutionBusy ||
+      draftResolutionBusyRef.current
+    ) return
+    const ignoredDraft = recoverableDraft
+    const ignoredDirection = direction
+    draftResolutionBusyRef.current = true
+    setDraftResolutionBusy(true)
+    const request = draftSaveQueueRef.current.catch(() => undefined).then(async () => {
+      const response = await fetch(`/api/workspace-drafts/${direction}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sourceText: source,
+          taskBrief,
+          selectedProjectId,
+          selectedPresetRevisionId,
+          promptBundleRevisionId,
+          allowedAgentVariantIds,
+          reviewMode,
+          mainEditorRunMode,
+          constraints,
+        }),
+      })
+      if (!response.ok) {
+        throw new Error(`workspace_draft_discard_failed:${response.status}`)
+      }
+      setDraftSaveError(null)
+    })
+    draftSaveQueueRef.current = request
+    pendingDraftSavesRef.current.add(request)
+    void request.then(
+      () => pendingDraftSavesRef.current.delete(request),
+      () => pendingDraftSavesRef.current.delete(request),
+    )
+    try {
+      await request
+      if (
+        directionRef.current !== ignoredDirection ||
+        recoverableDraftRef.current !== ignoredDraft
+      ) {
+        return
+      }
+      setRecoverableDraft(null)
+      removeFreshMarker()
+    } catch (error: unknown) {
+      setDraftSaveError(
+        error instanceof Error
+          ? error.message
+          : 'workspace_draft_discard_failed',
+      )
+    } finally {
+      draftResolutionBusyRef.current = false
+      setDraftResolutionBusy(false)
+    }
+  }, [
+    allowedAgentVariantIds,
+    constraints,
+    direction,
+    draftResolutionBusy,
+    mainEditorRunMode,
+    promptBundleRevisionId,
+    recoverableDraft,
+    removeFreshMarker,
+    reviewMode,
+    selectedPresetRevisionId,
+    selectedProjectId,
+    source,
+    taskBrief,
+  ])
+
+  const continueWithoutPreset = useCallback(() => {
+    presetLookupTokenRef.current += 1
+    presetSelectionBusyRef.current = false
+    setPresetSelectionBusy(false)
+    setSelectedPresetId('')
+    setSelectedPresetRevisionId(null)
+    updatePresetLookupError(null)
+  }, [updatePresetLookupError])
 
   const flushDraft = useCallback((): Promise<void> => {
-    if (!draftLoaded || busy || restoredSession) return Promise.resolve()
-    const request = fetch(`/api/workspace-drafts/${direction}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sourceText: source,
-        taskBrief,
-        selectedProjectId,
-        selectedPresetRevisionId,
-        promptBundleRevisionId,
-        allowedAgentVariantIds,
-        reviewMode,
-        constraints,
-      }),
+    if (
+      !draftLoaded ||
+      draftLoadError ||
+      presetLookupError ||
+      presetSelectionBusy ||
+      busy ||
+      restoredSession ||
+      recoverableDraft
+    ) {
+      return Promise.resolve()
+    }
+    const body = JSON.stringify({
+      sourceText: source,
+      taskBrief,
+      selectedProjectId,
+      selectedPresetRevisionId,
+      promptBundleRevisionId,
+      allowedAgentVariantIds,
+      reviewMode,
+      mainEditorRunMode,
+      constraints,
     })
-      .then(() => undefined)
-      .catch(() => undefined)
+    const request = draftSaveQueueRef.current.catch(() => undefined).then(
+      async () => {
+        const response = await fetch(`/api/workspace-drafts/${direction}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body,
+        })
+        if (!response.ok) {
+          throw new Error(`workspace_draft_save_failed:${response.status}`)
+        }
+        setDraftSaveError(null)
+      },
+    ).catch((error: unknown) => {
+      const message = error instanceof Error
+        ? error.message
+        : 'workspace_draft_save_failed'
+      setDraftSaveError(message)
+      throw error
+    })
+    draftSaveQueueRef.current = request
     pendingDraftSavesRef.current.add(request)
-    void request.then(() => {
-      pendingDraftSavesRef.current.delete(request)
-    })
+    void request.then(
+      () => pendingDraftSavesRef.current.delete(request),
+      () => pendingDraftSavesRef.current.delete(request),
+    )
     return request
   }, [
     allowedAgentVariantIds,
     busy,
     direction,
+    draftLoadError,
     draftLoaded,
     promptBundleRevisionId,
+    recoverableDraft,
     reviewMode,
+    mainEditorRunMode,
+    presetLookupError,
+    presetSelectionBusy,
     constraints,
     restoredSession,
     selectedProjectId,
@@ -437,24 +639,27 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
   ])
 
   useEffect(() => {
+    const currentDraft = {
+      sourceText: source,
+      taskBrief,
+      selectedProjectId,
+      selectedPresetRevisionId,
+      allowedAgentVariantIds,
+      reviewMode,
+      mainEditorRunMode,
+      promptBundleRevisionId,
+      constraints,
+    }
     registerDraftController({
       dirty:
         !restoredSession &&
-        (
-          source.trim().length > 0 ||
-          taskBrief.trim().length > 0 ||
-          selectedProjectId != null ||
-          selectedPresetRevisionId != null ||
-          promptBundleRevisionId != null ||
-          reviewMode !== 'main_editor' ||
-          JSON.stringify(constraints) !==
-            JSON.stringify(DEFAULT_POETRY_CONSTRAINTS) ||
-          allowedAgentVariantIds.length !== catalog.length ||
-          allowedAgentVariantIds.some(
-            (id) => !catalog.some((variant) => variant.id === id),
-          )
-        ),
+        hasMeaningfulDraft(currentDraft, catalog),
       flush: flushDraft,
+      isInteractionLocked: () =>
+        submitPreparingRef.current ||
+        draftResolutionBusyRef.current ||
+        presetSelectionBusyRef.current ||
+        presetLookupErrorRef.current != null,
     })
     return () => registerDraftController(null)
   }, [
@@ -465,6 +670,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     promptBundleRevisionId,
     restoredSession,
     reviewMode,
+    mainEditorRunMode,
     constraints,
     selectedProjectId,
     selectedPresetRevisionId,
@@ -473,12 +679,19 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
   ])
 
   useEffect(() => {
-    if (!draftLoaded || busy || restoredSession) return
+    if (
+      !draftLoaded ||
+      busy ||
+      restoredSession ||
+      submitPreparing ||
+      draftResolutionBusy ||
+      presetSelectionBusy
+    ) return
     const timer = window.setTimeout(() => {
       if (draftSaveTimerRef.current === timer) {
         draftSaveTimerRef.current = null
       }
-      void flushDraft()
+      void flushDraft().catch(() => undefined)
     }, 500)
     draftSaveTimerRef.current = timer
     return () => {
@@ -493,10 +706,26 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     draftLoaded,
     flushDraft,
     reviewMode,
+    mainEditorRunMode,
+    draftResolutionBusy,
     restoredSession,
     source,
+    submitPreparing,
+    presetSelectionBusy,
     taskBrief,
   ])
+
+  useEffect(() => {
+    if (!presetLookupError) return
+    const preventUnresolvedPresetExit = (event: BeforeUnloadEvent) => {
+      event.preventDefault()
+      event.returnValue = ''
+    }
+    window.addEventListener('beforeunload', preventUnresolvedPresetExit)
+    return () => {
+      window.removeEventListener('beforeunload', preventUnresolvedPresetExit)
+    }
+  }, [presetLookupError])
 
   // 全部完成 → 上抛右栏
   useEffect(() => {
@@ -507,8 +736,10 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
   const tokenCount = useMemo(() => estimateTokens(source), [source])
   const empty = source.trim().length === 0
   const canSubmit =
-    !busy &&
-    !restoredSession &&
+    !draftInteractionLocked &&
+    !presetSelectionBusy &&
+    !presetLookupError &&
+    recoverableDraft == null &&
     !empty &&
     allowedAgentVariantIds.filter(
       (id) =>
@@ -520,6 +751,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
   const handleTranslate = async () => {
     if (!canSubmit || submitPreparingRef.current) return
     submitPreparingRef.current = true
+    setSubmitPreparing(true)
     if (draftSaveTimerRef.current != null) {
       window.clearTimeout(draftSaveTimerRef.current)
       draftSaveTimerRef.current = null
@@ -532,6 +764,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
         direction,
         taskBrief,
         reviewMode,
+        mainEditorRunMode,
         constraints,
         allowedAgentVariantIds: Array.from(new Set([
           ...allowedAgentVariantIds,
@@ -545,43 +778,160 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
       })
     } finally {
       submitPreparingRef.current = false
+      setSubmitPreparing(false)
     }
   }
 
   const loadPreset = async (presetId: string) => {
+    const requestToken = ++presetLookupTokenRef.current
+    const requestDirection = direction
+    updatePresetLookupError(null)
     setSelectedPresetId(presetId)
+    setSelectedPresetRevisionId(null)
     if (!presetId) {
-      setSelectedPresetRevisionId(null)
+      presetSelectionBusyRef.current = false
+      setPresetSelectionBusy(false)
       return
     }
-    const response = await fetch(
-      `/api/workflow-presets/${encodeURIComponent(presetId)}`,
-    )
-    if (!response.ok) return
-    const payload = await response.json() as {
-      preset: WorkflowPreset
-      revisions: WorkflowPresetRevision[]
+    presetSelectionBusyRef.current = true
+    setPresetSelectionBusy(true)
+    const isCurrentRequest = () =>
+      requestToken === presetLookupTokenRef.current &&
+      directionRef.current === requestDirection
+    try {
+      const response = await fetch(
+        `/api/workflow-presets/${encodeURIComponent(presetId)}`,
+      )
+      if (!response.ok) {
+        throw new Error(`workspace_preset_load_failed:${response.status}`)
+      }
+      const payload = await response.json() as {
+        preset: WorkflowPreset
+        revisions: WorkflowPresetRevision[]
+      }
+      const revision = payload.revisions.find(
+        (item) => item.revisionNo === payload.preset.currentRevisionNo,
+      )
+      if (!revision) throw new Error('workspace_preset_revision_unresolved')
+      if (!isCurrentRequest()) return
+      setSelectedPresetRevisionId(revision.id)
+      setTaskBrief(revision.contract.taskBriefTemplate)
+      setAllowedAgentVariantIds(revision.contract.agentVariantIds)
+      setReviewMode(revision.contract.reviewMode)
+      setMainEditorRunMode(
+        revision.contract.mainEditorRunMode ?? 'fixed_pipeline',
+      )
+      setConstraints({
+        ...DEFAULT_POETRY_CONSTRAINTS,
+        ...(revision.contract.constraints ?? {}),
+      })
+      updatePresetLookupError(null)
+    } catch (error: unknown) {
+      if (!isCurrentRequest()) return
+      setSelectedPresetId('')
+      setSelectedPresetRevisionId(null)
+      updatePresetLookupError(
+        error instanceof Error ? error.message : 'workspace_preset_load_failed',
+      )
+    } finally {
+      if (isCurrentRequest()) {
+        presetSelectionBusyRef.current = false
+        setPresetSelectionBusy(false)
+      }
     }
-    const revision = payload.revisions.find(
-      (item) => item.revisionNo === payload.preset.currentRevisionNo,
-    )
-    if (!revision) return
-    setSelectedPresetRevisionId(revision.id)
-    setTaskBrief(revision.contract.taskBriefTemplate)
-    setAllowedAgentVariantIds(revision.contract.agentVariantIds)
-    setReviewMode(revision.contract.reviewMode)
-    setConstraints({
-      ...DEFAULT_POETRY_CONSTRAINTS,
-      ...(revision.contract.constraints ?? {}),
-    })
+  }
+
+  const preflightFailureText = (code: string | null) => {
+    if (code === 'preflight_context_exceeded') {
+      return t('preflight.error.preflight_context_exceeded')
+    }
+    if (code === 'preflight_binding_missing') {
+      return t('preflight.error.preflight_binding_missing')
+    }
+    if (code === 'preflight_snapshot_upgrade_required') {
+      return t('preflight.error.preflight_snapshot_upgrade_required')
+    }
+    if (code === 'preflight_snapshot_changed') {
+      return t('preflight.error.preflight_snapshot_changed')
+    }
+    return t('preflight.error.unknown')
+  }
+
+  const preflightActionText = (action: string) => {
+    switch (action) {
+      case 'configure_context_window_and_output_limit':
+        return t('preflight.action.configure_context_window_and_output_limit')
+      case 'choose_model_with_larger_context_window':
+        return t('preflight.action.choose_model_with_larger_context_window')
+      case 'reduce_optional_project_context_or_candidate_count':
+        return t('preflight.action.reduce_optional_project_context_or_candidate_count')
+      case 'configure_required_stage_model_binding':
+        return t('preflight.action.configure_required_stage_model_binding')
+      case 'repair_missing_endpoint_binding':
+        return t('preflight.action.repair_missing_endpoint_binding')
+      case 'configure_at_least_two_candidate_agent_variants':
+        return t('preflight.action.configure_at_least_two_candidate_agent_variants')
+      case 'create_new_session_with_current_configuration':
+        return t('preflight.action.create_new_session_with_current_configuration')
+      case 'retry_session_preflight':
+        return t('preflight.action.retry_session_preflight')
+      default:
+        return t('preflight.action.inspect_preflight_failures')
+    }
+  }
+
+  const preflightAssumptionText = (
+    assumption: NonNullable<typeof preflight>['assumptions'][number],
+  ) => {
+    const values = {
+      role: assumption.bindingRole ?? '—',
+      value: formatNumber(Number(assumption.value)),
+    }
+    switch (assumption.code) {
+      case 'context_window_defaulted':
+        return t('preflight.assumption.context_window_defaulted', values)
+      case 'max_output_tokens_defaulted':
+        return t('preflight.assumption.max_output_tokens_defaulted', values)
+      case 'dynamic_team_all_variants_checked':
+        return t('preflight.assumption.dynamic_team_all_variants_checked', values)
+      default:
+        return t('preflight.assumption.candidate_output_reserved', values)
+    }
   }
 
   // ── 配置检测中 ────────────────────────────────────────────────
   if (configStatus === 'loading' || !draftLoaded) {
     return (
-      <Card overline="Source" title="原文" className={className}>
+      <Card overline={t('translate.source.overline')} title={t('translate.source.title')} className={className}>
         <div className="flex min-h-56 items-center justify-center text-ink-3">
           <Spinner size="lg" />
+        </div>
+      </Card>
+    )
+  }
+
+  if (draftLoadError) {
+    return (
+      <Card overline={t('translate.source.overline')} title={t('translate.source.title')} className={className}>
+        <div
+          role="alert"
+          data-testid={TID.translate.draftLoadError}
+          className="flex min-h-56 flex-col items-center justify-center gap-3 text-center"
+        >
+          <p className="text-sm font-medium text-ink">
+            {t('translate.draft.loadFailedTitle')}
+          </p>
+          <p className="max-w-md text-sm leading-6 text-ink-3">
+            {t('translate.draft.loadFailedDescription')}
+          </p>
+          <p className="font-mono text-xs text-ink-4">{draftLoadError}</p>
+          <Button
+            className="mt-2"
+            testId={TID.translate.draftLoadRetry}
+            onClick={() => setDraftLoadRevision((revision) => revision + 1)}
+          >
+            {t('translate.draft.retryLoad')}
+          </Button>
         </div>
       </Card>
     )
@@ -590,13 +940,13 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
   // ── 未配置端点 / Agent → 引导 CTA ─────────────────────────────
   if (configStatus === 'unconfigured') {
     return (
-      <Card overline="Get Started" title="先完成一次兼容性检查" className={className}>
+      <Card overline={t('translate.setup.overline')} title={t('translate.setup.title')} className={className}>
         <div className="flex min-h-56 flex-col items-center justify-center gap-3 text-center">
           <p className="max-w-md text-sm leading-6 text-ink-3">
-            兼容性医生会检查模型列表、普通响应、流式、Token 用量与工具调用，并生成一份属于你的可编辑工作流。
+            {t('translate.setup.description')}
           </p>
           <Button href="/config#compatibility-doctor" className="mt-2">
-            打开首次运行向导
+            {t('translate.setup.open')}
           </Button>
         </div>
       </Card>
@@ -606,8 +956,8 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
   // ── 翻译视图 ──────────────────────────────────────────────────
   return (
     <Card
-      overline="Source"
-      title="原文"
+      overline={t('translate.source.overline')}
+      title={t('translate.source.title')}
       className={className}
       actions={
         <span className="inline-flex items-center gap-1.5 rounded-xs border border-line-2 bg-paper px-2 py-1 text-[0.6875rem] font-medium leading-4 tracking-wide text-ink-2">
@@ -621,25 +971,68 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     >
       {recoverableDraft && (
         <div className="mb-3 rounded-sm border border-line-2 bg-paper px-3 py-2.5 text-sm text-ink-2">
-          <p className="font-medium text-ink">该方向有一份上次未提交的草稿</p>
+          <p className="font-medium text-ink">{t('translate.draft.found')}</p>
           <p className="mt-1 text-xs text-ink-3">
-            更新时间：{new Date(recoverableDraft.updatedAt).toLocaleString('zh-CN')}
+            {t('translate.draft.updatedAt', {
+              date: formatDate(recoverableDraft.updatedAt, {
+                dateStyle: 'medium',
+                timeStyle: 'short',
+              }),
+            })}
           </p>
           <div className="mt-2 flex gap-2">
-            <Button size="sm" variant="outline" onClick={restoreSavedDraft}>
-              恢复上次草稿
+            <Button
+              size="sm"
+              variant="outline"
+              testId={TID.translate.draftRestoreButton}
+              disabled={draftResolutionBusy}
+              onClick={restoreSavedDraft}
+            >
+              {t('translate.draft.restore')}
             </Button>
             <Button
               size="sm"
               variant="ghost"
-              onClick={() => {
-                setRecoverableDraft(null)
-                removeFreshMarker()
-              }}
+              testId={TID.translate.draftIgnoreButton}
+              disabled={draftResolutionBusy}
+              onClick={() => void ignoreSavedDraft()}
             >
-              忽略
+              {t('common.ignore')}
             </Button>
           </div>
+        </div>
+      )}
+      {draftSaveError && (
+        <div className="fixed bottom-5 right-5 z-[70] max-w-sm">
+          <Toast
+            role="alert"
+            tone="inverted"
+            testId={TID.translate.draftSaveError}
+            title={t('translate.draft.saveFailed')}
+            message={draftSaveError}
+            onClose={() => setDraftSaveError(null)}
+          />
+        </div>
+      )}
+      {presetLookupError && (
+        <div className="fixed bottom-5 left-5 z-[70] max-w-sm">
+          <Toast
+            role="alert"
+            tone="inverted"
+            testId={TID.translate.draftPresetLookupError}
+            title={t('translate.draft.presetLookupFailed')}
+            message={presetLookupError}
+            action={
+              <Button
+                size="sm"
+                variant="outline"
+                testId={TID.translate.draftPresetContinueWithout}
+                onClick={continueWithoutPreset}
+              >
+                {t('translate.draft.continueWithoutPreset')}
+              </Button>
+            }
+          />
         </div>
       )}
       <Textarea
@@ -647,34 +1040,37 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
         rows={9}
         value={source}
         onChange={(e) => setSource(e.target.value)}
-        disabled={busy || restoredSession}
-        placeholder="粘贴或输入待译原文……"
-        aria-label="原文输入"
+        disabled={draftInteractionLocked}
+        placeholder={t('translate.source.placeholder')}
+        aria-label={t('translate.source.aria')}
       />
 
-      <details className="mt-3 rounded-sm border border-line bg-paper/55">
+      <details
+        data-testid={TID.translate.requirementsDetails}
+        className="responsive-form mt-3 min-w-0 rounded-sm border border-line bg-paper/55"
+      >
         <summary className="cursor-pointer px-3 py-2 text-sm font-medium text-ink-2">
-          翻译要求与 Agent 范围
+          {t('translate.requirements.summary')}
         </summary>
-        <div className="space-y-4 border-t border-line px-3 py-3">
-          <div className="rounded-sm border border-line bg-paper/70 px-3 py-3">
+        <div className="min-w-0 space-y-4 border-t border-line px-3 py-3">
+          <div className="min-w-0 rounded-sm border border-line bg-paper/70 px-3 py-3">
             <label className="block text-xs font-medium text-ink-3">
-              项目档案
+              {t('translate.project.label')}
               <select
-                aria-label="项目档案"
+                aria-label={t('translate.project.label')}
                 value={selectedProjectId ?? ''}
-                disabled={busy || restoredSession}
+                disabled={draftInteractionLocked}
                 onChange={(event) => {
                   setSelectedProjectId(event.target.value || null)
                   setRestoredProjectState(null)
                 }}
                 className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-2 text-sm text-ink"
               >
-                <option value="">不使用项目档案</option>
+                <option value="">{t('translate.project.none')}</option>
                 {selectedProjectId &&
                   !projects.some((project) => project.id === selectedProjectId) && (
                     <option value={selectedProjectId}>
-                      {selectedProjectSummary?.name ?? '已冻结或不可用的项目'}
+                      {selectedProjectSummary?.name ?? t('translate.project.unavailable')}
                     </option>
                   )}
                 {projects.map((project) => (
@@ -686,7 +1082,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
               </select>
             </label>
             {projectSummaryLoading && (
-              <p className="mt-2 text-xs text-ink-4">正在读取项目快照…</p>
+              <p className="mt-2 text-xs text-ink-4">{t('translate.project.loading')}</p>
             )}
             {projectSummaryError && (
               <p className="mt-2 text-xs text-ink-3">
@@ -695,27 +1091,30 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
             )}
             {selectedProjectSummary && !projectSummaryLoading && (
               <p className="mt-2 text-xs leading-5 text-ink-2">
-                {selectedProjectSummary.name} · snapshot r
-                {selectedProjectSummary.snapshotRevisionNo ?? '—'} · 已批准资源{' '}
-                {selectedProjectSummary.approvedResourceCount} 条 · 预计约{' '}
-                {selectedProjectSummary.tokenEstimate.toLocaleString('zh-CN')} token
+                {t('translate.project.summary', {
+                  name: selectedProjectSummary.name,
+                  revision: selectedProjectSummary.snapshotRevisionNo ?? '—',
+                  count: formatNumber(selectedProjectSummary.approvedResourceCount),
+                  tokens: formatNumber(selectedProjectSummary.tokenEstimate),
+                })}
               </p>
             )}
             <p className="mt-2 text-xs leading-5 text-ink-4">
               {selectedProjectSummary?.frozen
-                ? '本会话已冻结创建时的项目快照；之后对项目的修改不会影响本会话。'
-                : '创建会话时会冻结当时的项目快照；之后修改项目不会影响本会话。'}
+                ? t('translate.project.frozen')
+                : t('translate.project.freezeOnCreate')}
             </p>
           </div>
           <label className="block text-xs font-medium text-ink-3">
-            当前预设
+            {t('translate.preset.label')}
             <select
+              data-testid={TID.translate.currentPreset}
               value={selectedPresetId}
-              disabled={busy || restoredSession}
+              disabled={draftInteractionLocked}
               onChange={(event) => void loadPreset(event.target.value)}
               className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-2 text-sm text-ink"
             >
-              <option value="">不使用预设（动态编队）</option>
+              <option value="">{t('translate.preset.none')}</option>
               {presets.map((preset) => (
                 <option key={preset.id} value={preset.id}>
                   {preset.name} · revision {preset.currentRevisionNo}
@@ -724,10 +1123,10 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
             </select>
           </label>
           <label className="block text-xs font-medium text-ink-3">
-            提示词包
+            {t('translate.promptBundle.label')}
             <select
               value={promptBundleRevisionId ?? ''}
-              disabled={busy || restoredSession}
+              disabled={draftInteractionLocked}
               onChange={(event) =>
                 setPromptBundleRevisionId(event.target.value || null)
               }
@@ -747,21 +1146,21 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
             rows={4}
             value={taskBrief}
             onChange={(event) => setTaskBrief(event.target.value)}
-            disabled={busy || restoredSession}
-            aria-label="翻译任务要求"
-            placeholder="说明翻译目标、文体、术语、结构及其他要求。内容将原样传给 Agent。"
+            disabled={draftInteractionLocked}
+            aria-label={t('translate.taskBrief.aria')}
+            placeholder={t('translate.taskBrief.placeholder')}
           />
-          <details className="rounded-sm border border-line bg-paper/70">
+          <details className="min-w-0 rounded-sm border border-line bg-paper/70">
             <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-ink-2">
-              诗歌形式与押韵
+              {t('translate.poetry.summary')}
             </summary>
-            <div className="space-y-3 border-t border-line px-3 py-3">
+            <div className="min-w-0 space-y-3 border-t border-line px-3 py-3">
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <label className="text-xs font-medium text-ink-3">
-                  诗歌专项
+                  {t('translate.poetry.mode')}
                   <select
                     value={constraints.poetryMode ?? 'auto'}
-                    disabled={busy || restoredSession}
+                    disabled={draftInteractionLocked}
                     onChange={(event) =>
                       setConstraints((current) => ({
                         ...current,
@@ -771,18 +1170,17 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
                     }
                     className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-1.5 text-sm text-ink"
                   >
-                    <option value="auto">自动识别</option>
-                    <option value="on">强制启用</option>
-                    <option value="off">关闭</option>
+                    <option value="auto">{t('translate.option.autoDetect')}</option>
+                    <option value="on">{t('translate.option.enable')}</option>
+                    <option value="off">{t('translate.option.off')}</option>
                   </select>
                 </label>
                 <label className="text-xs font-medium text-ink-3">
-                  目标诗体
+                  {t('translate.poetry.targetForm')}
                   <select
                     value={constraints.poetryTargetForm ?? 'preserve'}
                     disabled={
-                      busy ||
-                      restoredSession ||
+                      draftInteractionLocked ||
                       constraints.poetryMode === 'off'
                     }
                     onChange={(event) =>
@@ -794,21 +1192,20 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
                     }
                     className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-1.5 text-sm text-ink"
                   >
-                    <option value="preserve">尽量保留原体</option>
-                    <option value="free_verse">自由诗</option>
-                    <option value="classical">古体诗</option>
-                    <option value="regulated">近体诗</option>
-                    <option value="custom">自定义</option>
+                    <option value="preserve">{t('translate.poetry.form.preserve')}</option>
+                    <option value="free_verse">{t('translate.poetry.form.freeVerse')}</option>
+                    <option value="classical">{t('translate.poetry.form.classical')}</option>
+                    <option value="regulated">{t('translate.poetry.form.regulated')}</option>
+                    <option value="custom">{t('translate.option.custom')}</option>
                   </select>
                 </label>
                 {direction === 'en_to_zh' ? (
                   <label className="text-xs font-medium text-ink-3">
-                    中文韵部规则
+                    {t('translate.poetry.chineseRhyme')}
                     <select
                       value={constraints.chineseRhymeSystem ?? 'mandarin'}
                       disabled={
-                        busy ||
-                        restoredSession ||
+                        draftInteractionLocked ||
                         constraints.poetryMode === 'off'
                       }
                       onChange={(event) =>
@@ -820,19 +1217,18 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
                       }
                       className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-1.5 text-sm text-ink"
                     >
-                      <option value="mandarin">普通话〔默认〕</option>
-                      <option value="pingshui">平水韵</option>
-                      <option value="dual">双重校验</option>
+                      <option value="mandarin">{t('translate.poetry.rhyme.mandarin')}</option>
+                      <option value="pingshui">{t('translate.poetry.rhyme.pingshui')}</option>
+                      <option value="dual">{t('translate.poetry.rhyme.dual')}</option>
                     </select>
                   </label>
                 ) : (
                   <label className="text-xs font-medium text-ink-3">
-                    英文押韵强度
+                    {t('translate.poetry.englishRhyme')}
                     <select
                       value={constraints.englishRhymeMode ?? 'natural'}
                       disabled={
-                        busy ||
-                        restoredSession ||
+                        draftInteractionLocked ||
                         constraints.poetryMode === 'off'
                       }
                       onChange={(event) =>
@@ -844,20 +1240,19 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
                       }
                       className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-1.5 text-sm text-ink"
                     >
-                      <option value="natural">自然优先〔默认〕</option>
-                      <option value="near">允许近似韵</option>
-                      <option value="exact">严格同韵</option>
-                      <option value="none">不要求押韵</option>
+                      <option value="natural">{t('translate.poetry.english.natural')}</option>
+                      <option value="near">{t('translate.poetry.english.near')}</option>
+                      <option value="exact">{t('translate.poetry.english.exact')}</option>
+                      <option value="none">{t('translate.poetry.english.none')}</option>
                     </select>
                   </label>
                 )}
                 <label className="text-xs font-medium text-ink-3">
-                  韵位
+                  {t('translate.poetry.positions')}
                   <select
                     value={constraints.rhymePositions ?? 'auto'}
                     disabled={
-                      busy ||
-                      restoredSession ||
+                      draftInteractionLocked ||
                       constraints.poetryMode === 'off'
                     }
                     onChange={(event) =>
@@ -869,19 +1264,18 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
                     }
                     className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-1.5 text-sm text-ink"
                   >
-                    <option value="auto">自动规划</option>
-                    <option value="even_lines">偶数句</option>
-                    <option value="all_lines">句句押韵</option>
-                    <option value="custom">按下方韵式</option>
+                    <option value="auto">{t('translate.poetry.positions.auto')}</option>
+                    <option value="even_lines">{t('translate.poetry.positions.even')}</option>
+                    <option value="all_lines">{t('translate.poetry.positions.all')}</option>
+                    <option value="custom">{t('translate.poetry.positions.custom')}</option>
                   </select>
                 </label>
                 <label className="text-xs font-medium text-ink-3">
-                  首句入韵
+                  {t('translate.poetry.firstLine')}
                   <select
                     value={constraints.firstLineRhyme ?? 'auto'}
                     disabled={
-                      busy ||
-                      restoredSession ||
+                      draftInteractionLocked ||
                       constraints.poetryMode === 'off'
                     }
                     onChange={(event) =>
@@ -893,18 +1287,17 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
                     }
                     className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-1.5 text-sm text-ink"
                   >
-                    <option value="auto">自动</option>
-                    <option value="yes">是</option>
-                    <option value="no">否</option>
+                    <option value="auto">{t('translate.option.auto')}</option>
+                    <option value="yes">{t('translate.option.yes')}</option>
+                    <option value="no">{t('translate.option.no')}</option>
                   </select>
                 </label>
                 <label className="text-xs font-medium text-ink-3">
-                  换韵
+                  {t('translate.poetry.change')}
                   <select
                     value={constraints.rhymeChange ?? 'source'}
                     disabled={
-                      busy ||
-                      restoredSession ||
+                      draftInteractionLocked ||
                       constraints.poetryMode === 'off'
                     }
                     onChange={(event) =>
@@ -916,19 +1309,18 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
                     }
                     className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-1.5 text-sm text-ink"
                   >
-                    <option value="source">跟随原文</option>
-                    <option value="single">一韵到底</option>
-                    <option value="by_stanza">逐节转韵</option>
-                    <option value="custom">自定义</option>
+                    <option value="source">{t('translate.poetry.change.source')}</option>
+                    <option value="single">{t('translate.poetry.change.single')}</option>
+                    <option value="by_stanza">{t('translate.poetry.change.stanza')}</option>
+                    <option value="custom">{t('translate.option.custom')}</option>
                   </select>
                 </label>
                 <label className="text-xs font-medium text-ink-3">
-                  形式与语义
+                  {t('translate.poetry.priority')}
                   <select
                     value={constraints.poetryPriority ?? 'balanced'}
                     disabled={
-                      busy ||
-                      restoredSession ||
+                      draftInteractionLocked ||
                       constraints.poetryMode === 'off'
                     }
                     onChange={(event) =>
@@ -940,19 +1332,18 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
                     }
                     className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-1.5 text-sm text-ink"
                   >
-                    <option value="balanced">平衡〔默认〕</option>
-                    <option value="meaning">语义优先</option>
-                    <option value="form">形式优先</option>
+                    <option value="balanced">{t('translate.poetry.priority.balanced')}</option>
+                    <option value="meaning">{t('translate.poetry.priority.meaning')}</option>
+                    <option value="form">{t('translate.poetry.priority.form')}</option>
                   </select>
                 </label>
               </div>
               <label className="block text-xs font-medium text-ink-3">
-                自定义韵式
+                {t('translate.poetry.scheme')}
                 <input
                   value={constraints.rhymeScheme ?? ''}
                   disabled={
-                    busy ||
-                    restoredSession ||
+                    draftInteractionLocked ||
                     constraints.poetryMode === 'off'
                   }
                   onChange={(event) =>
@@ -961,30 +1352,29 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
                       rhymeScheme: event.target.value,
                     }))
                   }
-                  placeholder="例如 AAxAxAxA、ABAB 或逐节说明"
+                  placeholder={t('translate.poetry.scheme.placeholder')}
                   className="mt-1 block w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-1.5 text-sm text-ink"
                 />
               </label>
               <p className="text-xs leading-5 text-ink-4">
-                仅处理诗歌文本的诗行、韵位与节奏；暂不处理歌词的旋律适配、可唱性或音符级音节对齐。
+                {t('translate.poetry.scope')}
               </p>
             </div>
           </details>
           <div>
-            <p className="mb-2 text-xs font-medium text-ink-3">允许主 Agent 调用</p>
+            <p className="mb-2 text-xs font-medium text-ink-3">{t('translate.agents.allowed')}</p>
             <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
               {catalog.map((variant) => (
                 <label
                   key={variant.id}
-                  className="flex items-start gap-2 rounded-xs border border-line px-2 py-1.5 text-xs text-ink-2"
+                  className="flex min-w-0 items-start gap-2 rounded-xs border border-line px-2 py-1.5 text-xs text-ink-2"
                 >
                   <input
                     type="checkbox"
                     className="mt-0.5 accent-ink"
                     checked={allowedAgentVariantIds.includes(variant.id)}
                     disabled={
-                      busy ||
-                      restoredSession ||
+                      draftInteractionLocked ||
                       variant.archetypeId === 'cultural-context'
                     }
                     onChange={(event) =>
@@ -995,11 +1385,11 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
                       )
                     }
                   />
-                  <span>
+                  <span className="min-w-0">
                     <span className="block font-medium text-ink">{variant.catalogName}</span>
                     {variant.archetypeId === 'cultural-context' && (
                       <span className="mb-0.5 block text-[0.6875rem] text-pine">
-                        固定前置 · 双模型并行
+                        {t('translate.agents.fixedContext')}
                       </span>
                     )}
                     <span className="line-clamp-2 text-ink-3">
@@ -1014,21 +1404,76 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
                 catalog.find((variant) => variant.id === id)?.archetypeId !==
                 'cultural-context',
             ).length < 2 && (
-              <p className="mt-2 text-xs text-cinnabar">至少选择两个不同角色。</p>
+              <p className="mt-2 text-xs text-cinnabar">{t('translate.agents.minimum')}</p>
             )}
           </div>
-          <label className="flex items-center justify-between gap-3 text-sm text-ink-2">
-            审议方式
+          <label className="flex min-w-0 flex-col items-stretch gap-2 text-sm text-ink-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
+            {t('translate.reviewMode.label')}
             <select
               value={reviewMode}
-              disabled={busy || restoredSession}
+              disabled={draftInteractionLocked}
               onChange={(event) => setReviewMode(event.target.value as ReviewMode)}
-              className="rounded-sm border border-line-2 bg-paper-raise px-2 py-1.5 text-sm text-ink"
+              className="min-w-0 max-w-full rounded-sm border border-line-2 bg-paper-raise px-2 py-1.5 text-sm text-ink"
             >
-              <option value="main_editor">主 Agent 证据化成稿</option>
-              <option value="four_stage">经典四阶段</option>
+              <option value="main_editor">{t('translate.reviewMode.mainEditor')}</option>
+              <option value="four_stage">{t('translate.reviewMode.fourStage')}</option>
             </select>
           </label>
+          {reviewMode === 'main_editor' && (
+            <fieldset className="min-w-0 rounded-sm border border-line bg-paper/55 px-3 py-3">
+              <legend className="px-1 text-xs font-medium text-ink-3">
+                {t('translate.mainEditorRunMode.label')}
+              </legend>
+              <div className="grid gap-2 sm:grid-cols-2">
+                {([
+                  [
+                    'fixed_pipeline',
+                    'translate.mainEditorRunMode.fixed',
+                    'translate.mainEditorRunMode.fixedDescription',
+                  ],
+                  [
+                    'tool_enabled',
+                    'translate.mainEditorRunMode.tools',
+                    'translate.mainEditorRunMode.toolsDescription',
+                  ],
+                ] as const).map(([value, titleKey, descriptionKey]) => (
+                  <label
+                    key={value}
+                    className={[
+                      'flex min-w-0 cursor-pointer items-start gap-2 rounded-sm border px-3 py-2.5',
+                      mainEditorRunMode === value
+                        ? 'border-ink bg-paper-sink'
+                        : 'border-line bg-paper-raise',
+                      draftInteractionLocked ? 'cursor-not-allowed opacity-60' : '',
+                    ].join(' ')}
+                  >
+                    <input
+                      type="radio"
+                      name="main-editor-run-mode"
+                      value={value}
+                      data-testid={
+                        value === 'tool_enabled'
+                          ? TID.translate.mainEditorToolMode
+                          : TID.translate.mainEditorFixedMode
+                      }
+                      checked={mainEditorRunMode === value}
+                      disabled={draftInteractionLocked}
+                      onChange={() => setMainEditorRunMode(value)}
+                      className="mt-0.5 accent-ink"
+                    />
+                    <span className="min-w-0">
+                      <span className="block text-xs font-medium text-ink">
+                        {t(titleKey)}
+                      </span>
+                      <span className="mt-0.5 block text-xs leading-5 text-ink-4">
+                        {t(descriptionKey)}
+                      </span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+          )}
         </div>
       </details>
 
@@ -1040,23 +1485,87 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
             'text-ink-4',
           ].join(' ')}
         >
-          {charCount.toLocaleString('zh-CN')} 字 · 约 {tokenCount.toLocaleString('zh-CN')} tokens
-          {' '}· 仅估算；配置上下文上限后会在调用前校验
+          {t('translate.counts', {
+            characters: formatNumber(charCount),
+            tokens: formatNumber(tokenCount),
+          })}
         </p>
         <Button
           testId={TID.translate.translateButton}
           disabled={!canSubmit}
           onClick={handleTranslate}
         >
-          {busy ? (
+          {busy || submitPreparing ? (
             <>
-              <Spinner size="sm" /> 翻译中…
+              <Spinner size="sm" /> {t('translate.action.running')}
             </>
           ) : (
-            '开始翻译'
+            t('translate.action.start')
           )}
         </Button>
       </div>
+
+      {preflight && (
+        <details
+          className={[
+            'mt-3 rounded-sm border px-3 py-2.5',
+            preflight.status === 'blocked'
+              ? 'border-cinnabar/40 bg-cinnabar/5'
+              : 'border-pine/40 bg-pine/5',
+          ].join(' ')}
+          open={preflight.status === 'blocked' ? true : undefined}
+        >
+          <summary
+            className="cursor-pointer text-sm font-medium text-ink"
+          >
+            {preflight.status === 'blocked'
+              ? t('preflight.blocked')
+              : t('preflight.pass')}
+          </summary>
+          <div className="mt-2 space-y-3 border-t border-line pt-2 text-xs leading-5 text-ink-2">
+            {preflight.status === 'blocked' && (
+              <div role="alert">
+                <p className="font-medium text-cinnabar">
+                  {preflightFailureText(
+                    preflightErrorCode ?? preflight.failures[0]?.code ?? null,
+                  )}
+                </p>
+                <ul className="mt-1 list-disc space-y-1 pl-5">
+                  {Array.from(new Set([
+                    ...preflightActions,
+                    ...preflight.failures.flatMap((failure) => failure.actions),
+                  ])).map((action) => (
+                    <li key={action}>{preflightActionText(action)}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            <p className="font-medium text-ink-3">{t('preflight.details')}</p>
+            {preflight.assumptions.length > 0 && (
+              <ul className="list-disc space-y-1 pl-5">
+                {preflight.assumptions.map((assumption, index) => (
+                  <li key={`${assumption.code}-${assumption.bindingRole}-${index}`}>
+                    {preflightAssumptionText(assumption)}
+                  </li>
+                ))}
+              </ul>
+            )}
+            <ul className="space-y-1 font-mono text-[0.6875rem] text-ink-3">
+              {preflight.stages.map((stage) => (
+                <li key={`${stage.stage}-${stage.bindingRole}-${stage.model}`}>
+                  {t('preflight.stage', {
+                    stage: stage.stage,
+                    model: stage.model,
+                    used: formatNumber(stage.totalReservedTokens),
+                    limit: formatNumber(stage.contextWindowTokens),
+                    calls: formatNumber(stage.callsWorstCase),
+                  })}
+                </li>
+              ))}
+            </ul>
+          </div>
+        </details>
+      )}
 
       {/* 汇总条：fanout_complete 后常驻；计数由卡片态派生，重试后自动修正 */}
       {summary && (
@@ -1070,16 +1579,18 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
           ].join(' ')}
         >
           <span className="tabular-nums">
-            <span className="font-medium text-pine">成功 {summary.succeeded}</span>
+            <span className="font-medium text-pine">
+              {t('translate.summary.success', { count: summary.succeeded })}
+            </span>
             <span className="mx-1.5 text-ink-4">/</span>
             <span className={summary.failed > 0 ? 'font-medium text-cinnabar' : 'text-ink-3'}>
-              失败 {summary.failed}
+              {t('translate.summary.failed', { count: summary.failed })}
             </span>
           </span>
           {allComplete ? (
-            <span className="text-xs text-pine">全部完成，可进入统筹 →</span>
+            <span className="text-xs text-pine">{t('translate.summary.complete')}</span>
           ) : (
-            summary.failed > 0 && <span className="text-xs text-ink-3">失败卡片可单独重试</span>
+            summary.failed > 0 && <span className="text-xs text-ink-3">{t('translate.summary.retryHint')}</span>
           )}
         </div>
       )}
@@ -1087,8 +1598,10 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
       {translationCards.length > 0 && (
         <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-y border-line py-2">
           <p className="text-xs font-medium text-ink-2">
-            候选译文 · 成功 {translationCards.filter((card) => card.status === 'complete').length}
-            {' · '}失败 {translationCards.filter((card) => card.status === 'error').length}
+            {t('translate.candidates.summary', {
+              success: translationCards.filter((card) => card.status === 'complete').length,
+              failed: translationCards.filter((card) => card.status === 'error').length,
+            })}
           </p>
           <div className="flex gap-1.5">
             <Button
@@ -1096,7 +1609,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
               variant="ghost"
               onClick={() => setTimelineOpen(true)}
             >
-              查看调用时间线
+              {t('translate.timeline.open')}
             </Button>
             <Button
               size="sm"
@@ -1106,7 +1619,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
               }
               onClick={() => setRetryAllOpen(true)}
             >
-              重试全部失败项
+              {t('translate.retryAll.open')}
             </Button>
           </div>
         </div>
@@ -1116,9 +1629,9 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
         <section className="mt-4">
           <div className="mb-2 flex items-center justify-between gap-2">
             <p className="text-xs font-medium text-ink-2">
-              前置意象分析 · {contextAnalysisCards.length} 个独立模型
+              {t('translate.context.title', { count: contextAnalysisCards.length })}
             </p>
-            <span className="text-xs text-ink-4">完整分析将传给后续 Agent</span>
+            <span className="text-xs text-ink-4">{t('translate.context.hint')}</span>
           </div>
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
             {contextAnalysisCards.map((card, index) => (
@@ -1139,10 +1652,10 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
         <section className="mt-4">
           <div className="mb-2 flex items-center justify-between gap-2">
             <p className="text-xs font-medium text-ink-2">
-              诗体与韵律专项规划
+              {t('translate.poetryPlan.title')}
             </p>
             <span className="text-xs text-ink-4">
-              仅在诗歌任务中启用，不包含歌词旋律适配
+              {t('translate.poetryPlan.hint')}
             </span>
           </div>
           <div className="grid grid-cols-1 gap-4">
@@ -1175,24 +1688,32 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
         </div>
       ) : (
         <div className={`mt-4 ${emptyBox}`}>
-          {phase === 'creating' ? '正在创建会话…' : '各翻译 Agent 的流式输出将在此并列显示'}
+          {phase === 'creating'
+            ? t('translate.empty.creating')
+            : t('translate.empty.waiting')}
         </div>
       )}
 
       {/* 全局错误通知（会话创建失败 / 管道级错误） */}
       {globalError && (
         <div className="fixed bottom-5 right-5 z-50">
-          <Toast tone="inverted" title="翻译出错" message={globalError} onClose={dismissError} />
+          <Toast
+            role="alert"
+            tone="inverted"
+            title={t('translate.error.title')}
+            message={globalError}
+            onClose={dismissError}
+          />
         </div>
       )}
       <Modal
         open={retryAllOpen}
         onClose={() => setRetryAllOpen(false)}
-        title="重试全部失败项"
+        title={t('translate.retryAll.title')}
         footer={
           <>
             <Button variant="ghost" size="sm" onClick={() => setRetryAllOpen(false)}>
-              取消
+              {t('common.cancel')}
             </Button>
             <Button
               variant="outline"
@@ -1202,7 +1723,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
                 void retryAll('frozen')
               }}
             >
-              按会话冻结配置重试
+              {t('translate.retryAll.frozen')}
             </Button>
             <Button
               size="sm"
@@ -1212,23 +1733,24 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
                 void retryAll('current')
               }}
             >
-              使用当前配置重试
+              {t('translate.retryAll.current')}
             </Button>
           </>
         }
       >
         <p className="text-sm leading-6 text-ink-2">
-          将重试 {cards.filter((card) => card.status === 'error').length} 个失败 Agent。
-          使用当前配置时，会采用当前端点、模型、Agent 和提示词版本。
+          {t('translate.retryAll.description', {
+            count: cards.filter((card) => card.status === 'error').length,
+          })}
         </p>
       </Modal>
       <Modal
         open={timelineOpen}
         onClose={() => setTimelineOpen(false)}
-        title="Agent 调用时间线"
+        title={t('translate.timeline.title')}
         footer={
           <Button size="sm" onClick={() => setTimelineOpen(false)}>
-            关闭
+            {t('common.close')}
           </Button>
         }
       >
@@ -1238,7 +1760,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
               <span className="font-medium text-ink">{card.name}</span>
               {' · '}{card.model}{' · '}{card.status}
               {(card.attempts?.length ?? 0) > 1
-                ? ` · ${card.attempts!.length} 次尝试`
+                ? t('translate.timeline.attempts', { count: card.attempts!.length })
                 : ''}
             </li>
           ))}

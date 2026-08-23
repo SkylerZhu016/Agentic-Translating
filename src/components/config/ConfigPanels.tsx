@@ -17,8 +17,10 @@ import { WorkflowPresetPanel } from './WorkflowPresetPanel'
 import { PromptBundlePanel } from './PromptBundlePanel'
 import { OnboardingDoctor } from './OnboardingDoctor'
 import { ProjectMemoryPanel } from './ProjectMemoryPanel'
+import { useI18n } from '@/src/i18n'
 
 export function ConfigPanels() {
+  const { t } = useI18n()
   const [loading, setLoading] = useState(true)
   const [endpointError, setEndpointError] = useState<string | null>(null)
   const [endpoints, setEndpoints] = useState<Endpoint[]>([])
@@ -32,10 +34,10 @@ export function ConfigPanels() {
         configApi.listAgents(),
     ])
     if (epResult.status === 'fulfilled') setEndpoints(epResult.value)
-    else setEndpointError('端点列表加载失败；其他配置区域仍可使用。')
+    else setEndpointError(t('config.endpointRegion.loadError'))
     if (agentResult.status === 'fulfilled') setAgents(agentResult.value)
     setLoading(false)
-  }, [])
+  }, [t])
 
   useEffect(() => {
     void loadAll()
@@ -51,15 +53,20 @@ export function ConfigPanels() {
   return (
     <div className="mx-auto max-w-7xl px-4 py-6 sm:px-6">
       <PageHeader
-        overline="Settings"
-        title="配置"
-        description="管理模型端点、Agent 阵容与工作流。配置和历史保存在本机；使用远程模型时，任务内容会发送至所选端点。"
+        overline={t('config.overline')}
+        title={t('config.title')}
+        description={t('config.description')}
       />
 
       {loading ? (
-        <div className="mx-auto grid max-w-3xl grid-cols-1 gap-5" aria-label="加载中">
-          {(['端点', '翻译 Agent', '统筹', '提示词'] as const).map((t) => (
-            <Card key={t} title={t}>
+        <div className="mx-auto grid max-w-3xl grid-cols-1 gap-5" aria-label={t('config.loading')}>
+          {([
+            t('config.section.endpoints'),
+            t('config.section.agents'),
+            t('config.section.coordinator'),
+            t('config.section.prompts'),
+          ] as const).map((title) => (
+            <Card key={title} title={title}>
               <div className="space-y-3">
                 <Skeleton className="h-4 w-1/3" />
                 <Skeleton className="h-9 w-full" />
@@ -76,10 +83,10 @@ export function ConfigPanels() {
           <AgentLibraryPanel notify={push} />
           <WorkflowPresetPanel endpoints={endpoints} notify={push} />
           {endpointError && (
-            <Card title="端点区域暂不可用">
+            <Card title={t('config.endpointRegion.unavailable')}>
               <p className="text-sm leading-6 text-ink-2">{endpointError}</p>
               <Button size="sm" className="mt-3" onClick={() => void loadAll()}>
-                重试端点加载
+                {t('config.endpointRegion.retry')}
               </Button>
             </Card>
           )}

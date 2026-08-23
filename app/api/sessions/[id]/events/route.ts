@@ -4,6 +4,7 @@ export const dynamic = 'force-dynamic'
 import { getDb } from '@/src/lib/db'
 import { migrate } from '@/src/lib/db/migrate'
 import { encodeSSE } from '@/src/lib/contracts/sse'
+import { redactCredentialValueForDb } from '@/src/lib/security/credential-redaction'
 
 interface EventRow {
   id: number
@@ -42,7 +43,10 @@ export async function GET(
             encoder.encode(
               `id: ${row.id}\n${encodeSSE(row.event_type, {
                 seq: row.seq,
-                ...JSON.parse(row.payload_json),
+                ...redactCredentialValueForDb(
+                  db,
+                  JSON.parse(row.payload_json),
+                ),
               })}`,
             ),
           )

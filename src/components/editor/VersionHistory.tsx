@@ -10,6 +10,7 @@ import { useState } from 'react'
 import { TID } from '@/src/lib/testids'
 import { Badge, Button, Modal, Spinner } from '@/src/components/ui'
 import { truncate, type FinalVersion } from './types'
+import { useI18n } from '@/src/i18n/LocaleProvider'
 
 export interface VersionHistoryProps {
   versions: FinalVersion[]
@@ -18,20 +19,16 @@ export interface VersionHistoryProps {
   onRestore: (versionNo: number) => Promise<void>
 }
 
-const SOURCE_META: Record<FinalVersion['source'], { label: string; variant: 'solid' | 'outline' | 'subtle' }> = {
-  assemble: { label: '组装', variant: 'solid' },
-  main_draft: { label: '主成稿', variant: 'solid' },
-  edit: { label: '编辑', variant: 'outline' },
-  restore: { label: '恢复', variant: 'subtle' },
-  revert: { label: '撤销', variant: 'subtle' },
-}
-
-function formatTime(createdAt: string): string {
-  // SQLite datetime('now') → "YYYY-MM-DD HH:MM:SS"，取 "MM-DD HH:MM"
-  return createdAt.length >= 16 ? createdAt.slice(5, 16) : createdAt
+const SOURCE_VARIANT: Record<FinalVersion['source'], 'solid' | 'outline' | 'subtle'> = {
+  assemble: 'solid',
+  main_draft: 'solid',
+  edit: 'outline',
+  restore: 'subtle',
+  revert: 'subtle',
 }
 
 export function VersionHistory({ versions, currentVersionNo, onRestore }: VersionHistoryProps) {
+  const { t, formatDate } = useI18n()
   const [pending, setPending] = useState<FinalVersion | null>(null)
   const [restoring, setRestoring] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -46,7 +43,7 @@ export function VersionHistory({ versions, currentVersionNo, onRestore }: Versio
       await onRestore(pending.version_no)
       setPending(null)
     } catch (err) {
-      setError(err instanceof Error ? err.message : '恢复失败，请重试')
+      setError(err instanceof Error ? err.message : t('versions.error.restore'))
     } finally {
       setRestoring(false)
     }
@@ -56,13 +53,21 @@ export function VersionHistory({ versions, currentVersionNo, onRestore }: Versio
     <div data-testid={TID.edit.versionHistory}>
       {ordered.length === 0 ? (
         <p className="px-5 py-6 text-center text-sm leading-6 text-ink-4">
-          尚无版本——组装完成后，每次修改与恢复都会在此留痕
+          {t('versions.empty')}
         </p>
       ) : (
         <ol className="max-h-72 divide-y divide-line overflow-y-auto">
           {ordered.map((version) => {
             const isCurrent = version.version_no === currentVersionNo
-            const meta = SOURCE_META[version.source]
+            const sourceLabel = version.source === 'assemble'
+              ? t('version.source.assemble')
+              : version.source === 'main_draft'
+                ? t('version.source.mainDraft')
+                : version.source === 'edit'
+                  ? t('version.source.edit')
+                  : version.source === 'revert'
+                    ? t('version.source.revert')
+                    : t('version.source.restore')
             return (
               <li key={version.version_no}>
                 <button
@@ -75,7 +80,9 @@ export function VersionHistory({ versions, currentVersionNo, onRestore }: Versio
                     setError(null)
                     setPending(version)
                   }}
-                  title={isCurrent ? '当前版本' : `恢复到 v${version.version_no}`}
+                  title={isCurrent
+                    ? t('versions.currentTitle')
+                    : t('versions.restoreTitle', { version: version.version_no })}
                   className={[
                     'flex w-full items-start gap-3 px-5 py-2.5 text-left transition-colors duration-150',
                     isCurrent
@@ -87,12 +94,17 @@ export function VersionHistory({ versions, currentVersionNo, onRestore }: Versio
                   <span className="min-w-0 flex-1">
                     <span className="flex items-center gap-2">
                       <span className="font-serif text-sm font-medium text-ink">v{version.version_no}</span>
-                      <Badge variant={meta.variant}>{meta.label}</Badge>
+                      <Badge variant={SOURCE_VARIANT[version.source]}>{sourceLabel}</Badge>
                       {isCurrent && (
-                        <span className="text-[0.6875rem] font-medium tracking-wide text-ink-3">当前</span>
+                        <span className="text-[0.6875rem] font-medium tracking-wide text-ink-3">{t('versions.current')}</span>
                       )}
                       <span className="ml-auto shrink-0 text-[0.6875rem] tabular-nums text-ink-4">
-                        {formatTime(version.created_at)}
+                        {formatDate(
+                          version.created_at.includes('T')
+                            ? version.created_at
+                            : `${version.created_at.replace(' ', 'T')}Z`,
+                          { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' },
+                        )}
                       </span>
                     </span>
                     <span className="mt-0.5 block truncate text-xs leading-5 text-ink-3">
@@ -111,14 +123,14 @@ export function VersionHistory({ versions, currentVersionNo, onRestore }: Versio
         onClose={() => {
           if (!restoring) setPending(null)
         }}
-        title={pending ? `恢复到 v${pending.version_no}` : undefined}
+        title={pending ? t('versions.restoreTitle', { version: pending.version_no }) : undefined}
         footer={
           <>
             <Button variant="ghost" size="sm" onClick={() => setPending(null)} disabled={restoring}>
-              取消
+              {t('common.cancel')}
             </Button>
             <Button size="sm" onClick={confirmRestore} disabled={restoring}>
-              {restoring ? <Spinner size="sm" /> : '确认恢复'}
+              {restoring ? <Spinner size="sm" /> : t('versions.restoreConfirm')}
             </Button>
           </>
         }
@@ -126,12 +138,12 @@ export function VersionHistory({ versions, currentVersionNo, onRestore }: Versio
         {pending && (
           <div>
             <p className="text-sm leading-6 text-ink-2">
-              全文将回到 v{pending.version_no} 的内容；当前版本不会丢失——恢复会作为新版本追加到历史。
+              {t('versions.restoreDescription', { version: pending.version_no })}
             </p>
             <blockquote className="mt-3 max-h-32 overflow-y-auto rounded-sm border border-line bg-paper px-3 py-2 poem-text-sm text-ink-3">
               {truncate(pending.text, 120)}
             </blockquote>
-            {error && <p className="mt-2 text-xs leading-5 text-cinnabar">{error}</p>}
+            {error && <p role="alert" className="mt-2 text-xs leading-5 text-cinnabar">{error}</p>}
           </div>
         )}
       </Modal>

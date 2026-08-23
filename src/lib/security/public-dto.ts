@@ -1,4 +1,5 @@
 import type { EndpointRow, SessionRow } from '../db/repositories'
+import { redactCredentialText } from './credential-redaction'
 
 export interface PublicEndpointDto {
   id: number
@@ -27,13 +28,23 @@ export function toPublicEndpointDto(endpoint: EndpointRow): PublicEndpointDto {
 
 /** Recursively remove secrets from browser and export payloads. */
 export function redactSecrets<T>(value: T): T {
+  if (typeof value === 'string') {
+    return redactCredentialText(value) as T
+  }
   if (Array.isArray(value)) {
     return value.map((item) => redactSecrets(item)) as T
   }
   if (value && typeof value === 'object') {
     const output: Record<string, unknown> = {}
     for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-      if (key === 'api_key' || key === 'apiKey') continue
+      const normalizedKey = key.toLowerCase().replace(/[_-]/g, '')
+      if (
+        (normalizedKey.endsWith('apikey') && normalizedKey !== 'hasapikey') ||
+        normalizedKey === 'authorization' ||
+        normalizedKey === 'token' || normalizedKey.endsWith('token') ||
+        normalizedKey === 'secret' || normalizedKey.endsWith('secret') ||
+        normalizedKey === 'credential' || normalizedKey.endsWith('credential')
+      ) continue
       output[key] = redactSecrets(child)
     }
     return output as T

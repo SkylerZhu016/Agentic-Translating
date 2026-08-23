@@ -9,12 +9,24 @@ describe('public DTO secret redaction', () => {
     const input = {
       api_key: 'root-secret',
       endpoints: [
-        { name: 'one', apiKey: 'nested-secret', hasApiKey: true },
+        {
+          name: 'one',
+          apiKey: 'nested-secret',
+          hasApiKey: true,
+          headers: {
+            Authorization: 'arbitrary-bearer-secret',
+            'X-Api-Key': 'opaque-old-key-not-in-endpoints',
+            refresh_token: 'opaque-old-refresh-token',
+          },
+        },
       ],
     }
     const output = redactSecrets(input)
     expect(JSON.stringify(output)).not.toContain('root-secret')
     expect(JSON.stringify(output)).not.toContain('nested-secret')
+    expect(JSON.stringify(output)).not.toContain('arbitrary-bearer-secret')
+    expect(JSON.stringify(output)).not.toContain('opaque-old-key-not-in-endpoints')
+    expect(JSON.stringify(output)).not.toContain('opaque-old-refresh-token')
     expect(output.endpoints[0].hasApiKey).toBe(true)
   })
 

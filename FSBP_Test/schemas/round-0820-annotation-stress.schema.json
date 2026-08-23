@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentic-translating.local/schemas/round-0820-annotation-stress.schema.json",
+  "title": "Round 0820 Naturally Occurring Annotation Stress Sample",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "direction",
+    "category",
+    "sourceText",
+    "taskBrief",
+    "sourceRunId",
+    "upstream",
+    "targetedError",
+    "errorEvidence",
+    "annotationInfluence",
+    "confirmationStatus",
+    "contentHash"
+  ],
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+    "direction": { "enum": ["en_to_zh", "zh_to_en"] },
+    "category": { "enum": ["poetry", "literary", "cultural_argument", "nonliterary"] },
+    "sourceText": { "type": "string", "minLength": 1 },
+    "contextBefore": { "type": "string" },
+    "contextAfter": { "type": "string" },
+    "taskBrief": { "type": "string", "minLength": 1 },
+    "sourceRunId": { "type": "string", "minLength": 1 },
+    "upstream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["invocationId", "model", "raw", "body", "annotation"],
+      "properties": {
+        "invocationId": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "raw": { "type": "string", "minLength": 1 },
+        "body": { "type": "string", "minLength": 1 },
+        "annotation": { "type": "string", "minLength": 1 },
+        "generatorCommit": { "type": "string", "pattern": "^[a-f0-9]{40}$" }
+      }
+    },
+    "targetedError": { "type": "string", "minLength": 1 },
+    "errorEvidence": { "type": "string", "minLength": 1 },
+    "annotationInfluence": { "type": "string", "minLength": 1 },
+    "confirmationStatus": { "enum": ["pending_human", "human_confirmed", "human_rejected"] },
+    "contentHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "retrievalSnapshot": { "type": ["object", "null"] }
+  }
+}

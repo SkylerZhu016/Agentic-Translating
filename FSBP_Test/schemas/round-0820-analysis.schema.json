@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentic-translating.local/schemas/round-0820-analysis.schema.json",
+  "title": "Round 0820 Deterministic Analysis Output",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schemaVersion",
+    "roundId",
+    "namespace",
+    "runId",
+    "freezeManifestSha256",
+    "sourceEligibility",
+    "resultEligibility",
+    "bootstrap",
+    "engineering",
+    "humanState",
+    "status",
+    "decodePerformed",
+    "missingHuman",
+    "quality",
+    "isolation",
+    "inputFingerprint"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "1.0.0" },
+    "roundId": { "const": "round-0820" },
+    "namespace": { "const": "fsbp" },
+    "runId": { "type": "string", "minLength": 1 },
+    "freezeManifestSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "status": {
+      "enum": [
+        "automatic_only",
+        "development_automatic_only",
+        "complete",
+        "development_complete",
+        "no_eligible_items"
+      ]
+    },
+    "sourceEligibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "formalEligible", "clean", "determinism"],
+      "properties": {
+        "mode": { "type": ["string", "null"] },
+        "formalEligible": { "type": "boolean" },
+        "clean": { "type": "boolean" },
+        "determinism": { "type": ["string", "null"] }
+      }
+    },
+    "resultEligibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requestedMode",
+        "sourceFormalEligible",
+        "coverageComplete",
+        "recognizedBindings",
+        "packageCredentialsVerified",
+        "formalOutputEligible",
+        "developmentOutputEligible"
+      ],
+      "properties": {
+        "requestedMode": { "enum": ["formal", "development_override"] },
+        "sourceFormalEligible": { "type": "boolean" },
+        "coverageComplete": { "type": "boolean" },
+        "recognizedBindings": { "type": "boolean" },
+        "packageCredentialsVerified": { "type": "boolean" },
+        "formalOutputEligible": { "type": "boolean" },
+        "developmentOutputEligible": { "type": "boolean" }
+      }
+    },
+    "decodePerformed": { "type": "boolean" },
+    "missingHuman": { "type": "array", "items": { "type": "string" } },
+    "bootstrap": {
+      "type": "object",
+      "required": ["method", "confidenceLevel", "iterations"],
+      "properties": {
+        "method": { "const": "paired_nonparametric_percentile" },
+        "confidenceLevel": { "const": 0.95 },
+        "iterations": { "type": "integer", "minimum": 100 }
+      }
+    },
+    "engineering": { "type": "object" },
+    "humanState": { "type": "object" },
+    "quality": {
+      "type": "object",
+      "properties": {
+        "summaries": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "weightedTotal": { "$ref": "#/$defs/weightedTotalWithRange" }
+            }
+          }
+        },
+        "comparisons": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "weightedTotal": { "$ref": "#/$defs/weightedTotalWithRange" }
+            }
+          }
+        }
+      }
+    },
+    "isolation": { "type": "object" },
+    "inputFingerprint": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+  },
+  "$defs": {
+    "weightedTotalRange": {
+      "type": "array",
+      "prefixItems": [{ "const": 10 }, { "const": 100 }],
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "weightedTotalWithRange": {
+      "type": "object",
+      "required": ["range"],
+      "properties": {
+        "range": { "$ref": "#/$defs/weightedTotalRange" }
+      }
+    }
+  }
+}

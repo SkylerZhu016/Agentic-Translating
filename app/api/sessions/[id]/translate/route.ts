@@ -28,6 +28,18 @@ import {
   serializeExecutionDiagnosticError,
   type ExecutionDiagnosticErrorDto,
 } from '@/src/lib/security/diagnostic-error';
+import {
+  createPreflightedLlmCaller,
+  ensureStoredSessionPreflight,
+  resolvePreflightOutputLimit,
+  sessionPreflightErrorDto,
+  type PhysicalPaidCallIdentity,
+} from '@/src/lib/services/session-preflight';
+import {
+  currentRuntimeEndpoint,
+  resolveRuntimeEndpoint,
+  runtimeEndpointCredentialErrorDto,
+} from '@/src/lib/services/runtime-endpoint-credentials';
 
 export async function POST(
   request: Request,
@@ -57,7 +69,18 @@ export async function POST(
   }
 
   // ── Guard: snapshot agents ≥ 1 ────────────────────────────────
-  const config: ConfigSnapshot = service.snapshotConfig(session.config_snapshot);
+  let config: ConfigSnapshot;
+  try {
+    config = ensureStoredSessionPreflight(db, session) as unknown as ConfigSnapshot;
+  } catch (error) {
+    const preflightError = sessionPreflightErrorDto(error);
+    if (preflightError) {
+      return Response.json(preflightError.body, {
+        status: preflightError.status,
+      });
+    }
+    throw error;
+  }
   const boundAgents = (config.agents ?? []).filter(
     (agent): agent is typeof agent & { endpoint_id: number } =>
       agent.endpoint_id !== null,
@@ -79,20 +102,15 @@ export async function POST(
 
   // ── Build AgentRuntime array ──────────────────────────────────
   const defaultTemplate = config.prompts.translator ?? '';
-  const endpointById = new Map(
-    (config.endpoints ?? (config.endpoint ? [config.endpoint] : [])).map(
-      (endpoint) => [endpoint.id, endpoint],
-    ),
-  );
-
-  const agents: AgentRuntime[] = boundAgents.map((agent) => {
-    const endpointConfig =
-      endpointById.get(agent.endpoint_id) ?? config.endpoint;
-    if (!endpointConfig) {
-      throw new Error(
-        `Endpoint ${agent.endpoint_id} for agent "${agent.name}" is missing from the session snapshot`,
-      );
-    }
+  const preflightByMessages = new WeakMap<object, PhysicalPaidCallIdentity>();
+  let agents: AgentRuntime[];
+  try {
+    agents = boundAgents.map((agent) => {
+    const variant = config.agentVariantSnapshots?.find(
+      (candidate) =>
+        candidate.id === agent.name || candidate.catalogName === agent.name,
+    );
+    const endpointConfig = resolveRuntimeEndpoint(db, config, agent.endpoint_id);
     const template = resolveTranslatorPrompt(
       { prompt_override: agent.prompt_override },
       defaultTemplate,
@@ -103,22 +121,87 @@ export async function POST(
       source_text: session.source_text,
     });
 
-    return {
+    const bindingRole = variant ? `worker:${variant.id}` : `worker:${agent.name}`;
+    const maxTokens = resolvePreflightOutputLimit(
+      config.preflight!,
+      {
+        stage: 'candidate_generation',
+        bindingRole,
+        endpointId: endpointConfig.id,
+        model: agent.model,
+        fallbackOutputTokens:
+          config.modelBindings?.defaultWorker.maxOutputTokens,
+      },
+    );
+    const frozenStage = config.preflight!.stages.find(
+      (stage) =>
+        stage.stage === 'candidate_generation' &&
+        stage.bindingRole === bindingRole &&
+        stage.endpointId === endpointConfig.id &&
+        stage.model === agent.model,
+    );
+    const runtime: AgentRuntime = {
       agentKey: agent.name,
       name: agent.name,
       endpoint: {
-        baseUrl: endpointConfig.base_url,
-        chatCompletionsPath:
-          endpointConfig.chat_completions_path ?? '/v1/chat/completions',
-        apiKey: endpointConfig.api_key,
+        baseUrl: endpointConfig.baseUrl,
+        chatCompletionsPath: endpointConfig.chatCompletionsPath,
+        apiKey: endpointConfig.apiKey,
       },
       model: agent.model,
+      maxTokens,
       messages: [
         { role: system.role, content: system.content },
         { role: user.role, content: user.content },
       ],
     };
-  });
+    preflightByMessages.set(runtime.messages, {
+      attemptKey: `translate:${agent.name}`,
+      stage: 'candidate_generation',
+      bindingRole,
+      endpointId: endpointConfig.id,
+      model: agent.model,
+      contextWindow:
+        frozenStage?.contextWindowTokens ?? endpointConfig.contextWindow,
+      maxOutputTokens: maxTokens,
+    });
+      return runtime;
+    });
+  } catch (error) {
+    const credentialError = runtimeEndpointCredentialErrorDto(error);
+    if (credentialError) {
+      return Response.json(credentialError.body, {
+        status: credentialError.status,
+      });
+    }
+    throw error;
+  }
+  const preflightedChatCompletion = createPreflightedLlmCaller(
+    (endpoint, llmRequest) => {
+      const identity = preflightByMessages.get(llmRequest.messages);
+      if (!identity) {
+        throw new Error('Physical preflight identity is unavailable for fanout call.');
+      }
+      if (identity.endpointId == null) {
+        throw new Error('Physical call endpoint identity is unavailable.');
+      }
+      return chatCompletion(
+        {
+          ...endpoint,
+          resolveRuntimeEndpoint: () =>
+            currentRuntimeEndpoint(db, identity.endpointId!),
+        },
+        llmRequest,
+      );
+    },
+    (_endpoint, llmRequest) => {
+      const identity = preflightByMessages.get(llmRequest.messages);
+      if (!identity) {
+        throw new Error('Physical preflight identity is unavailable for fanout call.');
+      }
+      return identity;
+    },
+  );
 
   // ── Transition to translating (if draft) ──────────────────────
   try {
@@ -229,7 +312,7 @@ export async function POST(
       };
 
       try {
-        const summary = await runFanOut(agents, callbacks, chatCompletion, {
+        const summary = await runFanOut(agents, callbacks, preflightedChatCompletion, {
           signal: controller.signal,
           sessionId: id,
         });

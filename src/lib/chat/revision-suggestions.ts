@@ -8,7 +8,16 @@ import {
   type BestEffortLlmCallContext,
 } from '../services/llm-call-ledger'
 
-export const REVISION_SUGGESTION_MAX_TOKENS = 131_072
+export type RevisionSuggestionOperation =
+  | 'chat_revision_suggestion_target_reader'
+  | 'chat_revision_suggestion_bilingual'
+  | 'chat_revision_suggestion_arbiter'
+
+export interface RevisionSuggestionPhysicalCall {
+  operation: RevisionSuggestionOperation
+  messages: Array<{ role: string; content: string }>
+  attempted: number
+}
 
 export interface RevisionSuggestionInput {
   endpoint: {
@@ -22,6 +31,10 @@ export interface RevisionSuggestionInput {
   taskBrief: string
   currentTranslation: string
   userRequest: string
+  /** Required paid-call gate; invoked with the exact current message set. */
+  preflightPhysicalCall: (
+    call: RevisionSuggestionPhysicalCall,
+  ) => { outputLimit: number }
   ledger?: Omit<BestEffortLlmCallContext, 'operation' | 'retryCount'>
 }
 
@@ -34,10 +47,8 @@ export interface RevisionSuggestionResult {
 async function completeText(
   input: RevisionSuggestionInput,
   messages: Array<{ role: string; content: string }>,
-  operation:
-    | 'chat_revision_suggestion_target_reader'
-    | 'chat_revision_suggestion_bilingual'
-    | 'chat_revision_suggestion_arbiter',
+  operation: RevisionSuggestionOperation,
+  outputLimit: number,
 ): Promise<string> {
   // 必须使用流式：推理模型在首个可见 token 前可能静默数十秒，
   // 非流式连接会被上游网关读超时切断（504），而推理仍继续计费。
@@ -48,7 +59,7 @@ async function completeText(
       model: input.model,
       messages,
       stream: true,
-      maxTokens: REVISION_SUGGESTION_MAX_TOKENS,
+      maxTokens: outputLimit,
     },
     input.ledger
       ? {
@@ -181,22 +192,54 @@ function arbiterMessages(
 export async function generateRevisionSuggestion(
   input: RevisionSuggestionInput,
 ): Promise<RevisionSuggestionResult> {
+  let attempted = 0
+  const nextAttempt = () => {
+    attempted += 1
+    return attempted
+  }
+  const targetMessages = targetReaderMessages(input)
+  const bilingualInputMessages = bilingualMessages(input)
+  // Both parallel branches are admitted before either provider request starts,
+  // avoiding partial spend when the other branch cannot fit.
+  const targetPreflight = input.preflightPhysicalCall({
+    operation: 'chat_revision_suggestion_target_reader',
+    messages: targetMessages,
+    attempted: nextAttempt(),
+  })
+  const bilingualPreflight = input.preflightPhysicalCall({
+    operation: 'chat_revision_suggestion_bilingual',
+    messages: bilingualInputMessages,
+    attempted: nextAttempt(),
+  })
   const [targetReaderReport, bilingualReport] = await Promise.all([
     completeText(
       input,
-      targetReaderMessages(input),
+      targetMessages,
       'chat_revision_suggestion_target_reader',
+      targetPreflight.outputLimit,
     ),
     completeText(
       input,
-      bilingualMessages(input),
+      bilingualInputMessages,
       'chat_revision_suggestion_bilingual',
+      bilingualPreflight.outputLimit,
     ),
   ])
+  const arbiterInputMessages = arbiterMessages(
+    input,
+    targetReaderReport,
+    bilingualReport,
+  )
+  const arbiterPreflight = input.preflightPhysicalCall({
+    operation: 'chat_revision_suggestion_arbiter',
+    messages: arbiterInputMessages,
+    attempted: nextAttempt(),
+  })
   const feedback = await completeText(
     input,
-    arbiterMessages(input, targetReaderReport, bilingualReport),
+    arbiterInputMessages,
     'chat_revision_suggestion_arbiter',
+    arbiterPreflight.outputLimit,
   )
   return { feedback, targetReaderReport, bilingualReport }
 }

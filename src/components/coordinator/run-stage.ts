@@ -15,6 +15,13 @@ export interface StageStreamHandlers {
   onDelta?: (stage: Stage, content: string) => void
   onComplete?: (stage: Stage, rawText: string | null) => void
   onError?: (stage: Stage, message: string) => void
+  localizeError?: (value: unknown, fallback: string) => string
+  messages?: {
+    network: string
+    request: (status: number) => string
+    stage: string
+    connection: string
+  }
 }
 
 function safeJson(text: string): Record<string, unknown> {
@@ -31,20 +38,36 @@ export async function runStageStream(
   stage: Stage,
   handlers: StageStreamHandlers,
 ): Promise<void> {
+  const errorText = (value: unknown, fallback: string) =>
+    handlers.localizeError?.(value, fallback)
+      ?? (value instanceof Error
+        ? value.message
+        : typeof value === 'string'
+          ? value
+          : fallback)
   let res: Response
   try {
     res = await fetch(`/api/sessions/${sessionId}/stages/${stage}/run`, {
       method: 'POST',
     })
   } catch (e) {
-    handlers.onError?.(stage, e instanceof Error ? e.message : '网络错误')
+    handlers.onError?.(
+      stage,
+      errorText(e, handlers.messages?.network ?? '网络错误'),
+    )
     return
   }
 
   // 守卫类失败（409 前置未达成 / 404 会话不存在 等）以 JSON 返回
   if (!res.ok || !res.body) {
     const body = (await res.json().catch(() => null)) as { error?: string } | null
-    handlers.onError?.(stage, body?.error ?? `请求失败（HTTP ${res.status}）`)
+    handlers.onError?.(
+      stage,
+      errorText(
+        body?.error,
+        handlers.messages?.request(res.status) ?? `请求失败（HTTP ${res.status}）`,
+      ),
+    )
     return
   }
 
@@ -79,11 +102,10 @@ export async function runStageStream(
           case 'stage_error':
             handlers.onError?.(
               evStage,
-              typeof data.detail === 'string'
-                ? data.detail
-                : typeof data.error === 'string'
-                  ? data.error
-                  : '阶段运行失败',
+              errorText(
+                typeof data.error === 'string' ? data.error : data.detail,
+                handlers.messages?.stage ?? '阶段运行失败',
+              ),
             )
             break
           case 'done':
@@ -94,7 +116,10 @@ export async function runStageStream(
       processedEventCount = events.length
     }
   } catch (e) {
-    handlers.onError?.(stage, e instanceof Error ? e.message : '连接中断')
+    handlers.onError?.(
+      stage,
+      errorText(e, handlers.messages?.connection ?? '连接中断'),
+    )
   } finally {
     reader.cancel().catch(() => {})
   }

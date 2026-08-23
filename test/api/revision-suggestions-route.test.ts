@@ -221,6 +221,11 @@ describe('POST /api/sessions/:id/revision-suggestions', () => {
     })
     expect(JSON.stringify(body)).not.toContain('secret-that-must-not-be-returned')
     expect(chatCompletion).toHaveBeenCalledTimes(3)
+    expect(
+      vi.mocked(chatCompletion).mock.calls.every(
+        ([, llmRequest]) => llmRequest.maxTokens === 4_096,
+      ),
+    ).toBe(true)
     const combinedMessages = vi
       .mocked(chatCompletion)
       .mock.calls.flatMap(([, llmRequest]) => llmRequest.messages)
@@ -335,6 +340,32 @@ describe('POST /api/sessions/:id/revision-suggestions', () => {
     } finally {
       consoleError.mockRestore()
     }
+  })
+
+  it('returns a stable 422 before any physical request when an exact lens message exceeds context', async () => {
+    const privateTranslation = '敏感正文'.repeat(20_000)
+    repos.finalVersions.insert({
+      session_id: sessionId,
+      version_no: 1,
+      text: privateTranslation,
+      source: 'assemble',
+    })
+
+    const response = await POST(request({ message: '请检查。' }), {
+      params: Promise.resolve({ id: sessionId }),
+    })
+    expect(response.status).toBe(422)
+    const body = await response.json()
+    expect(body).toMatchObject({
+      error: 'preflight_context_exceeded',
+      params: { attempted: 1 },
+      actions: expect.arrayContaining([
+        'choose_model_with_larger_context_window',
+      ]),
+    })
+    expect(JSON.stringify(body)).not.toContain(privateTranslation.slice(0, 80))
+    expect(JSON.stringify(body)).not.toContain('secret-that-must-not-be-returned')
+    expect(chatCompletion).not.toHaveBeenCalled()
   })
 
   it('rejects a missing session and an empty message without model calls', async () => {

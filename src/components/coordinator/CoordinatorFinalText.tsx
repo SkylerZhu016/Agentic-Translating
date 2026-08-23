@@ -9,8 +9,10 @@
 
 import { TID } from '@/src/lib/testids'
 import { useSessionFull } from './use-session'
+import { useI18n } from '@/src/i18n/LocaleProvider'
 
 export function CoordinatorFinalText() {
+  const { t } = useI18n()
   const { data } = useSessionFull()
   const latest = data?.finalVersion ?? null
 
@@ -18,7 +20,7 @@ export function CoordinatorFinalText() {
     return (
       <div data-testid={TID.edit.finalText} className="poem-text min-h-56">
         <span className="text-ink-4">
-          译文将在组装完成后呈现于此——宋体、松行距、微字距，适合中文长读。
+          {t('coordinator.final.empty')}
         </span>
       </div>
     )
@@ -27,8 +29,18 @@ export function CoordinatorFinalText() {
   return (
     <div>
       <p className="mb-2 text-xs text-ink-4">
-        版本 v{latest.version_no} ·{' '}
-        {latest.source === 'assemble' ? '组装' : latest.source === 'edit' ? '编辑' : '恢复'}
+        {t('coordinator.final.version', {
+          version: latest.version_no,
+          source: latest.source === 'assemble'
+            ? t('version.source.assemble')
+            : latest.source === 'main_draft'
+              ? t('version.source.mainDraft')
+              : latest.source === 'edit'
+                ? t('version.source.edit')
+                : latest.source === 'revert'
+                  ? t('version.source.revert')
+                  : t('version.source.restore'),
+        })}
       </p>
       <div data-testid={TID.edit.finalText} className="poem-text min-h-56">
         {latest.text}

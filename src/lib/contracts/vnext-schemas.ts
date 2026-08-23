@@ -4,6 +4,7 @@ export const modelBindingSchema = z.object({
   endpointId: z.number().int().positive().nullable(),
   model: z.string(),
   contextWindow: z.number().int().positive().nullable().optional(),
+  maxOutputTokens: z.number().int().positive().nullable().optional(),
 })
 
 export const agentVariantSnapshotSchema = z.object({
@@ -58,6 +59,9 @@ export const workflowPresetContractSchema = z.object({
   taskBriefTemplate: z.string(),
   teamPolicy: z.enum(['fixed', 'dynamic']),
   reviewMode: z.enum(['main_editor', 'four_stage']),
+  mainEditorRunMode: z
+    .enum(['fixed_pipeline', 'tool_enabled'])
+    .default('fixed_pipeline'),
   candidateAnnotationMode: z
     .enum(['body_only', 'body_and_annotation'])
     .default('body_only'),

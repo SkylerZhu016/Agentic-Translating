@@ -21,6 +21,16 @@ Web 生产环境必须显式设置强随机的 `AGENTIC_SECRET_KEY`。开发环�
 
 ## 3. 构建
 
+源码开发和 standalone 预览采用两个明确入口：
+
+```bash
+npm run desktop
+npm run build:standalone
+npm run desktop:preview
+```
+
+`desktop` 直接启动 Electron 和由其托管的 Next.js 开发服务，使用 `.next-electron-dev`，无需先构建。普通 `dev` 命令使用 `.next-web-dev`，两个源码入口不会写入同一份 Next 缓存。`desktop:preview` 只读取已有的 `.next/standalone`；缺失时会提示应执行的两条命令并退出，不会隐式构建。打包应用始终只启动 `resources/app/server.js`，不会回退到源码或开发服务。
+
 ```bash
 npm ci
 npm run typecheck
@@ -29,14 +39,14 @@ npm run build:standalone
 npm run package:win
 ```
 
-`build:standalone` 只清理可再生成的 `.next/standalone` 目录：它会移除 tracing 意外带入的 `.omo/`、`data/`、`迭代文档/` 等本地路径，再自动执行发行树扫描。扫描通过后，构建会使用独立临时数据目录和随机密钥，在系统分配的非 3000 端口真实启动 standalone，并等待 `/api/health/ready` 成功。发现数据库、运行记录、研发文档、疑似凭据或缺失运行时依赖时，构建直接失败；现有服务和工作区中的真实数据目录不会被停止、删除或改写。
+`build:standalone` 只清理可再生成的 `.next/standalone` 目录：它会移除 tracing 意外带入的 `.omo/`、`data/`、`迭代文档/`，以及完整的 `FSBP_Test/` 数据集目录，再自动执行发行树扫描。Next tracing 排除配置用于减少无关复制；Next 15 在 Windows 上可能无法用 POSIX glob 排除反斜杠路径，因此这层构建后清理才是跨平台发行边界。扫描通过后，构建会使用独立临时数据目录和随机密钥，在系统分配的非 3000 端口真实启动 standalone，并等待 `/api/health/ready` 成功。发现数据库、数据集或私有实验产物、运行记录、研发文档、疑似凭据或缺失运行时依赖时，构建直接失败；现有服务和工作区中的真实数据目录不会被停止、删除或改写。
 
 `package:win` 会在不含空格的隔离暂存目录中为 Electron ABI 重新构建 `better-sqlite3`，准备 standalone 资源，并由 electron-builder 同时生成 NSIS 和便携版目标。打包前会从 `app/icon.svg` 独立生成包含 16 到 256 px 多尺寸图层的 Windows ICO，无需依赖外部图标转换工具。短暂的下载或构建故障最多重试三次；确定性错误仍会以非零状态退出。该命令不会覆盖开发环境中 Node.js 使用的原生模块。
 
 当前 Windows x64 产物位于 `dist-electron/`：
 
-- `Agentic Translating-0.1.1-setup-x64.exe`
-- `Agentic Translating-0.1.1-portable-x64.exe`
+- `Agentic Translating-0.2.0-setup-x64.exe`
+- `Agentic Translating-0.2.0-portable-x64.exe`
 
 桌面运行时从 `resources/app` 启动 standalone 服务，并通过只读的 `app.asar/node_modules` 解析服务器依赖。`better-sqlite3` 仍由 electron-builder 放入 `app.asar.unpacked`。构建机需要 Node.js 22 或更高版本，以及可用的 Windows C++ 构建工具链，以便在预编译包缺失时从源码重建。
 

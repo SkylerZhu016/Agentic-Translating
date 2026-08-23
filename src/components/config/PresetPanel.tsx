@@ -11,6 +11,7 @@ import { Badge, Button, Card, Input, Modal, Spinner } from '@/src/components/ui'
 import type { ConfigPresetRow } from '@/src/lib/contracts/types'
 import { configApi, isApiError, type Endpoint, type LoadPresetResult } from './api'
 import { Field, Select, Skeleton, type NotifyFn } from './shared'
+import { localizeDiagnosticError, useI18n } from '@/src/i18n'
 
 export interface PresetPanelProps {
   endpoints: Endpoint[]
@@ -19,6 +20,11 @@ export interface PresetPanelProps {
 }
 
 export function PresetPanel({ endpoints, notify, onPresetLoaded }: PresetPanelProps) {
+  const { t } = useI18n()
+  const apiErrorMessage = (error: unknown) =>
+    isApiError(error)
+      ? localizeDiagnosticError(t, error.payload, t('config.error.tryLater'))
+      : t('config.error.networkRetry')
   const [presets, setPresets] = useState<ConfigPresetRow[]>([])
   const [loading, setLoading] = useState(true)
 
@@ -51,7 +57,7 @@ export function PresetPanel({ endpoints, notify, onPresetLoaded }: PresetPanelPr
       const list = await configApi.listPresets()
       setPresets(list)
     } catch (e) {
-      notify('加载预设失败', { message: isApiError(e) ? e.message : '网络错误，请重试' })
+      notify(t('legacy.preset.loadListFailed'), { message: apiErrorMessage(e) })
     } finally {
       setLoading(false)
     }
@@ -72,11 +78,11 @@ export function PresetPanel({ endpoints, notify, onPresetLoaded }: PresetPanelPr
 
   async function confirmCreate() {
     if (createName.trim().length === 0) {
-      notify('请输入预设名称')
+      notify(t('legacy.preset.error.name'))
       return
     }
     if (createMode === 'copy' && copyFromId == null) {
-      notify('请选择要复制的预设')
+      notify(t('legacy.preset.error.copySource'))
       return
     }
     setCreating(true)
@@ -87,11 +93,11 @@ export function PresetPanel({ endpoints, notify, onPresetLoaded }: PresetPanelPr
         ...(createMode === 'copy' && copyFromId != null ? { fromPresetId: copyFromId } : {}),
         ...(createMode === 'current' ? { fromCurrentConfig: true } : {}),
       })
-      notify('预设已创建', { tone: 'inverted' })
+      notify(t('legacy.preset.created'), { tone: 'inverted' })
       setCreateOpen(false)
       await loadPresets()
     } catch (e) {
-      notify('创建失败', { message: isApiError(e) ? e.message : '网络错误，请重试' })
+      notify(t('legacy.preset.createFailed'), { message: apiErrorMessage(e) })
     } finally {
       setCreating(false)
     }
@@ -108,7 +114,7 @@ export function PresetPanel({ endpoints, notify, onPresetLoaded }: PresetPanelPr
   async function confirmEdit() {
     if (!editTarget) return
     if (editName.trim().length === 0) {
-      notify('请输入预设名称')
+      notify(t('legacy.preset.error.name'))
       return
     }
     setSavingEdit(true)
@@ -117,11 +123,11 @@ export function PresetPanel({ endpoints, notify, onPresetLoaded }: PresetPanelPr
         name: editName.trim(),
         description: editDescription.trim() || undefined,
       })
-      notify('预设已更新', { tone: 'inverted' })
+      notify(t('legacy.preset.updated'), { tone: 'inverted' })
       setEditTarget(null)
       await loadPresets()
     } catch (e) {
-      notify('更新失败', { message: isApiError(e) ? e.message : '网络错误，请重试' })
+      notify(t('legacy.preset.updateFailed'), { message: apiErrorMessage(e) })
     } finally {
       setSavingEdit(false)
     }
@@ -137,11 +143,11 @@ export function PresetPanel({ endpoints, notify, onPresetLoaded }: PresetPanelPr
     setDeleting(true)
     try {
       await configApi.deletePreset(deleteTarget.id)
-      notify(`预设「${deleteTarget.name}」已删除`, { tone: 'inverted' })
+      notify(t('legacy.preset.deleted', { name: deleteTarget.name }), { tone: 'inverted' })
       setDeleteTarget(null)
       await loadPresets()
     } catch (e) {
-      notify('删除失败', { message: isApiError(e) ? e.message : '网络错误，请重试' })
+      notify(t('legacy.preset.deleteFailed'), { message: apiErrorMessage(e) })
       setDeleteTarget(null)
     } finally {
       setDeleting(false)
@@ -162,12 +168,12 @@ export function PresetPanel({ endpoints, notify, onPresetLoaded }: PresetPanelPr
       if (result.warnings && result.warnings.length > 0) {
         setLoadWarnings(result.warnings)
       } else {
-        notify(`预设「${loadTarget.name}」已加载`, { tone: 'inverted' })
+        notify(t('legacy.preset.loaded', { name: loadTarget.name }), { tone: 'inverted' })
         setLoadTarget(null)
         await onPresetLoaded()
       }
     } catch (e) {
-      notify('加载失败', { message: isApiError(e) ? e.message : '网络错误，请重试' })
+      notify(t('legacy.preset.loadFailed'), { message: apiErrorMessage(e) })
       setLoadTarget(null)
     } finally {
       setLoadingPreset(false)
@@ -180,17 +186,19 @@ export function PresetPanel({ endpoints, notify, onPresetLoaded }: PresetPanelPr
     try {
       const result = await configApi.loadPreset(loadTarget.id, true)
       if (!result.applied) {
-        notify('强制加载失败', { message: '服务器未应用预设，请重试' })
+        notify(t('legacy.preset.forceFailed'), {
+          message: t('legacy.preset.notApplied'),
+        })
         setLoadTarget(null)
         setLoadWarnings(null)
         return
       }
-      notify(`预设「${loadTarget.name}」已强制加载`, { tone: 'inverted' })
+      notify(t('legacy.preset.forceLoaded', { name: loadTarget.name }), { tone: 'inverted' })
       setLoadTarget(null)
       setLoadWarnings(null)
       await onPresetLoaded()
     } catch (e) {
-      notify('加载失败', { message: isApiError(e) ? e.message : '网络错误，请重试' })
+      notify(t('legacy.preset.loadFailed'), { message: apiErrorMessage(e) })
       setLoadTarget(null)
       setLoadWarnings(null)
     } finally {
@@ -202,23 +210,23 @@ export function PresetPanel({ endpoints, notify, onPresetLoaded }: PresetPanelPr
   async function copyPreset(preset: ConfigPresetRow) {
     try {
       await configApi.createPreset({
-        name: `${preset.name} 副本`,
+        name: t('legacy.preset.copyName', { name: preset.name }),
         fromPresetId: preset.id,
       })
-      notify('预设已复制', { tone: 'inverted' })
+      notify(t('legacy.preset.copied'), { tone: 'inverted' })
       await loadPresets()
     } catch (e) {
-      notify('复制失败', { message: isApiError(e) ? e.message : '网络错误，请重试' })
+      notify(t('legacy.preset.copyFailed'), { message: apiErrorMessage(e) })
     }
   }
 
   return (
     <Card
-      overline="Presets"
-      title="自定义预设"
+      overline={t('legacy.preset.overline')}
+      title={t('legacy.preset.title')}
       actions={
         <Button variant="outline" size="sm" onClick={openCreate}>
-          新建预设
+          {t('legacy.preset.new')}
         </Button>
       }
     >
@@ -231,10 +239,10 @@ export function PresetPanel({ endpoints, notify, onPresetLoaded }: PresetPanelPr
       ) : presets.length === 0 ? (
         <div className="rounded-sm border border-dashed border-line-2 bg-paper/60 px-4 py-8 text-center">
           <p className="text-sm leading-6 text-ink-3">
-            尚未添加预设。预设可保存当前全部配置，随时一键恢复。
+            {t('legacy.preset.empty')}
           </p>
           <Button variant="outline" size="sm" onClick={openCreate} className="mt-3">
-            新建预设
+            {t('legacy.preset.new')}
           </Button>
         </div>
       ) : (
@@ -245,7 +253,9 @@ export function PresetPanel({ endpoints, notify, onPresetLoaded }: PresetPanelPr
                 <div className="flex items-center gap-2">
                   <p className="truncate text-sm font-medium text-ink">{preset.name}</p>
                   <Badge variant={preset.is_builtin ? 'solid' : 'outline'}>
-                    {preset.is_builtin ? '内置' : '自定义'}
+                    {preset.is_builtin
+                      ? t('legacy.prompt.builtin')
+                      : t('legacy.prompt.custom')}
                   </Badge>
                 </div>
                 {preset.description && (
@@ -253,13 +263,13 @@ export function PresetPanel({ endpoints, notify, onPresetLoaded }: PresetPanelPr
                 )}
               </div>
               <Button variant="ghost" size="sm" onClick={() => requestLoad(preset)}>
-                加载
+                {t('legacy.preset.load')}
               </Button>
               <Button variant="ghost" size="sm" onClick={() => copyPreset(preset)}>
-                复制
+                {t('legacy.preset.copy')}
               </Button>
               <Button variant="ghost" size="sm" onClick={() => openEdit(preset)}>
-                编辑
+                {t('legacy.preset.edit')}
               </Button>
               <Button
                 variant="ghost"
@@ -267,7 +277,7 @@ export function PresetPanel({ endpoints, notify, onPresetLoaded }: PresetPanelPr
                 onClick={() => requestDelete(preset)}
                 disabled={!!preset.is_builtin}
               >
-                删除
+                {t('common.delete')}
               </Button>
             </li>
           ))}
@@ -278,15 +288,15 @@ export function PresetPanel({ endpoints, notify, onPresetLoaded }: PresetPanelPr
       <Modal
         open={createOpen}
         onClose={() => setCreateOpen(false)}
-        title="新建预设"
+        title={t('legacy.preset.new')}
         footer={
           <>
             <Button variant="ghost" size="sm" onClick={() => setCreateOpen(false)}>
-              取消
+              {t('common.cancel')}
             </Button>
             <Button size="sm" onClick={() => void confirmCreate()} disabled={creating}>
               {creating && <Spinner size="sm" />}
-              创建
+              {t('common.create')}
             </Button>
           </>
         }
@@ -298,39 +308,39 @@ export function PresetPanel({ endpoints, notify, onPresetLoaded }: PresetPanelPr
           }}
           className="space-y-4"
         >
-          <Field label="名称">
+          <Field label={t('legacy.preset.name')}>
             <Input
               value={createName}
               onChange={(e) => setCreateName(e.target.value)}
-              placeholder="如：五言诗歌翻译套装"
+              placeholder={t('legacy.preset.namePlaceholder')}
             />
           </Field>
-          <Field label="描述" hint="可选">
+          <Field label={t('legacy.preset.description')} hint={t('legacy.preset.optional')}>
             <Input
               value={createDescription}
               onChange={(e) => setCreateDescription(e.target.value)}
-              placeholder="简要说明该预设的用途"
+              placeholder={t('legacy.preset.descriptionPlaceholder')}
             />
           </Field>
-          <Field label="创建方式">
+          <Field label={t('legacy.preset.createMode')}>
             <Select
               value={createMode}
               onChange={(e) => setCreateMode(e.target.value as typeof createMode)}
             >
-              <option value="empty">空预设</option>
-              <option value="copy">复制自现有预设</option>
-              <option value="current">另存为当前配置</option>
+              <option value="empty">{t('legacy.preset.mode.empty')}</option>
+              <option value="copy">{t('legacy.preset.mode.copy')}</option>
+              <option value="current">{t('legacy.preset.mode.current')}</option>
             </Select>
           </Field>
           {createMode === 'copy' && (
-            <Field label="复制来源">
+            <Field label={t('legacy.preset.copySource')}>
               <Select
                 value={copyFromId ?? ''}
                 onChange={(e) =>
                   setCopyFromId(e.target.value === '' ? null : Number(e.target.value))
                 }
               >
-                <option value="">请选择预设…</option>
+                <option value="">{t('legacy.preset.select')}</option>
                 {presets.map((p) => (
                   <option key={p.id} value={String(p.id)}>
                     {p.name}
@@ -347,15 +357,15 @@ export function PresetPanel({ endpoints, notify, onPresetLoaded }: PresetPanelPr
       <Modal
         open={editTarget != null}
         onClose={() => setEditTarget(null)}
-        title="编辑预设"
+        title={t('legacy.preset.editTitle')}
         footer={
           <>
             <Button variant="ghost" size="sm" onClick={() => setEditTarget(null)}>
-              取消
+              {t('common.cancel')}
             </Button>
             <Button size="sm" onClick={() => void confirmEdit()} disabled={savingEdit}>
               {savingEdit && <Spinner size="sm" />}
-              保存
+              {t('common.save')}
             </Button>
           </>
         }
@@ -368,18 +378,18 @@ export function PresetPanel({ endpoints, notify, onPresetLoaded }: PresetPanelPr
             }}
             className="space-y-4"
           >
-            <Field label="名称">
+            <Field label={t('legacy.preset.name')}>
               <Input
                 value={editName}
                 onChange={(e) => setEditName(e.target.value)}
-                placeholder="预设名称"
+                placeholder={t('legacy.preset.editNamePlaceholder')}
               />
             </Field>
-            <Field label="描述" hint="可选">
+            <Field label={t('legacy.preset.description')} hint={t('legacy.preset.optional')}>
               <Input
                 value={editDescription}
                 onChange={(e) => setEditDescription(e.target.value)}
-                placeholder="预设描述"
+                placeholder={t('legacy.preset.editDescriptionPlaceholder')}
               />
             </Field>
             <button type="submit" className="hidden" aria-hidden tabIndex={-1} />
@@ -391,22 +401,22 @@ export function PresetPanel({ endpoints, notify, onPresetLoaded }: PresetPanelPr
       <Modal
         open={deleteTarget != null}
         onClose={() => setDeleteTarget(null)}
-        title="删除预设"
+        title={t('legacy.preset.deleteTitle')}
         footer={
           <>
             <Button variant="ghost" size="sm" onClick={() => setDeleteTarget(null)}>
-              取消
+              {t('common.cancel')}
             </Button>
             <Button size="sm" onClick={() => void confirmDelete()} disabled={deleting}>
               {deleting && <Spinner size="sm" />}
-              确认删除
+              {t('legacy.preset.deleteConfirm')}
             </Button>
           </>
         }
       >
         {deleteTarget != null && (
           <p className="text-sm leading-6 text-ink-2">
-            确定删除预设「{deleteTarget.name}」吗？此操作不可撤销。
+            {t('legacy.preset.deleteDescription', { name: deleteTarget.name })}
           </p>
         )}
       </Modal>
@@ -415,22 +425,22 @@ export function PresetPanel({ endpoints, notify, onPresetLoaded }: PresetPanelPr
       <Modal
         open={loadTarget != null && loadWarnings == null}
         onClose={() => setLoadTarget(null)}
-        title="加载预设"
+        title={t('legacy.preset.loadTitle')}
         footer={
           <>
             <Button variant="ghost" size="sm" onClick={() => setLoadTarget(null)}>
-              取消
+              {t('common.cancel')}
             </Button>
             <Button size="sm" onClick={() => void confirmLoad()} disabled={loadingPreset}>
               {loadingPreset && <Spinner size="sm" />}
-              确认加载
+              {t('legacy.preset.loadConfirm')}
             </Button>
           </>
         }
       >
         {loadTarget != null && (
           <p className="text-sm leading-6 text-ink-2">
-            确定加载预设「{loadTarget.name}」吗？当前配置将被覆盖。
+            {t('legacy.preset.loadDescription', { name: loadTarget.name })}
           </p>
         )}
       </Modal>
@@ -442,7 +452,7 @@ export function PresetPanel({ endpoints, notify, onPresetLoaded }: PresetPanelPr
           setLoadTarget(null)
           setLoadWarnings(null)
         }}
-        title="预设包含无效端点引用"
+        title={t('legacy.preset.orphanTitle')}
         footer={
           <>
             <Button
@@ -453,31 +463,36 @@ export function PresetPanel({ endpoints, notify, onPresetLoaded }: PresetPanelPr
                 setLoadWarnings(null)
               }}
             >
-              取消
+              {t('common.cancel')}
             </Button>
             <Button size="sm" onClick={() => void forceLoad()} disabled={loadingPreset}>
               {loadingPreset && <Spinner size="sm" />}
-              强制加载
+              {t('legacy.preset.forceLoad')}
             </Button>
           </>
         }
       >
         {loadTarget != null && loadWarnings != null && (
           <div className="space-y-3 text-sm leading-6 text-ink-2">
-            <p>预设「{loadTarget.name}」中的部分 Agent 引用了当前不存在的端点：</p>
+            <p>{t('legacy.preset.orphanDescription', { name: loadTarget.name })}</p>
             <ul className="list-disc space-y-1 pl-5">
               {loadWarnings.map((w, i) => {
                 const epName =
-                  endpoints.find((e) => e.id === w.endpointId)?.name ?? `端点 #${w.endpointId}`
+                  endpoints.find((e) => e.id === w.endpointId)?.name
+                    ?? t('legacy.preset.endpointFallback', { id: w.endpointId })
                 return (
                   <li key={i}>
-                    {w.kind === 'orphan_endpoint' ? '无效端点' : w.kind}：{epName}
-                    {w.agentIndex != null ? `（Agent #${w.agentIndex + 1}）` : ''}
+                    {w.kind === 'orphan_endpoint'
+                      ? t('legacy.preset.invalidEndpoint')
+                      : w.kind} · {epName}
+                    {w.agentIndex != null
+                      ? t('legacy.preset.agentIndex', { index: w.agentIndex + 1 })
+                      : ''}
                   </li>
                 )
               })}
             </ul>
-            <p>强制加载将跳过这些 Agent。是否继续？</p>
+            <p>{t('legacy.preset.forceDescription')}</p>
           </div>
         )}
       </Modal>

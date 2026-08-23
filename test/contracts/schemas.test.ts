@@ -7,10 +7,34 @@ import {
   promptCreateSchema, promptUpdateSchema,
   // Tools
   replaceTextParamsSchema,
+  sessionCreateSchema,
   // State transitions
   ALLOWED_TRANSITIONS,
 } from '../../src/lib/contracts/schemas'
 import type { SessionState, Stage } from '../../src/lib/contracts/types'
+
+describe('session run mode schema', () => {
+  const base = {
+    sourceText: 'source',
+    direction: 'en_to_zh' as const,
+  }
+
+  it('defaults main-editor runs to the fixed pipeline', () => {
+    expect(sessionCreateSchema.parse(base).mainEditorRunMode)
+      .toBe('fixed_pipeline')
+  })
+
+  it('accepts the explicit tool-enabled mode and rejects unknown modes', () => {
+    expect(sessionCreateSchema.parse({
+      ...base,
+      mainEditorRunMode: 'tool_enabled',
+    }).mainEditorRunMode).toBe('tool_enabled')
+    expect(sessionCreateSchema.safeParse({
+      ...base,
+      mainEditorRunMode: 'autonomous',
+    }).success).toBe(false)
+  })
+})
 
 // ---------------------------------------------------------------------------
 // Config CRUD schemas

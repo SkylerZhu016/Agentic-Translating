@@ -75,7 +75,7 @@ describe('DB Migrations — In-Memory DB', () => {
     expect(tables).toContain('prompt_bundle_families')
     expect(tables).toContain('prompt_bundle_revisions')
     expect(tables).toContain('session_run_controls')
-    // Migrations 0009-0014 add project memory, onboarding capability profiles,
+    // Migrations 0009-0018 add project memory, onboarding capability profiles,
     // the privacy-safe LLM call ledger, draft binding, idempotency hashes, and
     // non-destructive legacy Agent endpoint removal.
     expect(tables).toContain('translation_projects')
@@ -90,11 +90,16 @@ describe('DB Migrations — In-Memory DB', () => {
     expect(tables).toContain('onboarding_state')
     expect(tables).toContain('endpoint_capability_profiles')
     expect(tables).toContain('llm_call_records')
+    expect(tables).toContain('agent_tool_calls')
+    expect(tables).toContain('review_issues')
     const draftColumns = db.prepare(
       "PRAGMA table_info('workspace_drafts')",
     ).all() as Array<{ name: string }>
     expect(draftColumns.map((column) => column.name)).toContain(
       'selected_project_id',
+    )
+    expect(draftColumns.map((column) => column.name)).toContain(
+      'main_editor_run_mode',
     )
     expect(tables.length).toBeGreaterThanOrEqual(35)
   })
@@ -102,9 +107,9 @@ describe('DB Migrations — In-Memory DB', () => {
   it('is idempotent — 3x migrate → 1 version', () => {
     migrate(db); migrate(db); migrate(db)
     const version = (db.prepare('SELECT MAX(version) as v FROM migrations').get() as { v: number | null }).v
-    expect(version).toBe(14)
+    expect(version).toBe(18)
     const count = (db.prepare('SELECT COUNT(*) as c FROM migrations').get() as { c: number }).c
-    expect(count).toBe(14)
+    expect(count).toBe(18)
   })
 
   it('creates config_presets and child tables (migration 0002)', () => {
@@ -207,7 +212,7 @@ describe('DB Migrations — File DB', () => {
     db2.pragma('foreign_keys = ON')
     migrate(db2)
     const v = (db2.prepare('SELECT MAX(version) as v FROM migrations').get() as { v: number | null }).v
-    expect(v).toBe(14)
+    expect(v).toBe(18)
     expect(listTables(db2)).toContain('endpoints')
     expect(listTables(db2)).toContain('config_presets')
     expect(listTables(db2)).toContain('agent_direction_variants')

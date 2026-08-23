@@ -1,6 +1,7 @@
 import * as React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
+import { LocaleProvider } from '@/src/i18n'
 import {
   buildProjectResourceContent,
   buildProjectScope,
@@ -13,7 +14,15 @@ import {
 describe('ProjectMemoryPanel contract helpers', () => {
   it('renders as an isolated ink-paper card with the session boundary visible', () => {
     vi.stubGlobal('React', React)
-    const html = renderToStaticMarkup(React.createElement(ProjectMemoryPanel))
+    const html = renderToStaticMarkup(
+      React.createElement(
+        LocaleProvider,
+        {
+          initialLocale: 'zh-CN',
+          children: React.createElement(ProjectMemoryPanel),
+        },
+      ),
+    )
     vi.unstubAllGlobals()
 
     expect(html).toContain('data-testid="project-memory-panel"')

@@ -4,12 +4,14 @@ import { getDb } from '@/src/lib/db'
 import { migrate } from '@/src/lib/db/migrate'
 import { createRepositories } from '@/src/lib/db/repositories'
 import { createProjectRepositories } from '@/src/lib/db/project-repositories'
+import { createTranslationToolRepository } from '@/src/lib/db/translation-tool-repository'
 import { redactSecrets } from '@/src/lib/security/public-dto'
 import {
   publicPersistedExecutionError,
   type ExecutionDiagnosticErrorDto,
 } from '@/src/lib/security/diagnostic-error'
 import { parseSemanticAgentOutput } from '@/src/lib/protocol/semantic-output'
+import { redactCredentialValueForDb } from '@/src/lib/security/credential-redaction'
 
 function safeFilename(value: string) {
   return value.replace(/[^a-zA-Z0-9._-]+/g, '-').slice(0, 80)
@@ -36,20 +38,29 @@ export async function GET(
   migrate(db)
   const repos = createRepositories(db)
   const projectRepos = createProjectRepositories(db)
+  const toolRepos = createTranslationToolRepository(db)
   const session = repos.sessions.getById(id)
   if (!session) return Response.json({ error: 'session_not_found' }, { status: 404 })
   const results = repos.translationResults.listBySession(id)
   const stages = repos.stageOutputs.listBySession(id)
   const versions = repos.finalVersions.listBySession(id)
   const messages = repos.chatMessages.listBySession(id)
-  const invocations = db.prepare(
+  const invocations = redactCredentialValueForDb(db, db.prepare(
     'SELECT * FROM agent_invocations WHERE session_id=? ORDER BY created_at, id',
-  ).all(id) as Array<Record<string, unknown>>
+  ).all(id) as Array<Record<string, unknown>>)
   const patches = db.prepare(
     'SELECT * FROM text_patches WHERE session_id=? ORDER BY created_at, id',
   ).all(id)
   const projectContext =
     projectRepos.sessionProjectContexts.getBySession(id) ?? null
+  const toolCalls = redactCredentialValueForDb(
+    db,
+    toolRepos.listCalls({ sessionId: id }),
+  )
+  const reviewIssues = redactCredentialValueForDb(
+    db,
+    toolRepos.listIssues({ sessionId: id }),
+  )
   const config = redactSecrets(JSON.parse(session.config_snapshot))
   const publicResults = results.map((result) => {
     const errorDiagnostic = publicPersistedExecutionError(
@@ -79,7 +90,7 @@ export async function GET(
       semantic: parseSemanticAgentOutput(stage.raw_output ?? ''),
     }
   })
-  const payload = redactSecrets({
+  const payload = redactSecrets(redactCredentialValueForDb(db, {
     session: { ...session, config_snapshot: undefined },
     config_snapshot: config,
     project_context: projectContext,
@@ -89,7 +100,9 @@ export async function GET(
     versions,
     patches,
     messages,
-  })
+    tool_calls: toolCalls,
+    review_issues: reviewIssues,
+  }))
   const format = new URL(request.url).searchParams.get('format') ?? 'json'
   const base = safeFilename(`agentic-translation-${id}`)
   if (format === 'md') {
@@ -135,6 +148,30 @@ export async function GET(
         '',
       )
     }
+    lines.push('## 工具调用轨迹', '')
+    for (const toolCall of toolCalls) {
+      lines.push(
+        `### ${toolCall.toolName} · ${toolCall.status}`,
+        '',
+        '```json',
+        JSON.stringify(toolCall, null, 2),
+        '```',
+        '',
+      )
+    }
+    lines.push('## 审校问题', '')
+    for (const issue of reviewIssues) {
+      lines.push(
+        `### ${issue.title} · ${issue.status}`,
+        '',
+        issue.details,
+        '',
+        '```json',
+        JSON.stringify(issue, null, 2),
+        '```',
+        '',
+      )
+    }
     lines.push('## 四阶段', '')
     for (const stage of publicStages) {
       lines.push(
@@ -148,7 +185,8 @@ export async function GET(
     for (const version of versions) {
       lines.push(`### v${version.version_no} · ${version.source}`, '', version.text, '')
     }
-    return new Response(lines.join('\n'), {
+    const markdown = redactCredentialValueForDb(db, lines.join('\n'))
+    return new Response(markdown, {
       headers: {
         'Content-Type': 'text/markdown; charset=utf-8',
         'Content-Disposition': `attachment; filename="${base}.md"`,

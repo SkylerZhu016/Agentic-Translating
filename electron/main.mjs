@@ -15,6 +15,7 @@ import {
   createWriteStream,
   existsSync,
   mkdirSync,
+  appendFileSync,
   readFileSync,
   readdirSync,
   writeFileSync,
@@ -23,15 +24,34 @@ import { randomBytes } from 'crypto'
 import { createRequire } from 'module'
 import path from 'path'
 import JSZip from 'jszip'
+import {
+  createElectronTranslator,
+  normalizeElectronLocale,
+} from './i18n.mjs'
+import {
+  assertPortAvailable,
+  createServerEnvironment,
+  DESKTOP_PORT,
+  DesktopRuntimeError,
+  resolveDesktopRuntime,
+  serverEntryFor,
+  stopManagedServer,
+  waitForManagedServer,
+} from './runtime.mjs'
 
 let mainWindow = null
 let serverProcess = null
+let serverLogStream = null
+let serverShutdownPromise = null
+let serverShutdownComplete = false
 let tray = null
 let allowQuit = false
-const port = 3210
+const port = DESKTOP_PORT
 const MAX_BATCH_FILES = 500
 const MAX_BATCH_FILE_BYTES = 5 * 1024 * 1024
 const require = createRequire(import.meta.url)
+let electronLocale = normalizeElectronLocale(process.env.LANG)
+let et = createElectronTranslator(electronLocale)
 
 if (!app.requestSingleInstanceLock()) {
   app.quit()
@@ -43,12 +63,6 @@ app.on('second-instance', () => {
   mainWindow.show()
   mainWindow.focus()
 })
-
-function appRoot() {
-  return app.isPackaged
-    ? path.join(process.resourcesPath, 'app')
-    : path.join(process.cwd(), '.next', 'standalone')
-}
 
 function backupRecoveryFiles(userData) {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-')
@@ -136,10 +150,10 @@ function ensureSecret(userData) {
     if (!safeStorage.isEncryptionAvailable()) {
       const unavailable = dialog.showMessageBoxSync({
         type: 'error',
-        title: '无法使用 Windows 凭据保护',
-        message: '系统暂时无法提供安全存储，应用不会降级为明文保存密钥。',
-        detail: '可以重试、打开数据目录检查环境，或退出应用。',
-        buttons: ['重试', '打开数据目录', '退出'],
+        title: et('credential.unavailable.title'),
+        message: et('credential.unavailable.message'),
+        detail: et('credential.unavailable.detail'),
+        buttons: [et('button.retry'), et('button.openData'), et('button.exit')],
         defaultId: 0,
         cancelId: 2,
       })
@@ -158,11 +172,15 @@ function ensureSecret(userData) {
       } catch (error) {
         const response = dialog.showMessageBoxSync({
           type: 'warning',
-          title: '本地凭据无法解密',
-          message: '翻译历史仍然完好，但已保存的 API Key 当前无法恢复。',
-          detail:
-            '“保留数据并重置凭据”会先备份数据库和损坏密钥，只清空无法恢复的 API Key，不删除会话、译文或版本历史。',
-          buttons: ['重试', '打开数据目录', '保留数据并重置凭据', '退出'],
+          title: et('credential.unreadable.title'),
+          message: et('credential.unreadable.message'),
+          detail: et('credential.unreadable.detail'),
+          buttons: [
+            et('button.retry'),
+            et('button.openData'),
+            et('button.resetCredentials'),
+            et('button.exit'),
+          ],
           defaultId: 0,
           cancelId: 3,
         })
@@ -174,10 +192,12 @@ function ensureSecret(userData) {
           const recovered = resetCredentialsPreservingData(userData)
           dialog.showMessageBoxSync({
             type: 'info',
-            title: '凭据已重置',
-            message: '翻译历史已保留，请重新填写 API Key。',
-            detail: `恢复备份：${recovered.backupDirectory}`,
-            buttons: ['继续启动'],
+            title: et('credential.reset.title'),
+            message: et('credential.reset.message'),
+            detail: et('credential.reset.detail', {
+              directory: recovered.backupDirectory,
+            }),
+            buttons: [et('button.continue')],
           })
           return recovered.secret
         }
@@ -199,13 +219,13 @@ function isSupportedTextFile(filePath) {
 function readPreparedFile(filePath, relativePath) {
   const bytes = readFileSync(filePath)
   if (bytes.byteLength > MAX_BATCH_FILE_BYTES) {
-    throw new Error(`文件超过 5 MiB：${relativePath}`)
+    throw new Error(et('file.tooLarge', { path: relativePath }))
   }
   let sourceText
   try {
     sourceText = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
   } catch {
-    throw new Error(`不是有效 UTF-8：${relativePath}`)
+    throw new Error(et('file.invalidUtf8', { path: relativePath }))
   }
   return {
     relativePath: relativePath.split(path.sep).join('/'),
@@ -228,7 +248,7 @@ function collectFolderFiles(root, current = root, prepared = []) {
     } else if (entry.isFile() && isSupportedTextFile(absolute)) {
       prepared.push(readPreparedFile(absolute, path.relative(root, absolute)))
       if (prepared.length > MAX_BATCH_FILES) {
-        throw new Error('文件数量超过 500 个')
+        throw new Error(et('file.tooMany', { limit: MAX_BATCH_FILES }))
       }
     }
   }
@@ -252,65 +272,126 @@ function safeZipRelativePath(value) {
     /^[a-zA-Z]:/.test(unix) ||
     unix.split('/').includes('..')
   ) {
-    throw new Error(`导出包含不安全路径：${value}`)
+    throw new Error(et('export.unsafePath', { path: value }))
   }
   return unix
 }
 
-async function waitForServer() {
-  for (let attempt = 0; attempt < 120; attempt++) {
-    try {
-      const response = await fetch(`http://127.0.0.1:${port}/api/health/ready`)
-      if (response.ok) return
-    } catch {
-      // Embedded server is still starting.
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250))
-  }
-  throw new Error('Embedded Next.js service did not become healthy in time.')
-}
-
-function startServer() {
-  const root = appRoot()
-  const serverFile = path.join(root, 'server.js')
+async function startServer() {
+  const startupNonce = randomBytes(24).toString('hex')
+  const runtime = resolveDesktopRuntime({
+    isPackaged: app.isPackaged,
+    cwd: process.cwd(),
+    resourcesPath: process.resourcesPath,
+    electronExecutable: process.execPath,
+  })
+  const serverFile = serverEntryFor(runtime)
   if (!existsSync(serverFile)) {
-    throw new Error(`Standalone server is missing: ${serverFile}`)
+    if (runtime.kind === 'preview') {
+      throw new DesktopRuntimeError('preview_missing', serverFile, { serverFile })
+    }
+    throw new DesktopRuntimeError('server_missing', serverFile, {
+      serverFile,
+      runtime: runtime.kind,
+    })
   }
   const userData = app.getPath('userData')
   const logs = path.join(userData, 'logs')
   mkdirSync(logs, { recursive: true })
-  const output = createWriteStream(path.join(logs, 'desktop-server.log'), {
+  const logFile = path.join(logs, 'desktop-server.log')
+  try {
+    await assertPortAvailable(port)
+  } catch (error) {
+    appendFileSync(
+      logFile,
+      `[${new Date().toISOString()}] Desktop startup blocked: local port ${port} is unavailable.\n`,
+      'utf8',
+    )
+    if (error instanceof DesktopRuntimeError) {
+      error.details.logFile = logFile
+    }
+    throw error
+  }
+  serverLogStream = createWriteStream(logFile, {
     flags: 'a',
   })
-  serverProcess = spawn(process.execPath, [serverFile], {
-    cwd: root,
+  serverProcess = spawn(runtime.command, runtime.args, {
+    cwd: runtime.root,
     windowsHide: true,
-    env: {
-      ...process.env,
-      ELECTRON_RUN_AS_NODE: '1',
-      HOSTNAME: '127.0.0.1',
-      PORT: String(port),
-      NODE_ENV: 'production',
-      AGENTIC_DESKTOP: '1',
-      AGENTIC_DATA_DIR: userData,
-      AGENTIC_MIGRATIONS_DIR: path.join(root, 'migrations'),
-      AGENTIC_SECRET_KEY: ensureSecret(userData),
-      NODE_PATH: app.isPackaged
+    shell: false,
+    env: createServerEnvironment(runtime, {
+      port,
+      userData,
+      secret: ensureSecret(userData),
+      startupNonce,
+      packagedNodePath: app.isPackaged
         ? path.join(process.resourcesPath, 'app.asar', 'node_modules')
-        : process.env.NODE_PATH,
-    },
+        : undefined,
+    }),
     stdio: ['ignore', 'pipe', 'pipe'],
   })
-  serverProcess.stdout.pipe(output)
-  serverProcess.stderr.pipe(output)
+  serverProcess.stdout.pipe(serverLogStream)
+  serverProcess.stderr.pipe(serverLogStream)
+  const readiness = await waitForManagedServer(serverProcess, {
+    url: `http://127.0.0.1:${port}/api/health/ready`,
+    logFile,
+    expectedNonce: startupNonce,
+  })
   serverProcess.on('exit', (code) => {
-    if (!allowQuit && code !== 0) {
+    if (!allowQuit) {
       dialog.showErrorBox(
-        'Agentic Translating 服务已停止',
-        `内嵌服务退出，代码 ${code ?? 'unknown'}。可在数据目录 logs 中查看诊断日志。`,
+        et('service.stopped.title'),
+        et('service.stopped.message', { code: code ?? 'unknown' }),
       )
     }
   })
+  return readiness
+}
+
+function startupErrorMessage(error) {
+  if (error instanceof DesktopRuntimeError) {
+    if (error.code === 'preview_missing') {
+      return et('startup.previewMissing', {
+        path: error.details.serverFile,
+      })
+    }
+    if (error.code === 'system_node_missing') {
+      return et('startup.useLauncher')
+    }
+    if (error.code === 'port_unavailable') {
+      return et('startup.portUnavailable', {
+        port,
+        path: error.details.logFile,
+      })
+    }
+    if (error.code === 'server_missing') {
+      return et('startup.serverMissing', {
+        path: error.details.serverFile,
+      })
+    }
+  }
+  return error instanceof Error ? error.message : String(error)
+}
+
+async function stopServer() {
+  if (serverShutdownComplete) return
+  if (!serverShutdownPromise) {
+    serverShutdownPromise = (async () => {
+      try {
+        await stopManagedServer(serverProcess, { port })
+        serverProcess = null
+        serverShutdownComplete = true
+        if (serverLogStream) {
+          serverLogStream.end()
+          serverLogStream = null
+        }
+      } catch (error) {
+        serverShutdownPromise = null
+        throw error
+      }
+    })()
+  }
+  await serverShutdownPromise
 }
 
 async function hasRunningWork() {
@@ -330,6 +411,26 @@ async function hasRunningWork() {
   }
 }
 
+function updateTrayMenu() {
+  if (!tray) return
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: et('tray.open'), click: () => mainWindow?.show() },
+      {
+        label: et('tray.openData'),
+        click: () => void shell.openPath(app.getPath('userData')),
+      },
+      {
+        label: et('tray.exit'),
+        click: () => {
+          allowQuit = true
+          app.quit()
+        },
+      },
+    ]),
+  )
+}
+
 function ensureTray() {
   if (tray) return
   tray = new Tray(
@@ -338,22 +439,7 @@ function ensureTray() {
     ),
   )
   tray.setToolTip('Agentic Translating')
-  tray.setContextMenu(
-    Menu.buildFromTemplate([
-      { label: '打开', click: () => mainWindow?.show() },
-      {
-        label: '打开数据目录',
-        click: () => void shell.openPath(app.getPath('userData')),
-      },
-      {
-        label: '退出',
-        click: () => {
-          allowQuit = true
-          app.quit()
-        },
-      },
-    ]),
-  )
+  updateTrayMenu()
   tray.on('double-click', () => mainWindow?.show())
 }
 
@@ -375,7 +461,7 @@ async function createWindow() {
   await mainWindow.loadURL(
     `data:text/html;charset=utf-8,${encodeURIComponent(`
       <!doctype html>
-      <html lang="zh-CN">
+      <html lang="${electronLocale}">
         <meta charset="utf-8">
         <style>
           html,body{height:100%;margin:0;background:#f7f4ec;color:#26231f}
@@ -387,21 +473,24 @@ async function createWindow() {
           i{display:inline-block;width:6px;height:6px;border-radius:50%;background:#26231f;animation:pulse 1.2s infinite}
           @keyframes pulse{50%{opacity:.25}}
         </style>
-        <main><div class="seal">译</div><h1>Agentic Translating</h1><p><i></i> 正在准备本地工作台……</p></main>
+        <main><div class="seal">${et('splash.seal')}</div><h1>Agentic Translating</h1><p><i></i> ${et('splash.preparing')}</p></main>
       </html>
     `)}`,
   )
-  startServer()
-  await waitForServer()
+  await startServer()
   mainWindow.on('close', async (event) => {
     if (allowQuit || !(await hasRunningWork())) return
     event.preventDefault()
     const result = await dialog.showMessageBox(mainWindow, {
       type: 'warning',
-      title: '仍有任务运行',
-      message: '仍有翻译或批量任务在运行。',
-      detail: '可以最小化到托盘继续运行，或确认退出并在下次启动时从失败节点重试。',
-      buttons: ['最小化到托盘', '取消', '退出应用'],
+      title: et('running.title'),
+      message: et('running.message'),
+      detail: et('running.detail'),
+      buttons: [
+        et('button.minimize'),
+        et('button.cancel'),
+        et('button.exitApp'),
+      ],
       defaultId: 0,
       cancelId: 1,
     })
@@ -426,7 +515,9 @@ ipcMain.handle('agentic:select-files', async () => {
     const files = result.filePaths
       .filter(isSupportedTextFile)
       .map((filePath) => readPreparedFile(filePath, path.basename(filePath)))
-    if (files.length > MAX_BATCH_FILES) throw new Error('文件数量超过 500 个')
+    if (files.length > MAX_BATCH_FILES) {
+      throw new Error(et('file.tooMany', { limit: MAX_BATCH_FILES }))
+    }
     return { canceled: false, files }
   } catch (error) {
     return {
@@ -459,7 +550,7 @@ ipcMain.handle('agentic:select-folder', async () => {
 ipcMain.handle('agentic:export-batch', async (_event, batchId, includeAudit) => {
   const selection = await dialog.showOpenDialog(mainWindow, {
     properties: ['openDirectory', 'createDirectory'],
-    title: '选择批量译文输出目录',
+    title: et('export.selectDirectory'),
   })
   if (selection.canceled || !selection.filePaths[0]) {
     return { canceled: true }
@@ -471,7 +562,7 @@ ipcMain.handle('agentic:export-batch', async (_event, batchId, includeAudit) => 
     ),
   ])
   if (!detailResponse.ok || !archiveResponse.ok) {
-    throw new Error('无法读取批量任务导出内容')
+    throw new Error(et('export.readFailed'))
   }
   const detail = await detailResponse.json()
   const stamp = new Date().toISOString().replace(/[:.]/g, '-')
@@ -490,7 +581,7 @@ ipcMain.handle('agentic:export-batch', async (_event, batchId, includeAudit) => 
       relativeToOutput.startsWith('..') ||
       path.isAbsolute(relativeToOutput)
     ) {
-      throw new Error(`导出路径越界：${entryName}`)
+      throw new Error(et('export.pathEscaped', { path: entryName }))
     }
     mkdirSync(path.dirname(destination), { recursive: true })
     writeFileSync(destination, await entry.async('nodebuffer'))
@@ -503,15 +594,39 @@ ipcMain.handle('agentic:open-data-dir', () =>
 ipcMain.handle('agentic:open-diagnostic-logs', () =>
   shell.openPath(path.join(app.getPath('userData'), 'logs')),
 )
+ipcMain.handle('agentic:set-locale', (_event, locale) => {
+  electronLocale = normalizeElectronLocale(locale)
+  et = createElectronTranslator(electronLocale)
+  updateTrayMenu()
+  return electronLocale
+})
 
-app.whenReady().then(createWindow).catch((error) => {
-  dialog.showErrorBox('启动失败', error instanceof Error ? error.message : String(error))
+app.whenReady().then(() => {
+  electronLocale = normalizeElectronLocale(app.getLocale())
+  et = createElectronTranslator(electronLocale)
+  return createWindow()
+}).catch((error) => {
+  dialog.showErrorBox(
+    et('startup.failed'),
+    startupErrorMessage(error),
+  )
   app.quit()
 })
 
-app.on('before-quit', () => {
+app.on('before-quit', (event) => {
   allowQuit = true
-  serverProcess?.kill()
+  if (!serverProcess || serverShutdownComplete) return
+  event.preventDefault()
+  void stopServer()
+    .then(() => app.quit())
+    .catch((error) => {
+      const message = error instanceof Error ? error.message : String(error)
+      console.error(message)
+      dialog.showErrorBox(et('service.stopFailed.title'), message)
+      allowQuit = false
+      ensureTray()
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.show()
+    })
 })
 
 app.on('window-all-closed', () => {

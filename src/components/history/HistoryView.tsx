@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { Badge, Button, Card, Modal, Spinner } from '@/src/components/ui'
 import { PageHeader } from '@/src/components/shell/PageHeader'
 import { useDirection } from '@/src/components/direction/DirectionProvider'
+import { useI18n, type MessageKey, type Translator } from '@/src/i18n'
 import type { BuiltinDirection } from '@/src/lib/contracts/vnext'
 import { BatchManager } from './BatchManager'
 import { UsageOverviewCard } from './UsageOverviewCard'
@@ -28,12 +29,23 @@ interface HistorySession {
 
 type Filter = BuiltinDirection | 'all'
 
-function directionLabel(direction?: string) {
-  return direction === 'zh_to_en' ? '中 → 英' : '英 → 中'
+const SESSION_STATE_KEYS = {
+  draft: 'history.state.draft',
+  translating: 'history.state.translating',
+  translated: 'history.state.translated',
+  coordinating: 'history.state.coordinating',
+  assembled: 'history.state.assembled',
+  refining: 'history.state.refining',
+  done: 'history.state.done',
+} as const satisfies Record<string, MessageKey>
+
+function directionLabel(t: Translator, direction?: string) {
+  return direction === 'zh_to_en' ? t('direction.zhToEn') : t('direction.enToZh')
 }
 
 export function HistoryView() {
   const { direction } = useDirection()
+  const { t, formatDate, formatNumber } = useI18n()
   const [filter, setFilter] = useState<Filter>(direction)
   const [tab, setTab] = useState<'sessions' | 'batches'>('sessions')
   const [sessions, setSessions] = useState<HistorySession[]>([])
@@ -51,15 +63,15 @@ export function HistoryView() {
       const response = await fetch(`/api/sessions?limit=100${query}`, {
         cache: 'no-store',
       })
-      if (!response.ok) throw new Error('无法读取历史会话')
+      if (!response.ok) throw new Error(t('history.error.read'))
       const payload = await response.json() as { sessions: HistorySession[] }
       setSessions(payload.sessions)
     } catch (loadError) {
-      setError(loadError instanceof Error ? loadError.message : '加载失败')
+      setError(loadError instanceof Error ? loadError.message : t('history.error.load'))
     } finally {
       setLoading(false)
     }
-  }, [filter])
+  }, [filter, t])
 
   useEffect(() => {
     void load()
@@ -71,7 +83,7 @@ export function HistoryView() {
       method: 'DELETE',
     })
     if (!response.ok) {
-      setError('删除失败，请稍后重试')
+      setError(t('history.error.delete'))
       return
     }
     setDeleting(null)
@@ -81,21 +93,21 @@ export function HistoryView() {
   return (
     <div className="mx-auto max-w-7xl px-4 py-6 sm:px-6">
       <PageHeader
-        overline="History"
-        title="历史"
-        description="会话、候选来源、审议过程、工具事件与文本版本均可恢复和导出。"
+        overline={t('history.overline')}
+        title={t('history.title')}
+        description={t('history.description')}
       />
       <div className="mx-auto max-w-5xl space-y-4">
         <UsageOverviewCard />
         <Card
-          overline="Sessions"
-          title="历史会话"
+          overline={t('history.sessions.overline')}
+          title={t('history.sessions.title')}
           actions={
             <div className="inline-flex rounded-sm border border-line-2 bg-paper p-0.5">
               {([
-                ['all', '全部'],
-                ['en_to_zh', '英译中'],
-                ['zh_to_en', '中译英'],
+                ['all', t('history.filter.all')],
+                ['en_to_zh', t('history.filter.enToZh')],
+                ['zh_to_en', t('history.filter.zhToEn')],
               ] as const).map(([value, label]) => (
                 <button
                   key={value}
@@ -116,10 +128,10 @@ export function HistoryView() {
         >
           <div className="mb-4 flex gap-2 border-b border-line pb-3">
             <button type="button" onClick={() => setTab('sessions')}>
-              <Badge variant={tab === 'sessions' ? 'solid' : 'subtle'}>单篇任务</Badge>
+              <Badge variant={tab === 'sessions' ? 'solid' : 'subtle'}>{t('history.tab.sessions')}</Badge>
             </button>
             <button type="button" onClick={() => setTab('batches')}>
-              <Badge variant={tab === 'batches' ? 'solid' : 'subtle'}>批量任务</Badge>
+              <Badge variant={tab === 'batches' ? 'solid' : 'subtle'}>{t('history.tab.batches')}</Badge>
             </button>
           </div>
           {tab === 'batches' ? (
@@ -127,12 +139,12 @@ export function HistoryView() {
           ) : loading ? (
             <div className="flex min-h-40 items-center justify-center"><Spinner /></div>
           ) : error ? (
-            <div className="rounded-sm border border-cinnabar/30 bg-cinnabar/5 p-4 text-sm text-cinnabar">
+            <div role="alert" className="rounded-sm border border-cinnabar/30 bg-cinnabar/5 p-4 text-sm text-cinnabar">
               {error}
             </div>
           ) : sessions.length === 0 ? (
             <div className="rounded-sm border border-dashed border-line-2 bg-paper/60 px-4 py-12 text-center text-sm leading-6 text-ink-4">
-              当前筛选下暂无历史会话。
+              {t('history.empty')}
             </div>
           ) : (
             <ol className="divide-y divide-line">
@@ -141,10 +153,14 @@ export function HistoryView() {
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div className="min-w-0 flex-1">
                       <div className="flex flex-wrap items-center gap-2">
-                        <Badge variant="outline">{directionLabel(session.direction)}</Badge>
-                        <Badge variant="subtle">{session.state}</Badge>
+                        <Badge variant="outline">{directionLabel(t, session.direction)}</Badge>
+                        <Badge variant="subtle">
+                          {session.state in SESSION_STATE_KEYS
+                            ? t(SESSION_STATE_KEYS[session.state as keyof typeof SESSION_STATE_KEYS])
+                            : session.state}
+                        </Badge>
                         <span className="text-xs text-ink-4">
-                          {session.updated_at}
+                          {formatDate(session.updated_at, { dateStyle: 'medium', timeStyle: 'short' })}
                         </span>
                       </div>
                       <p className="mt-2 line-clamp-2 font-serif text-sm leading-6 text-ink">
@@ -152,16 +168,16 @@ export function HistoryView() {
                       </p>
                       {session.task_brief && (
                         <p className="mt-1 line-clamp-1 text-xs text-ink-3">
-                          要求：{session.task_brief}
+                          {t('history.requirements', { brief: session.task_brief })}
                         </p>
                       )}
                       <p className="mt-2 text-xs text-ink-4">
-                        实际调用 {session.agent_invocation_count} 个 Agent
+                        {t('history.calls', { count: formatNumber(session.agent_invocation_count) })}
                         {session.models.length > 0
                           ? ` · ${session.models.join(' / ')}`
                           : ''}
                         {session.latest_version
-                          ? ` · 最终 v${session.latest_version.version_no}`
+                          ? ` · ${t('history.finalVersion', { version: formatNumber(session.latest_version.version_no) })}`
                           : ''}
                       </p>
                     </div>
@@ -171,28 +187,28 @@ export function HistoryView() {
                         size="sm"
                         variant="outline"
                       >
-                        查看 / 继续
+                        {t('history.view')}
                       </Button>
                       <Button
                         href={`/api/sessions/${encodeURIComponent(session.id)}/export?format=md`}
                         size="sm"
                         variant="ghost"
                       >
-                        Markdown
+                        {t('history.export.markdown')}
                       </Button>
                       <Button
                         href={`/api/sessions/${encodeURIComponent(session.id)}/export?format=json`}
                         size="sm"
                         variant="ghost"
                       >
-                        JSON
+                        {t('history.export.json')}
                       </Button>
                       <Button
                         size="sm"
                         variant="ghost"
                         onClick={() => setDeleting(session)}
                       >
-                        删除
+                        {t('history.delete')}
                       </Button>
                     </div>
                   </div>
@@ -205,20 +221,20 @@ export function HistoryView() {
       <Modal
         open={deleting != null}
         onClose={() => setDeleting(null)}
-        title="删除历史会话？"
+        title={t('history.delete.title')}
         footer={
           <>
             <Button variant="ghost" size="sm" onClick={() => setDeleting(null)}>
-              取消
+              {t('common.cancel')}
             </Button>
             <Button size="sm" onClick={() => void confirmDelete()}>
-              删除
+              {t('history.delete')}
             </Button>
           </>
         }
       >
         <p className="text-sm leading-6 text-ink-2">
-          会话、候选输出、版本和审计事件将一并删除。此操作不可恢复。
+          {t('history.delete.description')}
         </p>
       </Modal>
     </div>

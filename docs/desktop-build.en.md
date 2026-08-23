@@ -21,6 +21,16 @@ In production web environments, a strong random `AGENTIC_SECRET_KEY` must be set
 
 ## 3. Build
 
+Source development and standalone preview are deliberately separate:
+
+```bash
+npm run desktop
+npm run build:standalone
+npm run desktop:preview
+```
+
+`desktop` starts Electron plus a managed Next.js development server and uses `.next-electron-dev`; no standalone build is required. The normal `dev` command uses `.next-web-dev`, so simultaneous source entry points do not write the same Next cache. `desktop:preview` reads only the existing `.next/standalone` tree. If it is missing, the app explains which two commands to run and exits without building anything. Packaged applications always start `resources/app/server.js` and never fall back to a source or development server.
+
 ```bash
 npm ci
 npm run typecheck
@@ -29,7 +39,7 @@ npm run build:standalone
 npm run package:win
 ```
 
-`build:standalone` cleans only the reproducible `.next/standalone` output. It removes local paths such as `.omo/`, `data/`, and `迭代文档/` if tracing copied them, then automatically runs the release-tree scan. After the scan passes, it uses an isolated temporary data directory and random key to start the real standalone server on an OS-assigned non-3000 port and waits for `/api/health/ready`. The build fails when it finds a database, runtime record, development note, possible credential, or missing runtime dependency. Existing services and real workspace data directories are never stopped, deleted, or rewritten.
+`build:standalone` cleans only the reproducible `.next/standalone` output. It removes local paths such as `.omo/`, `data/`, `迭代文档/`, and the complete `FSBP_Test/` dataset tree if tracing copied them, then automatically runs the release-tree scan. Next's tracing exclusions reduce unnecessary copies, while this post-processing cleanup is the cross-platform release boundary because Next 15 tracing on Windows may not apply POSIX exclude globs to backslash-normalized paths. After the scan passes, the command uses an isolated temporary data directory and random key to start the real standalone server on an OS-assigned non-3000 port and waits for `/api/health/ready`. The build fails when it finds a database, dataset/private experiment artifact, runtime record, development note, possible credential, or missing runtime dependency. Existing services and real workspace data directories are never stopped, deleted, or rewritten.
 
 `package:win` rebuilds `better-sqlite3` for the Electron ABI in a temporary staging directory without spaces, prepares the standalone assets, and lets electron-builder produce both NSIS and portable targets simultaneously. Before packaging, a Windows ICO with multiple layers ranging from 16 to 256 px is generated from `app/icon.svg`, eliminating the need for external icon conversion tools. Transient download or build failures retry up to three times; deterministic errors still exit with a non-zero status. The command does not overwrite native modules used by Node.js in the development environment.
 

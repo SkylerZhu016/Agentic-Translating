@@ -9,35 +9,41 @@ import type {
   DisagreementMapDto,
 } from '@/src/lib/contracts/disagreement-map'
 import { Badge, Button, Card, Spinner } from '@/src/components/ui'
+import { localizeDiagnosticError, useI18n, type MessageKey } from '@/src/i18n'
 import type { SelectionSnapshot } from './types'
 
-const DIFFERENCE_LABEL: Record<DisagreementDifferenceKind, string> = {
-  wording: '措辞',
-  punctuation: '标点',
-  number: '数字',
-  negation: '否定',
-  proper_noun: '专名',
-  terminology: '术语',
-  structure: '结构',
-}
+const DIFFERENCE_KEY = {
+  wording: 'disagreement.kind.wording',
+  punctuation: 'disagreement.kind.punctuation',
+  number: 'disagreement.kind.number',
+  negation: 'disagreement.kind.negation',
+  proper_noun: 'disagreement.kind.properNoun',
+  terminology: 'disagreement.kind.terminology',
+  structure: 'disagreement.kind.structure',
+} as const satisfies Record<DisagreementDifferenceKind, MessageKey>
 
-const HINT_LABEL: Record<DisagreementHintKind, string> = {
-  punctuation: '标点清单不同',
-  number: '数字清单不同',
-  negation: '否定表达不同',
-  proper_noun: '专名清单不同',
-  terminology: '术语清单不同',
-}
+const HINT_KEY = {
+  punctuation: 'disagreement.hint.punctuation',
+  number: 'disagreement.hint.number',
+  negation: 'disagreement.hint.negation',
+  proper_noun: 'disagreement.hint.properNoun',
+  terminology: 'disagreement.hint.terminology',
+} as const satisfies Record<DisagreementHintKind, MessageKey>
 
-const FALLBACK_LABEL: Record<DisagreementFallbackReason, string> = {
-  invalid_input: '输入不完整',
-  insufficient_candidates: '可比较候选不足',
-  empty_source: '原文为空',
-  empty_candidate: '候选正文为空',
-  too_large: '文本过长',
-  segmentation_failed: '分段失败',
-  alignment_failed: '片段未能对齐',
-  internal_error: '比较过程异常',
+const FALLBACK_KEY = {
+  invalid_input: 'disagreement.fallback.invalidInput',
+  insufficient_candidates: 'disagreement.fallback.insufficientCandidates',
+  empty_source: 'disagreement.fallback.emptySource',
+  empty_candidate: 'disagreement.fallback.emptyCandidate',
+  too_large: 'disagreement.fallback.tooLarge',
+  segmentation_failed: 'disagreement.fallback.segmentationFailed',
+  alignment_failed: 'disagreement.fallback.alignmentFailed',
+  internal_error: 'disagreement.fallback.internalError',
+} as const satisfies Record<DisagreementFallbackReason, MessageKey>
+
+function adoptInstruction(body: string) {
+  // This is an Agent instruction, so it stays stable when the display locale changes.
+  return `请只把当前选中的最终译文片段替换为下面的候选正文，保持全文其他位置不变。\n\n替换内容：\n${body}`
 }
 
 function uniqueSelection(
@@ -73,6 +79,7 @@ function Hotspot({
   busy: boolean
   onAdopt: (instruction: string, selection: SelectionSnapshot) => void
 }) {
+  const { t, formatNumber } = useI18n()
   const selection = uniqueSelection(currentText, hotspot.finalSegment)
   const candidateNames = useMemo(
     () => new Map(
@@ -92,7 +99,7 @@ function Hotspot({
         </span>
         <span className="min-w-0 flex-1">
           <span className="block font-serif text-sm font-medium text-ink">
-            原文片段 {hotspot.index + 1}
+            {t('disagreement.hotspot', { number: formatNumber(hotspot.index + 1) })}
           </span>
           <span className="mt-0.5 block truncate text-xs text-ink-3">
             {hotspot.sourceRange.text}
@@ -100,14 +107,14 @@ function Hotspot({
         </span>
         <span className="flex max-w-32 flex-wrap justify-end gap-1">
           {hotspot.differenceKinds.slice(0, 3).map((kind) => (
-            <Badge key={kind} variant="subtle">{DIFFERENCE_LABEL[kind]}</Badge>
+            <Badge key={kind} variant="subtle">{t(DIFFERENCE_KEY[kind])}</Badge>
           ))}
         </span>
       </summary>
 
       <div className="space-y-4 bg-paper px-4 py-4">
         <div>
-          <p className="mb-1 text-xs font-medium tracking-wide text-ink-3">来源片段</p>
+          <p className="mb-1 text-xs font-medium tracking-wide text-ink-3">{t('disagreement.sourceSegment')}</p>
           <blockquote className="whitespace-pre-wrap rounded-sm border border-line bg-paper-raise px-3 py-2 font-serif text-sm leading-6 text-ink-2">
             {hotspot.sourceRange.text}
           </blockquote>
@@ -115,7 +122,7 @@ function Hotspot({
 
         {hotspot.finalSegment != null && (
           <div>
-            <p className="mb-1 text-xs font-medium tracking-wide text-ink-3">当前最终译文片段</p>
+            <p className="mb-1 text-xs font-medium tracking-wide text-ink-3">{t('disagreement.finalSegment')}</p>
             <blockquote className="whitespace-pre-wrap rounded-sm border border-line bg-paper-sink/70 px-3 py-2 font-serif text-sm leading-6 text-ink-2">
               {hotspot.finalSegment}
             </blockquote>
@@ -123,7 +130,7 @@ function Hotspot({
         )}
 
         <div className="space-y-2">
-          <p className="text-xs font-medium tracking-wide text-ink-3">候选差异</p>
+          <p className="text-xs font-medium tracking-wide text-ink-3">{t('disagreement.candidateDifferences')}</p>
           {hotspot.candidates.map((candidate) => {
             const isCurrent = hotspot.adoptedCandidateIds.includes(
               candidate.invocationId,
@@ -138,7 +145,7 @@ function Hotspot({
                   <Badge variant="subtle" className="max-w-full break-all">
                     {candidate.model}
                   </Badge>
-                  {isCurrent && <Badge variant="solid">当前采用</Badge>}
+                  {isCurrent && <Badge variant="solid">{t('disagreement.current')}</Badge>}
                 </div>
                 <p className="whitespace-pre-wrap font-serif text-sm leading-6 text-ink-2">
                   {candidate.bodySegment}
@@ -150,11 +157,11 @@ function Hotspot({
                     className="mt-3"
                     disabled={!canAdopt || busy}
                     onClick={() => onAdopt(
-                      `请只把当前选中的最终译文片段替换为下面的候选正文，保持全文其他位置不变。\n\n替换内容：\n${candidate.bodySegment}`,
+                      adoptInstruction(candidate.bodySegment),
                       selection,
                     )}
                   >
-                    交给编辑 Agent 采用
+                    {t('disagreement.adopt')}
                   </Button>
                 )}
               </div>
@@ -162,7 +169,7 @@ function Hotspot({
           })}
           {hotspot.finalSegment != null && !selection && (
             <p className="text-xs leading-5 text-ink-4">
-              当前译文中无法唯一定位这段文字，因此暂不提供自动采用操作。
+              {t('disagreement.notUnique')}
             </p>
           )}
         </div>
@@ -170,18 +177,18 @@ function Hotspot({
         {hotspot.hints.length > 0 && (
           <div className="rounded-sm border border-line-2 bg-paper-sink/60 px-3 py-3">
             <div className="mb-2 flex items-center gap-2">
-              <p className="text-xs font-medium tracking-wide text-ink-3">确定性提示</p>
-              <Badge variant="outline">机械确定</Badge>
+              <p className="text-xs font-medium tracking-wide text-ink-3">{t('disagreement.deterministicHints')}</p>
+              <Badge variant="outline">{t('disagreement.mechanical')}</Badge>
             </div>
             <ul className="space-y-2 text-xs leading-5 text-ink-3">
               {hotspot.hints.map((hint) => (
                 <li key={hint.kind}>
-                  <span className="font-medium text-ink-2">{HINT_LABEL[hint.kind]}：</span>
+                  <span className="font-medium text-ink-2">{t(HINT_KEY[hint.kind])}: </span>
                   {hint.candidateValues.map((entry) => (
                     <span key={entry.invocationId} className="ml-1.5 inline-block">
                       {candidateNames.get(entry.invocationId) ?? entry.invocationId.slice(0, 8)}
                       {' '}
-                      [{entry.values.join('、') || '无'}]
+                      [{entry.values.join(' · ') || t('disagreement.none')}]
                     </span>
                   ))}
                 </li>
@@ -211,6 +218,7 @@ export function DisagreementMap({
   busy: boolean
   onAdopt: (instruction: string, selection: SelectionSnapshot) => void
 }) {
+  const { t, formatNumber } = useI18n()
   const [requested, setRequested] = useState(false)
   const [reloadNo, setReloadNo] = useState(0)
   const [map, setMap] = useState<DisagreementMapDto | null>(null)
@@ -242,15 +250,15 @@ export function DisagreementMap({
             ? payload as { error?: unknown; message?: unknown }
             : null
           throw new Error(
-            typeof detail?.message === 'string'
-              ? detail.message
-              : typeof detail?.error === 'string'
-                ? detail.error
-                : `分歧地图请求失败（${response.status}）`,
+            localizeDiagnosticError(
+              t,
+              detail?.error,
+              t('disagreement.error.request', { status: response.status }),
+            ),
           )
         }
         if (!isDisagreementMapDto(payload)) {
-          throw new Error('分歧地图返回了无法识别的数据')
+          throw new Error(t('disagreement.error.invalid'))
         }
         setMap(payload)
       })
@@ -259,7 +267,7 @@ export function DisagreementMap({
         setError(
           fetchError instanceof Error
             ? fetchError.message
-            : '分歧地图暂时无法加载',
+            : t('disagreement.error.unavailable'),
         )
       })
       .finally(() => {
@@ -273,23 +281,26 @@ export function DisagreementMap({
     finalVersionId,
     candidateRevision,
     reloadNo,
+    t,
   ])
 
   return (
     <Card
-      overline="Evidence"
-      title="分歧地图"
+      overline={t('disagreement.overline')}
+      title={t('disagreement.title')}
       padded={false}
       testId="disagreement-map"
       actions={map ? (
         <Badge variant={map.status === 'ready' ? 'outline' : 'subtle'}>
-          {map.status === 'ready' ? `${map.hotspots.length} 处分歧` : '全文比较'}
+          {map.status === 'ready'
+            ? t('disagreement.count', { count: formatNumber(map.hotspots.length) })
+            : t('disagreement.fullComparison')}
         </Badge>
       ) : undefined}
     >
       <div className="space-y-3 px-4 py-4">
         <p className="text-xs leading-5 text-ink-3">
-          对照各翻译 Agent 的候选正文与当前译文。提示仅是机械差异，不判断对错。
+          {t('disagreement.description')}
         </p>
 
         {!requested && (
@@ -299,14 +310,14 @@ export function DisagreementMap({
             disabled={!sessionId}
             onClick={() => setRequested(true)}
           >
-            查看分歧地图
+            {t('disagreement.open')}
           </Button>
         )}
 
         {requested && loading && (
           <div className="flex items-center gap-2 py-2 text-sm text-ink-3">
             <Spinner size="sm" />
-            正在比较候选正文…
+            {t('disagreement.loading')}
           </div>
         )}
 
@@ -319,7 +330,7 @@ export function DisagreementMap({
               className="mt-2"
               onClick={() => setReloadNo((value) => value + 1)}
             >
-              重试
+              {t('disagreement.retry')}
             </Button>
           </div>
         )}
@@ -327,10 +338,12 @@ export function DisagreementMap({
         {requested && map && !loading && (
           <div className="flex flex-wrap items-center gap-2">
             <Badge variant="subtle">
-              {map.segmentationMode === 'full_text' ? '全文' : '按片段'}
+              {map.segmentationMode === 'full_text'
+                ? t('disagreement.mode.full')
+                : t('disagreement.mode.segmented')}
             </Badge>
             {map.finalAlignmentStatus === 'unavailable' && (
-              <span className="text-xs text-ink-4">当前译文未能按片段对齐</span>
+              <span className="text-xs text-ink-4">{t('disagreement.alignmentUnavailable')}</span>
             )}
             <Button
               variant="ghost"
@@ -338,7 +351,7 @@ export function DisagreementMap({
               className="ml-auto"
               onClick={() => setReloadNo((value) => value + 1)}
             >
-              刷新
+              {t('disagreement.refresh')}
             </Button>
           </div>
         )}
@@ -347,7 +360,7 @@ export function DisagreementMap({
       {requested && map?.status === 'ready' && !loading && (
         map.hotspots.length === 0 ? (
           <p className="border-t border-line px-4 py-4 text-sm leading-6 text-ink-3">
-            当前候选在机械比较阈值下没有形成明显分歧片段。
+            {t('disagreement.noHotspots')}
           </p>
         ) : (
           <div className="max-h-[42rem] overflow-y-auto border-t border-line">
@@ -368,15 +381,15 @@ export function DisagreementMap({
       {requested && map?.status === 'full_text_fallback' && map.fallback && !loading && (
         <div className="space-y-3 border-t border-line px-4 py-4">
           <div className="flex flex-wrap items-center gap-2">
-            <Badge variant="outline">本次只能按全文比较</Badge>
+            <Badge variant="outline">{t('disagreement.fullTextOnly')}</Badge>
             <span className="text-xs text-ink-4">
-              {FALLBACK_LABEL[map.fallback.reason]}
+              {t(FALLBACK_KEY[map.fallback.reason])}
             </span>
           </div>
 
           <details className="rounded-sm border border-line bg-paper" open>
             <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-ink-3">
-              原文全文
+              {t('disagreement.sourceFull')}
             </summary>
             <p className="max-h-48 overflow-y-auto whitespace-pre-wrap border-t border-line px-3 py-3 font-serif text-sm leading-6 text-ink-2">
               {map.fallback.sourceText}
@@ -400,7 +413,7 @@ export function DisagreementMap({
           {map.fallback.finalText != null && (
             <details className="rounded-sm border border-line bg-paper">
               <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-ink-3">
-                当前最终译文全文
+                {t('disagreement.finalFull')}
               </summary>
               <p className="max-h-48 overflow-y-auto whitespace-pre-wrap border-t border-line px-3 py-3 font-serif text-sm leading-6 text-ink-2">
                 {map.fallback.finalText}

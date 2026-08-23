@@ -62,7 +62,7 @@ describe('seed — built-in prompt templates', () => {
     ).toBe(true)
   })
 
-  it('seeds independent direction prompt bundles and SQLite drafts', () => {
+  it('seeds independent direction prompt bundles without inventing user drafts', () => {
     seed(db)
     const bundles = db.prepare(
       'SELECT direction, prompt_language FROM direction_prompt_bundles ORDER BY direction',
@@ -74,10 +74,7 @@ describe('seed — built-in prompt templates', () => {
       { direction: 'en_to_zh', prompt_language: 'zh' },
       { direction: 'zh_to_en', prompt_language: 'en' },
     ])
-    expect(drafts).toEqual([
-      { direction: 'en_to_zh' },
-      { direction: 'zh_to_en' },
-    ])
+    expect(drafts).toEqual([])
   })
 
   it('is idempotent — second seed call inserts no duplicates', () => {

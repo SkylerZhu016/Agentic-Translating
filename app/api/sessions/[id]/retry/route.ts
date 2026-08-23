@@ -7,6 +7,7 @@ import {
   startVNextFailedRetries,
   startVNextInvocationRetry,
 } from '@/src/lib/orchestration/vnext-runner'
+import { sessionPreflightErrorDto } from '@/src/lib/services/session-preflight'
 
 const retrySchema = z.union([
   z.object({
@@ -77,6 +78,12 @@ export async function POST(
       : startVNextFailedRetries(db, sessionId, parsed.data.configMode)
     return Response.json({ runs }, { status: 202 })
   } catch (error) {
+    const preflightError = sessionPreflightErrorDto(error)
+    if (preflightError) {
+      return Response.json(preflightError.body, {
+        status: preflightError.status,
+      })
+    }
     const message = error instanceof Error ? error.message : String(error)
     const status =
       message === 'session_not_found' || message === 'invocation_not_found'

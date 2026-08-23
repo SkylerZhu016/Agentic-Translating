@@ -23,7 +23,11 @@ import { createSessionService } from '@/src/lib/services/session-service'
 import {
   buildRevisionReferenceMessage,
   createChatHandlers,
+  resolveChatConfig,
+  resolveChatReviewConfig,
 } from '@/src/lib/handlers/chat-handler'
+import type { ConfigSnapshot } from '@/src/lib/contracts/types'
+import type { ConfigSnapshotVNext, ModelBinding } from '@/src/lib/contracts/vnext'
 import { encodeSSE, parseSSEChunk } from '@/src/lib/contracts/sse'
 import { startMockLLM, type MockLLMInstance } from '../fixtures/mock-llm'
 import {
@@ -31,6 +35,8 @@ import {
   estimateProjectContextTokens,
 } from '@/src/lib/db/project-repositories'
 import { getChatActivity } from '@/src/lib/chat/activity'
+import { runSessionPreflight } from '@/src/lib/services/session-preflight'
+import { currentRuntimeEndpoint } from '@/src/lib/services/runtime-endpoint-credentials'
 
 // Inline migration SQL
 const MIGRATION_SQL_0001 = fs.readFileSync(
@@ -190,6 +196,74 @@ describe('Chat SSE Route', () => {
 
   const DEF_SOURCE = { sourceText: 'Hello world', sourceLang: 'English', targetLang: 'Chinese' }
 
+  function pointLiveEndpointAt(baseUrl: string, apiKey = 'sk-test'): void {
+    const endpoint = repos.endpoints.getById(1)
+    if (!endpoint) throw new Error('Live test endpoint 1 is unavailable.')
+    repos.endpoints.update({
+      ...endpoint,
+      base_url: baseUrl,
+      api_key: apiKey,
+    })
+  }
+
+  it('resolves request_review from the frozen review binding and its own cap', () => {
+    const shared = { endpointId: 1, model: 'shared-model' }
+    const frozen = {
+      version: 3,
+      endpoint: null,
+      endpoints: [],
+      agents: [],
+      coordinator: null,
+      prompts: {},
+      endpointSnapshots: [
+        {
+          id: 1,
+          name: 'editing',
+          baseUrl: 'https://editing.invalid',
+          hasApiKey: true,
+          contextWindow: 32_768,
+        },
+        {
+          id: 2,
+          name: 'review',
+          baseUrl: 'https://review.invalid',
+          hasApiKey: true,
+          contextWindow: 131_072,
+        },
+      ],
+      modelBindings: {
+        defaultWorker: shared,
+        mainAgent: shared,
+        editingAgent: {
+          endpointId: 1,
+          model: 'shared-model',
+          maxOutputTokens: 2_048,
+        },
+        reviewAgent: {
+          endpointId: 2,
+          model: 'shared-model',
+          maxOutputTokens: 8_192,
+        },
+      },
+    } as ConfigSnapshot
+
+    const editing = resolveChatConfig(frozen)
+    expect(editing).toMatchObject({
+      bindingRole: 'editingAgent',
+      endpointId: 1,
+      maxOutputTokens: 2_048,
+    })
+    expect(editing).not.toBeNull()
+    const review = resolveChatReviewConfig(frozen, editing!)
+    expect(review).toMatchObject({
+      bindingRole: 'reviewAgent',
+      endpointId: 2,
+      model: 'shared-model',
+      contextWindow: 131_072,
+      maxOutputTokens: 8_192,
+    })
+  })
+
   it('includes complete body-only workflow evidence in revision reference data', () => {
     const message = buildRevisionReferenceMessage({
       promptLanguage: 'en',
@@ -287,15 +361,17 @@ describe('Chat SSE Route', () => {
       source: 'assemble',
     })
 
-    // Re-snapshot with mock LLM URL (the snapshot was taken at create time
-    // before we set up the mock LLM, so we need to update it)
+    // Keep deliberately hostile legacy connection data in the immutable
+    // snapshot. Every successful provider request in this fixture therefore
+    // proves that chat resolves the current endpoints row instead of reusing
+    // a frozen URL or key.
     const latest = repos.sessions.getById(s.id)!
     const updatedSnapshot = JSON.parse(latest.config_snapshot)
     updatedSnapshot.endpoint = {
       id: 1,
       name: 'test-ep',
-      base_url: mockLLM.url,
-      api_key: 'sk-test',
+      base_url: 'https://frozen-chat-endpoint.invalid',
+      api_key: 'sk-frozen-chat-key-must-not-be-used',
       created_at: new Date().toISOString(),
     }
     updatedSnapshot.coordinator = {
@@ -684,16 +760,7 @@ describe('Chat SSE Route', () => {
 
       try {
         const sid = await createAssembledSession()
-        const session = repos.sessions.getById(sid)!
-        const snapshot = JSON.parse(session.config_snapshot)
-        if (snapshot.endpoint) snapshot.endpoint.base_url = providerUrl
-        for (const endpoint of snapshot.endpoints ?? []) {
-          endpoint.base_url = providerUrl
-        }
-        for (const endpoint of snapshot.endpointSnapshots ?? []) {
-          endpoint.baseUrl = providerUrl
-        }
-        setSnapshotConfig(db, sid, snapshot)
+        pointLiveEndpointAt(providerUrl)
 
         const request = new NextRequest(
           `http://localhost/api/sessions/${sid}/chat`,
@@ -923,6 +990,12 @@ describe('Chat SSE Route', () => {
       expect(request.tools?.map((tool) => tool.function?.name)).toEqual([
         'replace_text',
       ])
+      expect(
+        db.prepare('SELECT COUNT(*) FROM orchestration_runs').pluck().get(),
+      ).toBe(0)
+      expect(
+        db.prepare('SELECT COUNT(*) FROM agent_invocations').pluck().get(),
+      ).toBe(0)
     })
 
     it('returns SSE stream with expected events for a message turn', async () => {
@@ -966,6 +1039,134 @@ describe('Chat SSE Route', () => {
       const userMsg = messages.find((m) => m.role === 'user')
       expect(userMsg).toBeDefined()
       expect(userMsg!.content).toContain('请把')
+    })
+
+    it('does not block an ordinary edit when an unused frozen review endpoint was deleted', async () => {
+      sessionId = await createAssembledSession()
+      const binding = (
+        endpointId: number,
+        model: string,
+      ): ModelBinding => ({
+        endpointId,
+        model,
+        contextWindow: 131_072,
+        maxOutputTokens: 2_048,
+      })
+      const editingBinding = binding(1, 'echo-model')
+      const reviewBinding = binding(999, 'deleted-review-model')
+      const vnext: ConfigSnapshotVNext = {
+        version: 3,
+        direction: 'en_to_zh',
+        promptBundleSnapshot: {
+          direction: 'en_to_zh',
+          promptLanguage: 'zh',
+          mainAgentSystemPrompt: '主编提示',
+          workerBasePrompt: '译者提示',
+          reviewPrompt: '审查提示',
+          filterPrompt: '筛选提示',
+          orchestratePrompt: '统筹提示',
+          assemblePrompt: '组装提示',
+          editingPrompt: '只处理当前用户的编辑请求。',
+          toolDescriptions: {},
+          version: 1,
+        },
+        agentVariantSnapshots: [
+          {
+            id: 'semantic',
+            archetypeId: 'semantic-fidelity',
+            direction: 'en_to_zh',
+            catalogName: '语义',
+            catalogDescription: '语义忠实',
+            rolePrompt: '忠实翻译',
+            promptLanguage: 'zh',
+            promptVersion: 1,
+            enabled: true,
+            endpointOverrideId: null,
+            modelOverride: null,
+            sortOrder: 1,
+          },
+          {
+            id: 'natural',
+            archetypeId: 'target-naturalness',
+            direction: 'en_to_zh',
+            catalogName: '自然',
+            catalogDescription: '自然表达',
+            rolePrompt: '自然翻译',
+            promptLanguage: 'zh',
+            promptVersion: 1,
+            enabled: true,
+            endpointOverrideId: null,
+            modelOverride: null,
+            sortOrder: 2,
+          },
+        ],
+        endpointSnapshots: [
+          {
+            id: 1,
+            name: 'editing',
+            baseUrl: mockLLM.url,
+            chatCompletionsPath: '/v1/chat/completions',
+            hasApiKey: true,
+            contextWindow: 131_072,
+          },
+          {
+            id: 999,
+            name: 'deleted review',
+            baseUrl: 'https://deleted-review.invalid',
+            chatCompletionsPath: '/v1/chat/completions',
+            hasApiKey: true,
+            contextWindow: 131_072,
+          },
+        ],
+        modelBindings: {
+          defaultWorker: editingBinding,
+          mainAgent: editingBinding,
+          reviewAgent: reviewBinding,
+          filterAgent: editingBinding,
+          orchestrateAgent: editingBinding,
+          assembleAgent: editingBinding,
+          editingAgent: editingBinding,
+        },
+        presetRevisionSnapshot: null,
+        taskBrief: '',
+        constraints: {},
+        orchestrationPolicy: {
+          teamPolicy: 'fixed',
+          reviewMode: 'main_editor',
+          maxAgentCalls: 4,
+          candidateAnnotationMode: 'body_only',
+        },
+      }
+      vnext.preflight = runSessionPreflight({
+        sourceText: DEF_SOURCE.sourceText,
+        snapshot: vnext,
+      })
+      expect(vnext.preflight.status).toBe('pass')
+      setSnapshotConfig(db, sessionId, vnext)
+
+      const response = await handlers.POST(
+        new NextRequest(`http://localhost/api/sessions/${sessionId}/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: '请说明当前译文，不要调用审查工具。' }),
+        }),
+        { params: Promise.resolve({ id: sessionId }) },
+      )
+      expect(response.status).toBe(200)
+      const events = await readSSEEvents(response)
+      expect(events.map((event) => event.event)).toContain('message_complete')
+      expect(JSON.stringify(events)).not.toContain('runtime_endpoint_deleted')
+
+      const chatSnapshot = vnext as unknown as ConfigSnapshot
+      const editing = resolveChatConfig(chatSnapshot, db)
+      const review = resolveChatReviewConfig(chatSnapshot, editing!)
+      expect(review).toMatchObject({ endpointId: 999, apiKey: '' })
+      try {
+        currentRuntimeEndpoint(db, review!.endpointId)
+        throw new Error('expected deleted review endpoint failure')
+      } catch (error) {
+        expect(error).toMatchObject({ code: 'runtime_endpoint_deleted' })
+      }
     })
 
     it('user message includes selection context when selection is provided', async () => {
@@ -1062,16 +1263,9 @@ describe('Chat SSE Route', () => {
         })
       })
 
-      // Override the session's endpoint to point to our custom server
+      // Provider routing is live configuration, not immutable session data.
       const sid = await createAssembledSession()
-
-      const latest = repos.sessions.getById(sid)!
-      const snap = JSON.parse(latest.config_snapshot)
-      snap.endpoint.base_url = server.url
-      for (const endpoint of snap.endpoints ?? []) {
-        endpoint.base_url = server.url
-      }
-      setSnapshotConfig(db, sid, snap)
+      pointLiveEndpointAt(server.url)
 
       try {
         const req = new NextRequest(`http://localhost/api/sessions/${sid}/chat`, {
@@ -1173,13 +1367,7 @@ describe('Chat SSE Route', () => {
       })
 
       const sid = await createAssembledSession()
-      const latest = repos.sessions.getById(sid)!
-      const snapshot = JSON.parse(latest.config_snapshot)
-      snapshot.endpoint.base_url = server.url
-      for (const endpoint of snapshot.endpoints ?? []) {
-        endpoint.base_url = server.url
-      }
-      setSnapshotConfig(db, sid, snapshot)
+      pointLiveEndpointAt(server.url)
 
       try {
         const response = await handlers.POST(
@@ -1288,13 +1476,7 @@ describe('Chat SSE Route', () => {
       })
 
       const sid = await createAssembledSession()
-      const latest = repos.sessions.getById(sid)!
-      const snap = JSON.parse(latest.config_snapshot)
-      snap.endpoint.base_url = server.url
-      for (const endpoint of snap.endpoints ?? []) {
-        endpoint.base_url = server.url
-      }
-      setSnapshotConfig(db, sid, snap)
+      pointLiveEndpointAt(server.url)
 
       try {
         const req = new NextRequest(`http://localhost/api/sessions/${sid}/chat`, {
