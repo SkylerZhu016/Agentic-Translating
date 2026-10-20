@@ -1,5 +1,4 @@
-import { dictionary } from 'cmu-pronouncing-dictionary'
-import { getInitialAndFinal, pinyin } from 'pinyin-pro'
+import { chineseRhyme, englishRhyme } from '../poetry/pronunciation'
 import type {
   TranslationConstraints,
   TranslationDirection,
@@ -36,31 +35,6 @@ export interface TranslationEvidenceReport {
   caveat: string
   summary: string
   naturalLanguage: string
-}
-
-function englishRhyme(word: string): string | null {
-  const pronunciation = dictionary[word.toLowerCase()]
-  if (!pronunciation) return null
-  const phones = pronunciation
-    .replace(/\s+#.*$/, '')
-    .split(/\s+/)
-    .filter(Boolean)
-  let vowelIndex = -1
-  for (let index = phones.length - 1; index >= 0; index--) {
-    if (/[012]$/.test(phones[index])) {
-      vowelIndex = index
-      if (/[12]$/.test(phones[index])) break
-    }
-  }
-  if (vowelIndex < 0) return null
-  return phones.slice(vowelIndex).map((phone) => phone.replace(/[012]/g, '')).join('-')
-}
-
-function chineseRhyme(character: string): string | null {
-  if (!character) return null
-  const value = pinyin(character, { toneType: 'none' })
-  if (!value || value === character) return null
-  return getInitialAndFinal(value).final || null
 }
 
 function stanzaCount(text: string) {

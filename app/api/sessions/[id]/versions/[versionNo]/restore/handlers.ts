@@ -8,6 +8,14 @@ import { createRepositories } from '@/src/lib/db/repositories'
 
 export function createHandlers(db: Database.Database) {
   const repos = createRepositories(db)
+  const hasFinalVersionPointer = (
+    db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>
+  ).some((column) => column.name === 'final_version_id')
+  const selectRestoredVersion = hasFinalVersionPointer
+    ? db.prepare(
+        "UPDATE sessions SET final_version_id=?, updated_at=datetime('now') WHERE id=?",
+      )
+    : null
 
   return {
     // ────────────────────────────────────────────────────────────
@@ -36,18 +44,20 @@ export function createHandlers(db: Database.Database) {
         )
       }
 
-      // 2. Determine next version_no
-      const latest = repos.finalVersions.getLatestBySession(id)
-      const nextVersionNo = latest ? latest.version_no + 1 : 1
-
-      // 3. Transaction: insert restored version + system chat message
+      // 2. Publish the restored version and its audit message atomically.
+      // Modern workspaces read final_version_id, while legacy schemas read
+      // the newest version directly.
       const txn = db.transaction(() => {
-        repos.finalVersions.insert({
+        const latest = repos.finalVersions.getLatestBySession(id)
+        const nextVersionNo = latest ? latest.version_no + 1 : 1
+        const inserted = repos.finalVersions.insert({
           session_id: id,
           version_no: nextVersionNo,
           text: sourceVersion.text,
           source: 'restore',
         })
+        const restoredVersionId = Number(inserted.lastInsertRowid)
+        selectRestoredVersion?.run(restoredVersionId, id)
 
         repos.chatMessages.insert({
           session_id: id,
@@ -55,13 +65,13 @@ export function createHandlers(db: Database.Database) {
           content: `已恢复到版本 ${versionNo}`,
           tool_calls: null,
           tool_results: null,
-          version_id: null,
+          version_id: restoredVersionId,
         })
+        return repos.finalVersions.getById(restoredVersionId)!
       })
-      txn()
 
-      // 4. Return the newly created version
-      const newVersion = repos.finalVersions.getBySessionAndVersion(id, nextVersionNo)!
+      // 3. Return the same version now selected by detail and export consumers.
+      const newVersion = txn()
       return NextResponse.json(newVersion, { status: 200 })
     },
   }

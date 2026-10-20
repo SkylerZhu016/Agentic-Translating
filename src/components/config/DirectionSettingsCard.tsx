@@ -12,17 +12,28 @@ export function DirectionSettingsCard({ notify }: { notify: NotifyFn }) {
   const [desktop, setDesktop] = useState(false)
 
   useEffect(() => {
+    const controller = new AbortController()
     setDesktop(Boolean(window.agenticDesktop))
-    void fetch('/api/settings')
-      .then((response) => response.ok ? response.json() : [])
+    void fetch('/api/settings', { signal: controller.signal })
+      .then((response) => {
+        if (!response.ok) throw new Error(t('config.error.networkRetry'))
+        return response.json()
+      })
       .then((settings: Array<{ key: string; value: string }>) => {
+        if (controller.signal.aborted) return
         setSuppressed(
           settings.find(
             (entry) => entry.key === 'suppress_direction_switch_warning',
           )?.value === '1',
         )
       })
-  }, [])
+      .catch((error) => {
+        if (!controller.signal.aborted) notify(t('config.error.networkRetry'), {
+          message: error instanceof Error ? error.message : t('config.error.tryLater'),
+        })
+      })
+    return () => controller.abort()
+  }, [notify, t])
 
   async function restoreWarning() {
     setSaving(true)

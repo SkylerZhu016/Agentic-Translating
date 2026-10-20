@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Badge, Button, Card, Input, Modal, Spinner, Textarea } from '@/src/components/ui'
 import { useDirection } from '@/src/components/direction/DirectionProvider'
 import type {
@@ -12,6 +12,7 @@ import type {
 import type { ModelBinding } from '@/src/lib/contracts/vnext'
 import type { NotifyFn } from './shared'
 import { ModelPicker } from './ModelPicker'
+import { MODEL_BUDGET_LAYOUT, OutputBudgetField, OutputBudgetHint, parseOutputBudget } from './OutputBudgetField'
 import {
   localizeDiagnosticError,
   useI18n,
@@ -88,6 +89,7 @@ function VariantEditor({
   const [testError, setTestError] = useState('')
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
+  const [opened, setOpened] = useState(false)
 
   useEffect(() => {
     setName(variant.catalogName)
@@ -189,7 +191,7 @@ function VariantEditor({
   }
 
   return (
-    <details className="mt-3 rounded-sm border border-line bg-paper/55">
+    <details className="mt-3 rounded-sm border border-line bg-paper/55" onToggle={(event) => { if (event.currentTarget.open) setOpened(true) }}>
       <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-ink-2">
         {t('agentLibrary.variant.settings')}
         <span className="ml-2 font-normal text-ink-4">
@@ -202,7 +204,7 @@ function VariantEditor({
               })}
         </span>
       </summary>
-      <div className="space-y-3 border-t border-line px-3 py-3">
+      {opened && <div className="space-y-3 border-t border-line px-3 py-3">
         <label className="flex items-center gap-2 text-xs text-ink-2">
           <input
             type="checkbox"
@@ -310,7 +312,7 @@ function VariantEditor({
           )}
           {result && <IndependentTestOutput result={result} />}
         </div>
-      </div>
+      </div>}
     </details>
   )
 }
@@ -377,43 +379,73 @@ export function AgentLibraryPanel({ notify }: { notify: NotifyFn }) {
     editingAgent: { endpointId: null, model: '' },
   })
   const [profileSaving, setProfileSaving] = useState(false)
+  const [profileOutputBudgets, setProfileOutputBudgets] = useState<Partial<Record<ProfileRole, string>>>({})
+  const [profileOpened, setProfileOpened] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const loadController = useRef<AbortController | null>(null)
   const [testingRole, setTestingRole] = useState<ProfileRole | null>(null)
   const [roleTestStatus, setRoleTestStatus] = useState<
     Partial<Record<ProfileRole, { message: string; success: boolean }>>
   >({})
 
   const load = useCallback(async () => {
-    const [response, endpointResponse, profileResponse] = await Promise.all([
-      fetch(`/api/agent-catalog?direction=${direction}&includeDisabled=1`),
-      fetch('/api/endpoints'),
-      fetch(`/api/model-profiles/${direction}`),
-    ])
-    if (!response.ok) return
-    const payload = await response.json() as {
-      archetypes: AgentArchetype[]
-      variants: AgentDirectionVariant[]
+    loadController.current?.abort()
+    const controller = new AbortController()
+    loadController.current = controller
+    setLoading(true)
+    setLoadError(null)
+    try {
+      const [response, endpointResponse, profileResponse] = await Promise.all([
+        fetch(`/api/agent-catalog?direction=${direction}&includeDisabled=1`, { signal: controller.signal }),
+        fetch('/api/endpoints', { signal: controller.signal }),
+        fetch(`/api/model-profiles/${direction}`, { signal: controller.signal }),
+      ])
+      if (!response.ok || !endpointResponse.ok || !profileResponse.ok) throw new Error(t('config.error.networkRetry'))
+      const [payload, nextEndpoints, nextProfile] = await Promise.all([
+        response.json() as Promise<{ archetypes: AgentArchetype[]; variants: AgentDirectionVariant[] }>,
+        endpointResponse.json() as Promise<EndpointSummary[]>,
+        profileResponse.json(),
+      ])
+      if (controller.signal.aborted) return
+      setArchetypes(payload.archetypes)
+      setVariants(payload.variants)
+      setEndpoints(nextEndpoints)
+      if (nextProfile) {
+        setProfile(nextProfile)
+        setProfileOutputBudgets(Object.fromEntries(
+          PROFILE_ROLES.map(([key]) => [key, nextProfile[key]?.maxOutputTokens?.toString() ?? '']),
+        ))
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) setLoadError(error instanceof Error ? error.message : t('config.error.networkRetry'))
+    } finally {
+      if (!controller.signal.aborted) setLoading(false)
     }
-    setArchetypes(payload.archetypes)
-    setVariants(payload.variants)
-    if (endpointResponse.ok) {
-      setEndpoints(await endpointResponse.json())
-    }
-    if (profileResponse.ok) {
-      const value = await profileResponse.json()
-      if (value) setProfile(value)
-    }
-  }, [direction])
+  }, [direction, t])
 
   async function saveProfile() {
+    if (PROFILE_ROLES.some(([key]) => parseOutputBudget(profileOutputBudgets[key] ?? '') === undefined)) {
+      notify(t('outputBudget.error'))
+      return
+    }
+    const nextProfile = Object.fromEntries(PROFILE_ROLES.map(([key]) => [
+      key,
+      { ...profile[key], maxOutputTokens: parseOutputBudget(profileOutputBudgets[key] ?? '') },
+    ]))
     setProfileSaving(true)
     try {
       const response = await fetch(`/api/model-profiles/${direction}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(profile),
+        body: JSON.stringify(nextProfile),
       })
       if (!response.ok) throw new Error(t('agentLibrary.profile.error.save'))
-      setProfile(await response.json())
+      const savedProfile = await response.json()
+      setProfile(savedProfile)
+      setProfileOutputBudgets(Object.fromEntries(
+        PROFILE_ROLES.map(([key]) => [key, savedProfile[key]?.maxOutputTokens?.toString() ?? '']),
+      ))
       notify(t('agentLibrary.profile.saved'), { tone: 'inverted' })
     } catch (error) {
       notify(t('config.error.save'), {
@@ -489,6 +521,7 @@ export function AgentLibraryPanel({ notify }: { notify: NotifyFn }) {
 
   useEffect(() => {
     void load()
+    return () => loadController.current?.abort()
   }, [load])
 
   const archetypeMap = useMemo(
@@ -505,27 +538,25 @@ export function AgentLibraryPanel({ notify }: { notify: NotifyFn }) {
   })
 
   async function clone(id: string) {
-    const response = await fetch(`/api/agent-catalog/${encodeURIComponent(id)}/clone`, {
-      method: 'POST',
-    })
-    if (!response.ok) {
-      notify(t('agentLibrary.clone.failed'))
-      return
+    try {
+      const response = await fetch(`/api/agent-catalog/${encodeURIComponent(id)}/clone`, { method: 'POST' })
+      if (!response.ok) throw new Error(t('agentLibrary.clone.failed'))
+      notify(t('agentLibrary.cloned'), { tone: 'inverted' })
+      await load()
+    } catch (error) {
+      notify(t('agentLibrary.clone.failed'), { message: error instanceof Error ? error.message : t('config.error.networkRetry') })
     }
-    notify(t('agentLibrary.cloned'), { tone: 'inverted' })
-    await load()
   }
 
   async function remove(archetypeId: string) {
-    const response = await fetch(`/api/agent-catalog/${encodeURIComponent(archetypeId)}`, {
-      method: 'DELETE',
-    })
-    if (!response.ok) {
-      notify(t('agentLibrary.delete.failed'))
-      return
+    try {
+      const response = await fetch(`/api/agent-catalog/${encodeURIComponent(archetypeId)}`, { method: 'DELETE' })
+      if (!response.ok) throw new Error(t('agentLibrary.delete.failed'))
+      notify(t('agentLibrary.deleted'), { tone: 'inverted' })
+      await load()
+    } catch (error) {
+      notify(t('agentLibrary.delete.failed'), { message: error instanceof Error ? error.message : t('config.error.networkRetry') })
     }
-    notify(t('agentLibrary.deleted'), { tone: 'inverted' })
-    await load()
   }
 
   async function create() {
@@ -672,11 +703,16 @@ export function AgentLibraryPanel({ notify }: { notify: NotifyFn }) {
         </Button>
       }
     >
-      <details className="mb-4 rounded-sm border border-line bg-paper/55" open>
+      {loadError && <div role="alert" className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-sm border border-cinnabar/30 bg-cinnabar/5 p-3 text-sm text-cinnabar">
+        <p>{loadError}</p><Button size="sm" variant="outline" onClick={() => void load()}>{t('common.retry')}</Button>
+      </div>}
+      {loading && <div className="flex min-h-16 items-center justify-center"><Spinner /></div>}
+      <details className="mb-4 rounded-sm border border-line bg-paper/55" onToggle={(event) => { if (event.currentTarget.open) setProfileOpened(true) }}>
         <summary className="cursor-pointer px-3 py-2 text-sm font-medium text-ink-2">
           {t('agentLibrary.profile.title')}
         </summary>
-        <div className="space-y-3 border-t border-line px-3 py-3">
+        {profileOpened && <div className="space-y-3 border-t border-line px-3 py-3">
+          <OutputBudgetHint />
           {PROFILE_ROLES.map(([key, labelKey, hintKey]) => {
             const label = t(labelKey)
             return (
@@ -696,6 +732,7 @@ export function AgentLibraryPanel({ notify }: { notify: NotifyFn }) {
                     setProfile((current) => ({
                       ...current,
                       [key]: {
+                        ...current[key],
                         endpointId: event.target.value
                           ? Number(event.target.value)
                           : null,
@@ -716,18 +753,25 @@ export function AgentLibraryPanel({ notify }: { notify: NotifyFn }) {
                     </option>
                   ))}
                 </select>
-                <ModelPicker
-                  endpointId={profile[key].endpointId}
-                  value={profile[key].model}
-                  onChange={(model) =>
-                    setProfile((current) => ({
-                      ...current,
-                      [key]: { ...current[key], model },
-                    }))
-                  }
-                  emptyLabel={t('modelPicker.empty')}
-                  ariaLabel={t('agentLibrary.role.modelAria', { role: label })}
-                />
+                <div className={MODEL_BUDGET_LAYOUT}>
+                  <ModelPicker
+                    endpointId={profile[key].endpointId}
+                    value={profile[key].model}
+                    onChange={(model) =>
+                      setProfile((current) => ({
+                        ...current,
+                        [key]: { ...current[key], model },
+                      }))
+                    }
+                    emptyLabel={t('modelPicker.empty')}
+                    ariaLabel={t('agentLibrary.role.modelAria', { role: label })}
+                  />
+                  <OutputBudgetField
+                    value={profileOutputBudgets[key] ?? ''}
+                    onChange={(value) => setProfileOutputBudgets((current) => ({ ...current, [key]: value }))}
+                    role={label}
+                  />
+                </div>
                 <div className="min-h-[3.25rem] min-w-0">
                   <Button
                     type="button"
@@ -757,12 +801,12 @@ export function AgentLibraryPanel({ notify }: { notify: NotifyFn }) {
           <Button
             size="sm"
             variant="outline"
-            disabled={profileSaving}
+            disabled={loading || profileSaving || PROFILE_ROLES.some(([key]) => parseOutputBudget(profileOutputBudgets[key] ?? '') === undefined)}
             onClick={() => void saveProfile()}
           >
             {profileSaving && <Spinner size="sm" />}{t('agentLibrary.profile.save')}
           </Button>
-        </div>
+        </div>}
       </details>
       <Input
         value={search}

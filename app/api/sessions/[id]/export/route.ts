@@ -10,7 +10,11 @@ import {
   publicPersistedExecutionError,
   type ExecutionDiagnosticErrorDto,
 } from '@/src/lib/security/diagnostic-error'
-import { parseSemanticAgentOutput } from '@/src/lib/protocol/semantic-output'
+import {
+  parseSemanticAgentOutput,
+  semanticOutputFormatForPrompt,
+  SemanticOutputError,
+} from '@/src/lib/protocol/semantic-output'
 import { redactCredentialValueForDb } from '@/src/lib/security/credential-redaction'
 
 function safeFilename(value: string) {
@@ -73,10 +77,25 @@ export async function GET(
       ...(errorDiagnostic
         ? { error: errorDiagnostic.message, errorDiagnostic }
         : {}),
-      semantic: parseSemanticAgentOutput(result.output_text ?? ''),
+      semantic: parseSemanticAgentOutput(result.output_text ?? '', { format: 'legacy' }),
     }
   })
   const publicStages = stages.map((stage) => {
+    const format = semanticOutputFormatForPrompt(stage.prompt_used ?? '') === 'json'
+      ? 'json'
+      : 'legacy'
+    let semantic: ReturnType<typeof parseSemanticAgentOutput> | null = null
+    let semanticError: string | undefined
+    // Failed outputs are diagnostics, not usable stage bodies. Malformed
+    // marked output must remain exportable without becoming legacy content.
+    if (stage.status === 'complete') {
+      try {
+        semantic = parseSemanticAgentOutput(stage.raw_output ?? '', { format })
+      } catch (error) {
+        if (!(error instanceof SemanticOutputError)) throw error
+        semanticError = error.code
+      }
+    }
     const errorDiagnostic = publicPersistedExecutionError(
       stage.error,
       'stage',
@@ -84,10 +103,12 @@ export async function GET(
     )
     return {
       ...stage,
+      status: semanticError ? 'failed' : stage.status,
       ...(errorDiagnostic
         ? { error: errorDiagnostic.message, errorDiagnostic }
         : {}),
-      semantic: parseSemanticAgentOutput(stage.raw_output ?? ''),
+      semantic,
+      ...(semanticError ? { semanticError } : {}),
     }
   })
   const payload = redactSecrets(redactCredentialValueForDb(db, {
@@ -177,6 +198,7 @@ export async function GET(
       lines.push(
         `### ${stage.stage}`,
         '',
+        ...(stage.semanticError ? [`输出格式校验失败：${stage.semanticError}`, ''] : []),
         stage.raw_output ?? markdownExecutionError(stage.errorDiagnostic ?? null),
         '',
       )

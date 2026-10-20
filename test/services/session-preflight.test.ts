@@ -23,6 +23,8 @@ import {
   toSessionPreflightDto,
 } from '../../src/lib/services/session-preflight'
 import { runFanOut } from '../../src/lib/orchestration/fanout'
+import { INTEGRATED_REVIEW_MARKER } from '../../src/lib/prompts/review-strategy'
+import { estimateTokens } from '../../src/lib/guards/tokens'
 
 function binding(overrides: Partial<ModelBinding> = {}): ModelBinding {
   return {
@@ -138,6 +140,33 @@ function snapshot(
 }
 
 describe('session paid-call preflight', () => {
+  it('reserves one or three review calls and the same review outputs in every downstream stage', () => {
+    const legacy = snapshot('fixed', 'four_stage', 262_144)
+    legacy.modelBindings.reviewAgent = binding({ maxOutputTokens: 2_048 })
+    const integrated = structuredClone(legacy)
+    integrated.promptBundleSnapshot.reviewPrompt += `\n${INTEGRATED_REVIEW_MARKER}`
+    const oldEstimate = runSessionPreflight({ sourceText: 'Source', snapshot: legacy })
+    const newEstimate = runSessionPreflight({ sourceText: 'Source', snapshot: integrated })
+    const oldReview = oldEstimate.stages.find((stage) => stage.stage === 'review')!
+    const newReview = newEstimate.stages.find((stage) => stage.stage === 'review')!
+    expect(oldReview.callsWorstCase).toBe(3)
+    expect(newReview.callsWorstCase).toBe(1)
+    expect(newReview.reservedOutputTokens).toBe(2_048)
+    expect(newReview.estimatedInputTokens - oldReview.estimatedInputTokens).toBe(
+      estimateTokens(integrated.promptBundleSnapshot.reviewPrompt) -
+      estimateTokens(legacy.promptBundleSnapshot.reviewPrompt),
+    )
+    for (const stageName of ['filter', 'orchestrate', 'assemble']) {
+      const oldStage = oldEstimate.stages.find((stage) => stage.stage === stageName)!
+      const newStage = newEstimate.stages.find((stage) => stage.stage === stageName)!
+      expect(newStage.callsWorstCase).toBe(1)
+      expect(oldStage.estimatedInputTokens - newStage.estimatedInputTokens).toBe(4_096)
+      expect(oldStage.totalReservedTokens - newStage.totalReservedTokens).toBe(4_096)
+    }
+    expect(oldEstimate.estimatedTotalCallTokens - newEstimate.estimatedTotalCallTokens)
+      .toBe(3 * oldReview.totalReservedTokens - newReview.totalReservedTokens + 3 * 4_096)
+  })
+
   it('gates the first fanout attempt and every automatic retry', async () => {
     const messages = [{ role: 'user', content: 'Translate this.' }]
     const provider = vi.fn()

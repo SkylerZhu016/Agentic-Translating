@@ -1,6 +1,7 @@
 import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import path from 'node:path'
+import { isForbiddenReleaseRootEntry } from './release-boundary.mjs'
 
 const root = process.cwd()
 const requestedRoots = process.argv.slice(2)
@@ -66,7 +67,7 @@ function scan(directory, relativeBase = '') {
       ['private', 'results', 'cache'].includes(segments[fsbpIndex + 1])
     if (
       segments.some((segment) => forbiddenSegments.has(segment)) ||
-      segments[1] === 'data' ||
+      isForbiddenReleaseRootEntry(segments[1]) ||
       isPrivateFsbpPath ||
       (fsbpIndex >= 0 && /\.local\./i.test(entry.name))
     ) {

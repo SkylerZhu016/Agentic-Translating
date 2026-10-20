@@ -7,6 +7,11 @@ export interface LaunchSpec {
 
 export type LaunchMode = 'development' | 'preview' | 'web-dev' | 'build'
 
+export function parseLaunchArguments(args?: string[]): {
+  mode: LaunchMode
+  forwardedArgs: string[]
+}
+
 export function desktopLaunchSpec(
   mode: LaunchMode,
   options?: {

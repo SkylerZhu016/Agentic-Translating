@@ -26,7 +26,8 @@ import { createHash, randomUUID } from 'crypto'
 import { buildDiffSpans } from '@/src/lib/editing/diff-spans'
 import {
   parseSemanticAgentOutput,
-  semanticBody,
+  SemanticOutputError,
+  semanticOutputFormatForPrompt,
 } from '@/src/lib/protocol/semantic-output'
 import { createProjectRepositories } from '@/src/lib/db/project-repositories'
 import { createTranslationToolRepository } from '@/src/lib/db/translation-tool-repository'
@@ -42,6 +43,7 @@ import type {
 } from '@/src/lib/contracts/translation-tools'
 import { ledgeredChatCompletion } from '@/src/lib/services/llm-call-ledger'
 import { isAsyncIterable } from '@/src/lib/llm/client'
+import { REASONING_PREVIEW_LIMIT } from '@/src/lib/llm/reasoning-preview'
 import {
   beginChatActivity,
   endChatActivity,
@@ -66,7 +68,10 @@ import {
   frozenEndpointMetadata,
   runtimeEndpointCredentialErrorDto,
 } from '@/src/lib/services/runtime-endpoint-credentials'
-import { safeErrorMessageForPersistence } from '@/src/lib/security/credential-redaction'
+import {
+  redactCredentialValueForDb,
+  safeErrorMessageForPersistence,
+} from '@/src/lib/security/credential-redaction'
 
 // =============================================================================
 // Types
@@ -132,6 +137,22 @@ function annotationMetadata(annotation: string | null, source: string) {
       }
 }
 
+function parseSavedStageEvidence(raw: string, prompt: string | null) {
+  try {
+    const parsed = parseSemanticAgentOutput(raw, {
+      format: semanticOutputFormatForPrompt(prompt ?? '') === 'json'
+        ? 'json'
+        : 'legacy',
+    })
+    return parsed.body ? parsed : null
+  } catch (error) {
+    // Corrupt output cannot become reference evidence, even if an older
+    // producer incorrectly marked the stage complete.
+    if (error instanceof SemanticOutputError) return null
+    throw error
+  }
+}
+
 function tableHasColumns(
   db: Database.Database,
   table: string,
@@ -181,10 +202,11 @@ function frozenToolEvidence(
     'stage',
     'status',
     'raw_output',
+    'prompt_used',
   ])
   const stages = (canReadStageEvidence
     ? db.prepare(`
-        SELECT id, stage, raw_output
+        SELECT id, stage, raw_output, prompt_used
         FROM stage_outputs
         WHERE session_id = ? AND status = 'complete' AND raw_output IS NOT NULL
         ORDER BY id
@@ -193,6 +215,7 @@ function frozenToolEvidence(
     id: number
     stage: string
     raw_output: string
+    prompt_used: string | null
   }>
   return [
     ...invocations.map((row) => ({
@@ -207,10 +230,11 @@ function frozenToolEvidence(
         `agent_invocations:${row.id}:annotation_output`,
       ),
     })),
-    ...stages.map((row) => {
-      const parsed = parseSemanticAgentOutput(row.raw_output)
+    ...stages.flatMap((row) => {
+      const parsed = parseSavedStageEvidence(row.raw_output, row.prompt_used)
+      if (!parsed) return []
       const evidenceId = `stage:${row.stage}:${row.id}`
-      return {
+      return [{
         evidenceId,
         sourceType: 'stage_output' as const,
         sourceId: evidenceId,
@@ -221,7 +245,7 @@ function frozenToolEvidence(
           parsed.annotation,
           `stage_outputs:${row.id}:semantic_annotation`,
         ),
-      }
+      }]
     }),
   ]
 }
@@ -626,9 +650,10 @@ export function createHandlers(db: Database.Database) {
         )
         .reduce<Partial<Record<'review' | 'filter' | 'orchestrate', string>>>(
           (acc, stage) => {
-            acc[stage.stage as 'review' | 'filter' | 'orchestrate'] = semanticBody(
-              stage.raw_output,
-            )
+            const parsed = parseSavedStageEvidence(stage.raw_output!, stage.prompt_used)
+            if (parsed) {
+              acc[stage.stage as 'review' | 'filter' | 'orchestrate'] = parsed.body
+            }
             return acc
           },
           {},
@@ -947,7 +972,11 @@ export function createHandlers(db: Database.Database) {
                 if (isAsyncIterable(response)) {
                   throw new Error('Read-only review unexpectedly returned a stream.')
                 }
-                const semantic = parseSemanticAgentOutput(response.content)
+                const semantic = parseSemanticAgentOutput(response.content, {
+                  format: semanticOutputFormatForPrompt(reviewMessages[0].content) === 'json'
+                    ? 'json'
+                    : 'legacy',
+                })
                 if (!semantic.body) throw new Error('Read-only review returned an empty body.')
                 db.prepare(`
                   UPDATE agent_invocations
@@ -1077,6 +1106,17 @@ export function createHandlers(db: Database.Database) {
                 markChatActivityProgress(sessionId, 'generating', Date.now(), activityLeaseId)
                 fullText += text
                 enqueue(encodeSSE('delta', { text }))
+              },
+              onReasoning: (preview) => {
+                const safePreview = redactCredentialValueForDb(db, preview)
+                // Redaction can expand short credentials. Keep the outbound
+                // tail bounded while preserving the provider's raw count.
+                enqueue(encodeSSE('reasoning', {
+                  ...safePreview,
+                  reasoningPreview: safePreview.reasoningPreview.slice(-REASONING_PREVIEW_LIMIT),
+                  reasoningTruncated: safePreview.reasoningTruncated ||
+                    safePreview.reasoningPreview.length > REASONING_PREVIEW_LIMIT,
+                }))
               },
               onToolCall: (name, args) => {
                 markChatActivityProgress(sessionId, 'applying_edits', Date.now(), activityLeaseId)

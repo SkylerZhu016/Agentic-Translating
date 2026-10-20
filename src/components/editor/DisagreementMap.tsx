@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { memo, useEffect, useMemo, useState } from 'react'
 import type {
   DisagreementDifferenceKind,
   DisagreementFallbackReason,
@@ -8,7 +8,8 @@ import type {
   DisagreementHotspotDto,
   DisagreementMapDto,
 } from '@/src/lib/contracts/disagreement-map'
-import { Badge, Button, Card, Spinner } from '@/src/components/ui'
+import { Badge, Button, Spinner } from '@/src/components/ui'
+import { BoundedText } from '@/src/components/ui/BoundedText'
 import { localizeDiagnosticError, useI18n, type MessageKey } from '@/src/i18n'
 import type { SelectionSnapshot } from './types'
 
@@ -63,6 +64,40 @@ function isDisagreementMapDto(value: unknown): value is DisagreementMapDto {
     (record.status === 'ready' || record.status === 'full_text_fallback') &&
     Array.isArray(record.hotspots) &&
     typeof record.candidateSetHash === 'string'
+  )
+}
+
+function FullTextFallbackSection({
+  title,
+  text,
+  downloadFileName,
+  initiallyOpen = false,
+}: {
+  title: string
+  text: string
+  downloadFileName: string
+  initiallyOpen?: boolean
+}) {
+  const [open, setOpen] = useState(initiallyOpen)
+  return (
+    <details
+      open={open}
+      className="rounded-sm border border-line bg-paper"
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-ink-3">
+        {title}
+      </summary>
+      {open && (
+        <BoundedText
+          className="border-t border-line px-3 py-3"
+          text={text}
+          viewportClassName="max-h-48"
+          textClassName="font-serif text-sm leading-6 text-ink-2"
+          downloadFileName={downloadFileName}
+        />
+      )}
+    </details>
   )
 }
 
@@ -201,7 +236,7 @@ function Hotspot({
   )
 }
 
-export function DisagreementMap({
+export const DisagreementMap = memo(function DisagreementMap({
   sessionId,
   finalVersionId,
   candidateRevision,
@@ -220,6 +255,7 @@ export function DisagreementMap({
 }) {
   const { t, formatNumber } = useI18n()
   const [requested, setRequested] = useState(false)
+  const [expanded, setExpanded] = useState(false)
   const [reloadNo, setReloadNo] = useState(0)
   const [map, setMap] = useState<DisagreementMapDto | null>(null)
   const [loading, setLoading] = useState(false)
@@ -260,7 +296,7 @@ export function DisagreementMap({
         if (!isDisagreementMapDto(payload)) {
           throw new Error(t('disagreement.error.invalid'))
         }
-        setMap(payload)
+        if (!controller.signal.aborted) setMap(payload)
       })
       .catch((fetchError: unknown) => {
         if (controller.signal.aborted) return
@@ -285,19 +321,26 @@ export function DisagreementMap({
   ])
 
   return (
-    <Card
-      overline={t('disagreement.overline')}
-      title={t('disagreement.title')}
-      padded={false}
-      testId="disagreement-map"
-      actions={map ? (
-        <Badge variant={map.status === 'ready' ? 'outline' : 'subtle'}>
-          {map.status === 'ready'
-            ? t('disagreement.count', { count: formatNumber(map.hotspots.length) })
-            : t('disagreement.fullComparison')}
-        </Badge>
-      ) : undefined}
+    <details
+      className="group/disagreement overflow-hidden rounded-md border border-line bg-paper-raise"
+      data-testid="disagreement-map"
+      onToggle={(event) => {
+        if (event.target !== event.currentTarget) return
+        setExpanded(event.currentTarget.open)
+        if (event.currentTarget.open) setRequested(true)
+      }}
     >
+      <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-3 text-sm font-medium text-ink-2 hover:bg-paper-sink/50">
+        <span className="text-ink-4 transition-transform group-open/disagreement:rotate-90" aria-hidden>▸</span>
+        <span className="min-w-0 flex-1">{t('disagreement.title')}</span>
+        {map && (
+          <Badge variant={map.status === 'ready' ? 'outline' : 'subtle'}>
+            {map.status === 'ready'
+              ? t('disagreement.count', { count: formatNumber(map.hotspots.length) })
+              : t('disagreement.fullComparison')}
+          </Badge>
+        )}
+      </summary>
       <div className="space-y-3 px-4 py-4">
         <p className="text-xs leading-5 text-ink-3">
           {t('disagreement.description')}
@@ -378,7 +421,7 @@ export function DisagreementMap({
         )
       )}
 
-      {requested && map?.status === 'full_text_fallback' && map.fallback && !loading && (
+      {expanded && requested && map?.status === 'full_text_fallback' && map.fallback && !loading && (
         <div className="space-y-3 border-t border-line px-4 py-4">
           <div className="flex flex-wrap items-center gap-2">
             <Badge variant="outline">{t('disagreement.fullTextOnly')}</Badge>
@@ -387,41 +430,31 @@ export function DisagreementMap({
             </span>
           </div>
 
-          <details className="rounded-sm border border-line bg-paper" open>
-            <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-ink-3">
-              {t('disagreement.sourceFull')}
-            </summary>
-            <p className="max-h-48 overflow-y-auto whitespace-pre-wrap border-t border-line px-3 py-3 font-serif text-sm leading-6 text-ink-2">
-              {map.fallback.sourceText}
-            </p>
-          </details>
+          <FullTextFallbackSection
+            title={t('disagreement.sourceFull')}
+            text={map.fallback.sourceText}
+            downloadFileName="source-text.txt"
+            initiallyOpen
+          />
 
           {map.fallback.candidates.map((candidate) => (
-            <details
+            <FullTextFallbackSection
               key={candidate.invocationId}
-              className="rounded-sm border border-line bg-paper"
-            >
-              <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-ink-3">
-                {candidate.agentName} · {candidate.model}
-              </summary>
-              <p className="max-h-48 overflow-y-auto whitespace-pre-wrap border-t border-line px-3 py-3 font-serif text-sm leading-6 text-ink-2">
-                {candidate.body}
-              </p>
-            </details>
+              title={`${candidate.agentName} · ${candidate.model}`}
+              text={candidate.body}
+              downloadFileName={`candidate-${candidate.invocationId}.txt`}
+            />
           ))}
 
           {map.fallback.finalText != null && (
-            <details className="rounded-sm border border-line bg-paper">
-              <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-ink-3">
-                {t('disagreement.finalFull')}
-              </summary>
-              <p className="max-h-48 overflow-y-auto whitespace-pre-wrap border-t border-line px-3 py-3 font-serif text-sm leading-6 text-ink-2">
-                {map.fallback.finalText}
-              </p>
-            </details>
+            <FullTextFallbackSection
+              title={t('disagreement.finalFull')}
+              text={map.fallback.finalText}
+              downloadFileName="final-translation.txt"
+            />
           )}
         </div>
       )}
-    </Card>
+    </details>
   )
-}
+})

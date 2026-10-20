@@ -60,7 +60,10 @@ describe('Agent test LLM ledger integration', () => {
       async (_endpoint, llmRequest: ChatCompletionRequest) => {
         llmRequest.onActivity?.()
         return {
-          content: 'translated body\n---\nprivate annotation',
+          content: JSON.stringify({
+            body: 'translated body',
+            annotation: 'private annotation',
+          }),
           usage: {
             prompt_tokens: 31,
             completion_tokens: 7,
@@ -242,9 +245,45 @@ describe('Agent test LLM ledger integration', () => {
     })
   })
 
+  it('retains provider usage when a built-in result fails JSON validation', async () => {
+    vi.mocked(chatCompletion).mockResolvedValue({
+      content: '{"body":"PRIVATE-MALFORMED-CONTENT"',
+      usage: {
+        prompt_tokens: 31,
+        completion_tokens: 11,
+        total_tokens: 42,
+      },
+    })
+
+    const response = await testSavedAgent(request({
+      sourceText: 'Source.',
+      endpointId,
+      model: 'test-model',
+    }), {
+      params: Promise.resolve({ id: 'semantic-fidelity.en-to-zh' }),
+    })
+
+    expect(response.status).toBe(502)
+    expect(chatCompletion).toHaveBeenCalledTimes(1)
+    const row = db.prepare(`
+      SELECT status, input_tokens, output_tokens, usage_source, error_code
+      FROM llm_call_records
+    `).get()
+    expect(row).toEqual({
+      status: 'failed',
+      input_tokens: 31,
+      output_tokens: 11,
+      usage_source: 'provider',
+      error_code: 'llm_call_failed',
+    })
+    expect(JSON.stringify(row)).not.toContain('PRIVATE-MALFORMED-CONTENT')
+  })
+
   it('returns the Agent result when the accounting table is unavailable', async () => {
     db.exec('DROP TABLE llm_call_records')
-    vi.mocked(chatCompletion).mockResolvedValue({ content: 'result survives' })
+    vi.mocked(chatCompletion).mockResolvedValue({
+      content: JSON.stringify({ body: 'result survives', annotation: null }),
+    })
 
     const response = await testSavedAgent(request({
       sourceText: 'Source.',

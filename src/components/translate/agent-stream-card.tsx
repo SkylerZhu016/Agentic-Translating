@@ -5,11 +5,13 @@
 //
 // 头部：agent 名 + 模型 + 状态徽章
 //   streaming → 墨色呼吸点脉冲 / complete → 墨绿 / error → 朱红
-// 体部：流式逐字渲染（等宽草稿 + 块光标）→ 完成后切换 .poem-text-sm 排版
+// 体部：有界流式正文 → 完成后切换 .poem-text-sm 排版；思考与注释独立折叠
 // error 卡：错误摘要 + retry-agent-button（仅该卡重流式）
 // ---------------------------------------------------------------------------
 
+import { memo, useState } from 'react'
 import { Badge, Button, Spinner } from '@/src/components/ui'
+import { BoundedText, CollapsibleText } from '@/src/components/ui/BoundedText'
 import { TID } from '@/src/lib/testids'
 import type { AgentCardState } from './use-translation'
 import { useI18n } from '@/src/i18n/LocaleProvider'
@@ -77,7 +79,7 @@ function StatusBadge({ status }: { status: AgentCardState['status'] }) {
 
 // ── 卡片 ────────────────────────────────────────────────────────
 
-export function AgentStreamCard({
+export const AgentStreamCard = memo(function AgentStreamCard({
   card,
   enterDelayMs = 0,
   retrying,
@@ -86,6 +88,7 @@ export function AgentStreamCard({
 }: AgentStreamCardProps) {
   const { t } = useI18n()
   const errorTone = card.status === 'error'
+  const [attemptsOpen, setAttemptsOpen] = useState(false)
 
   return (
     <article
@@ -94,19 +97,19 @@ export function AgentStreamCard({
       data-agent-kind={card.kind ?? 'translation'}
       style={{ animationDelay: `${enterDelayMs}ms` }}
       className={[
-        'flex min-h-40 animate-rise flex-col rounded-md border bg-paper-raise shadow-card transition-colors duration-200',
+        'flex min-w-0 min-h-32 animate-rise flex-col rounded-lg border bg-paper-raise shadow-card transition-colors duration-200',
         errorTone ? 'border-cinnabar/45' : 'border-line',
       ].join(' ')}
     >
       {/* 头部：名 + 模型 + 状态 */}
-      <header className="flex items-center justify-between gap-3 border-b border-line px-4 pb-2.5 pt-3">
-        <div className="flex min-w-0 items-baseline gap-2">
-          <h3 className="truncate font-serif text-sm font-semibold text-ink">{card.name}</h3>
-          <span className="shrink-0 font-mono text-[0.6875rem] leading-4 text-ink-3">
+      <header className="flex flex-wrap items-start justify-between gap-2 border-b border-line px-4 pb-2.5 pt-3">
+        <div className="min-w-0 flex-1">
+          <h3 className="break-words text-sm font-semibold text-ink">{card.name}</h3>
+          <span className="mt-0.5 block break-all font-mono text-[0.6875rem] leading-4 text-ink-4">
             {card.model}
           </span>
         </div>
-        <div className="flex items-center gap-1.5">
+        <div className="flex max-w-full flex-wrap items-center gap-1.5">
           {(card.attempts?.length ?? 0) > 1 && (
             <Badge variant="subtle">{t('agent.attemptCount', { count: card.attempts!.length })}</Badge>
           )}
@@ -127,15 +130,34 @@ export function AgentStreamCard({
 
       {/* 体部：流式草稿 → 译文排版 */}
       <div className="flex-1 px-4 py-3">
+        {card.reasoningPreview ? (
+          <CollapsibleText
+            className="mb-3 rounded-sm border border-line bg-paper-sink/50 px-2.5 py-1.5"
+            title={t('reasoning.preview')}
+            meta={t('reasoning.received', { count: card.reasoningCharacters ?? card.reasoningPreview?.length ?? 0 })}
+            description={t('reasoning.limited')}
+            text={card.reasoningPreview ?? ''}
+            tailPreview
+            streaming={card.status === 'streaming'}
+            viewportClassName="max-h-48"
+            textClassName="font-mono text-xs leading-5 text-ink-3"
+          />
+        ) : (card.reasoningCharacters ?? 0) > 0 ? (
+          <p className="mb-3 text-[0.6875rem] leading-5 text-ink-4">
+            {t('reasoning.stats', { count: card.reasoningCharacters ?? 0 })}
+          </p>
+        ) : null}
         {card.status === 'error' ? (
           <div className="flex h-full flex-col items-start gap-3">
-            <p className="text-sm leading-6 text-cinnabar">
-              {localizeDiagnosticError(
+            <BoundedText
+              text={localizeDiagnosticError(
                 t,
                 card.error,
                 card.error ?? t('error.unknown'),
               )}
-            </p>
+              viewportClassName="max-h-48"
+              textClassName="text-sm leading-6 text-cinnabar"
+            />
             <Button
               variant="outline"
               size="sm"
@@ -154,17 +176,14 @@ export function AgentStreamCard({
             </Button>
           </div>
         ) : card.text.length > 0 ? (
-          card.status === 'complete' ? (
-            <p className="poem-text-sm max-h-80 overflow-y-auto pr-1">{card.text}</p>
-          ) : (
-            <p className="max-h-80 overflow-y-auto whitespace-pre-wrap break-words pr-1 font-mono text-[0.8125rem] leading-6 text-ink-2">
-              {card.text}
-              <span
-                className="ml-0.5 inline-block h-3.5 w-[7px] animate-pulse bg-ink-2 align-[-2px]"
-                aria-hidden
-              />
-            </p>
-          )
+          <BoundedText
+            text={card.text}
+            streaming={card.status === 'streaming'}
+            downloadFileName={`${card.agentKey}-text.txt`}
+            textClassName={card.status === 'complete'
+              ? 'poem-text-sm'
+              : 'font-mono text-[0.8125rem] leading-6 text-ink-2'}
+          />
         ) : (
           card.status === 'streaming' ? (
             <div
@@ -202,37 +221,37 @@ export function AgentStreamCard({
           </Button>
         </div>
       )}
-      {card.status === 'complete' && (card.annotation || card.evidence) && (
+      {(card.annotation || card.evidence) && (
         <div className="border-t border-line px-4 py-2">
           {card.annotation && (
-            <details>
-              <summary className="cursor-pointer text-xs font-medium text-ink-3">
-                {t('agent.annotation')}
-              </summary>
-              <p className="mt-2 whitespace-pre-wrap text-xs leading-5 text-ink-3">
-                {card.annotation}
-              </p>
-            </details>
+            <CollapsibleText
+              title={t('agent.annotation')}
+              text={card.annotation}
+              streaming={card.status === 'streaming'}
+              downloadFileName={`${card.agentKey}-annotation.txt`}
+              viewportClassName="max-h-56"
+              textClassName="text-xs leading-5 text-ink-3"
+            />
           )}
           {card.evidence && (
-            <details className={card.annotation ? 'mt-2' : ''}>
-              <summary className="cursor-pointer text-xs font-medium text-ink-3">
-                {t('agent.evidenceDetails')}
-              </summary>
-              <p className="mt-2 whitespace-pre-wrap text-xs leading-5 text-ink-3">
-                {card.evidence.naturalLanguage}
-              </p>
-            </details>
+            <CollapsibleText
+              className={card.annotation ? 'mt-2' : ''}
+              title={t('agent.evidenceDetails')}
+              text={card.evidence.naturalLanguage}
+              downloadFileName={`${card.agentKey}-evidence.txt`}
+              viewportClassName="max-h-56"
+              textClassName="text-xs leading-5 text-ink-3"
+            />
           )}
         </div>
       )}
       {(card.attempts?.length ?? 0) > 1 && (
         <div className="border-t border-line px-4 py-2">
-          <details>
+          <details onToggle={(event) => setAttemptsOpen(event.currentTarget.open)}>
             <summary className="cursor-pointer text-xs font-medium text-ink-3">
               {t('agent.attempts')}
             </summary>
-            <ol className="mt-2 space-y-1 text-xs leading-5 text-ink-3">
+            {attemptsOpen && <ol className="mt-2 max-h-64 space-y-1 overflow-y-auto text-xs leading-5 text-ink-3">
               {card.attempts!.map((attempt, index) => (
                 <li key={attempt.id}>
                   {t('agent.attemptLine', {
@@ -240,19 +259,19 @@ export function AgentStreamCard({
                     model: attempt.model,
                     status: attempt.status,
                   })}
-                  {attempt.error
-                    ? ` · ${localizeDiagnosticError(
-                        t,
-                        attempt.error,
-                        t('error.unknown'),
-                      )}`
-                    : ''}
+                  {attempt.error && (
+                    <BoundedText
+                      text={localizeDiagnosticError(t, attempt.error, t('error.unknown'))}
+                      viewportClassName="max-h-32"
+                      textClassName="text-xs leading-5 text-ink-3"
+                    />
+                  )}
                 </li>
               ))}
-            </ol>
+            </ol>}
           </details>
         </div>
       )}
     </article>
   )
-}
+})

@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events'
 import path from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import {
+  assertRuntimeAssets,
   createServerEnvironment,
   DESKTOP_RUNTIME_ENV,
   resolveDesktopRuntime,
@@ -72,6 +73,32 @@ describe('Electron runtime selection', () => {
     expect(packaged.kind).toBe('packaged')
     expect(packaged.args[0]).toBe(path.resolve('D:/resources', 'app', 'server.js'))
     expect(packaged.electronRunAsNode).toBe(true)
+  })
+
+  it('rejects a partially prepared production build before it starts', () => {
+    const cwd = path.resolve('D:/workspace')
+    const preview = resolveDesktopRuntime({
+      isPackaged: false,
+      cwd,
+      resourcesPath: path.resolve('D:/resources'),
+      electronExecutable: path.resolve('D:/Electron.exe'),
+      env: {
+        [SYSTEM_NODE_ENV]: path.resolve('C:/node/node.exe'),
+        [DESKTOP_RUNTIME_ENV]: 'preview',
+      },
+    })
+    expect(() => assertRuntimeAssets(
+      preview,
+      (asset) => asset !== preview.migrationsDir,
+    )).toThrow(expect.objectContaining({
+      code: 'preview_missing',
+      details: expect.objectContaining({ serverFile: preview.migrationsDir }),
+    }))
+    expect(() => assertRuntimeAssets(
+      preview,
+      (asset) => asset !== path.join(preview.root, '.next', 'static'),
+    )).toThrow(expect.objectContaining({ code: 'preview_missing' }))
+    expect(() => assertRuntimeAssets(preview, () => true)).not.toThrow()
   })
 
   it('does not forward provider credentials and injects only the desktop secret', () => {
@@ -149,7 +176,7 @@ describe('Electron readiness gate', () => {
 
   it('fails immediately when the child exits before readiness', async () => {
     const child = new FakeChild()
-    const pendingFetch = vi.fn(() => new Promise(() => {}))
+    const pendingFetch = vi.fn((_url: string, _options: { signal: AbortSignal }) => new Promise(() => {}))
     const readiness = waitForManagedServer(child as never, {
       url: 'http://127.0.0.1:3210/api/health/ready',
       logFile: 'D:/data/logs/desktop-server.log',
@@ -167,6 +194,7 @@ describe('Electron readiness gate', () => {
       code: 'server_exited',
       details: { logFile: 'D:/data/logs/desktop-server.log' },
     })
+    expect(pendingFetch.mock.calls[0]?.[1]?.signal.aborted).toBe(true)
   })
 
   it('waits for the managed child to exit during cleanup', async () => {

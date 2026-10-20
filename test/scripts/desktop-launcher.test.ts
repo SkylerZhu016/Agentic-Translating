@@ -1,12 +1,22 @@
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { desktopLaunchSpec } from '../../scripts/launch-desktop.mjs'
+import { desktopLaunchSpec, parseLaunchArguments } from '../../scripts/launch-desktop.mjs'
 import { resolveNextDistDir } from '../../next.config'
 
 describe('desktop source launcher', () => {
   const cwd = path.resolve('D:/workspace')
   const nodeExecutable = path.resolve('C:/node/node.exe')
   const electronExecutable = path.resolve('D:/workspace/node_modules/electron/dist/electron.exe')
+
+  it('uses the existing production build by default and makes development opt-in', () => {
+    expect(parseLaunchArguments()).toEqual({ mode: 'preview', forwardedArgs: [] })
+    expect(parseLaunchArguments(['--dev'])).toEqual({ mode: 'development', forwardedArgs: [] })
+    expect(parseLaunchArguments(['--web-dev', '--port', '4040'])).toEqual({
+      mode: 'web-dev',
+      forwardedArgs: ['--port', '4040'],
+    })
+    expect(() => parseLaunchArguments(['--unknown'])).toThrow('Unknown launch option')
+  })
 
   it('starts Electron in source development mode without a build step', () => {
     const spec = desktopLaunchSpec('development', {

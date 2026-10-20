@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Badge, Button, Card, Spinner, Textarea } from '@/src/components/ui'
 import { useDirection } from '@/src/components/direction/DirectionProvider'
 import type { DirectionPromptBundle } from '@/src/lib/contracts/vnext'
@@ -40,20 +40,37 @@ export function PromptBundlePanel({ notify }: { notify: NotifyFn }) {
     useState<ModuleKey>('mainAgentSystemPrompt')
   const [draft, setDraft] = useState<DirectionPromptBundle | null>(null)
   const [saving, setSaving] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const selectedIdRef = useRef('')
+  const loadController = useRef<AbortController | null>(null)
 
-  const load = useCallback(async () => {
-    const response = await fetch(`/api/prompt-bundles?direction=${direction}`)
-    if (!response.ok) return
-    const list = (await response.json()) as PromptBundleView[]
-    setBundles(list)
-    const preferred =
-      list.find((item) => item.id === selectedId) ?? list[0] ?? null
-    setSelectedId(preferred?.id ?? '')
-    setDraft(preferred?.currentRevision.payload ?? null)
-  }, [direction, selectedId])
+  const load = useCallback(async (preferredId?: string) => {
+    loadController.current?.abort()
+    const controller = new AbortController()
+    loadController.current = controller
+    setLoading(true)
+    setLoadError(null)
+    try {
+      const response = await fetch(`/api/prompt-bundles?direction=${direction}`, { signal: controller.signal })
+      if (!response.ok) throw new Error(t('config.error.networkRetry'))
+      const list = (await response.json()) as PromptBundleView[]
+      if (controller.signal.aborted) return
+      setBundles(list)
+      const preferred = list.find((item) => item.id === (preferredId ?? selectedIdRef.current)) ?? list[0] ?? null
+      selectedIdRef.current = preferred?.id ?? ''
+      setSelectedId(selectedIdRef.current)
+      setDraft(preferred?.currentRevision.payload ?? null)
+    } catch (error) {
+      if (!controller.signal.aborted) setLoadError(error instanceof Error ? error.message : t('config.error.networkRetry'))
+    } finally {
+      if (!controller.signal.aborted) setLoading(false)
+    }
+  }, [direction, t])
 
   useEffect(() => {
     void load()
+    return () => loadController.current?.abort()
   }, [load])
 
   const selected = useMemo(
@@ -64,6 +81,7 @@ export function PromptBundlePanel({ notify }: { notify: NotifyFn }) {
   function selectBundle(id: string) {
     const next = bundles.find((item) => item.id === id) ?? null
     setSelectedId(id)
+    selectedIdRef.current = id
     setDraft(next?.currentRevision.payload ?? null)
   }
 
@@ -83,9 +101,7 @@ export function PromptBundlePanel({ notify }: { notify: NotifyFn }) {
       if (!response.ok) throw new Error(t('promptBundle.error.clone'))
       const created = (await response.json()) as PromptBundleView
       notify(t('promptBundle.cloned'), { tone: 'inverted' })
-      await load()
-      setSelectedId(created.id)
-      setDraft(created.currentRevision.payload)
+      await load(created.id)
     } catch (error) {
       notify(t('promptBundle.error.clone'), {
         message: error instanceof Error ? error.message : t('config.error.tryLater'),
@@ -136,7 +152,10 @@ export function PromptBundlePanel({ notify }: { notify: NotifyFn }) {
         ) : undefined
       }
     >
-      {selected && draft ? (
+      {loadError && <div role="alert" className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-sm border border-cinnabar/30 bg-cinnabar/5 p-3 text-sm text-cinnabar">
+        <p>{loadError}</p><Button size="sm" variant="outline" onClick={() => void load()}>{t('common.retry')}</Button>
+      </div>}
+      {loading ? <div className="flex min-h-24 items-center justify-center"><Spinner /></div> : selected && draft ? (
         <div className="space-y-3">
           <select
             value={selectedId}

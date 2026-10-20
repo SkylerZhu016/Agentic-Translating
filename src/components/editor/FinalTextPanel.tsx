@@ -7,7 +7,7 @@
 // 聊天工具路径）；编辑完成后平滑滚动到变更处并短暂高亮。
 // ---------------------------------------------------------------------------
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useRef, useState } from 'react'
 import { TID } from '@/src/lib/testids'
 import { EditPopover, type PopoverAnchor } from './EditPopover'
 import type { SelectionSnapshot } from './types'
@@ -54,11 +54,12 @@ function readSelection(container: HTMLElement): { snapshot: SelectionSnapshot; r
   }
 }
 
-export function FinalTextPanel({ text, emptyHint, readonly, busy = false, highlight, onSubmitEdit }: FinalTextPanelProps) {
+export const FinalTextPanel = memo(function FinalTextPanel({ text, emptyHint, readonly, busy = false, highlight, onSubmitEdit }: FinalTextPanelProps) {
   const { t } = useI18n()
   const containerRef = useRef<HTMLDivElement>(null)
   const markRef = useRef<HTMLSpanElement>(null)
   const rangeRef = useRef<Range | null>(null)
+  const selectionTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [popover, setPopover] = useState<PopoverState | null>(null)
 
   const closePopover = useCallback(() => {
@@ -74,17 +75,26 @@ export function FinalTextPanel({ text, emptyHint, readonly, busy = false, highli
     if (readonly || busy) return
 
     // 等选区稳定后再读
-    window.setTimeout(() => {
+    if (selectionTimer.current) clearTimeout(selectionTimer.current)
+    selectionTimer.current = setTimeout(() => {
       const result = readSelection(container)
-      if (!result) return
+      if (!result) {
+        closePopover()
+        return
+      }
       rangeRef.current = result.range
       setPopover({ snapshot: result.snapshot, anchor: result.anchor })
     }, 0)
-  }, [readonly, busy])
+  }, [readonly, busy, closePopover])
+
+  useEffect(() => () => {
+    if (selectionTimer.current) clearTimeout(selectionTimer.current)
+  }, [])
 
   // ── 点击 popover 容器之外 → 关闭 ────────────────────────────
+  const hasPopover = popover != null
   useEffect(() => {
-    if (!popover) return
+    if (!hasPopover) return
     const onDocMouseDown = (e: MouseEvent) => {
       const target = e.target as HTMLElement | null
       if (!target) return
@@ -94,41 +104,51 @@ export function FinalTextPanel({ text, emptyHint, readonly, busy = false, highli
     }
     document.addEventListener('mousedown', onDocMouseDown)
     return () => document.removeEventListener('mousedown', onDocMouseDown)
-  }, [popover, closePopover])
+  }, [hasPopover, closePopover])
 
   // ── 滚动/缩放时跟随选区重锚（选区已失效则关闭）──────────────
   useEffect(() => {
-    if (!popover) return
+    if (!hasPopover) return
+    let frame: number | null = null
     const reanchor = () => {
-      const range = rangeRef.current
-      if (!range || !range.startContainer.isConnected) {
-        closePopover()
-        return
-      }
-      const rect = range.getBoundingClientRect()
-      if (rect.width === 0 && rect.height === 0) {
-        closePopover()
-        return
-      }
-      setPopover((prev) => (prev ? { ...prev, anchor: rect } : prev))
+      if (frame != null) return
+      frame = window.requestAnimationFrame(() => {
+        frame = null
+        const range = rangeRef.current
+        if (!range || !range.startContainer.isConnected) {
+          closePopover()
+          return
+        }
+        const rect = range.getBoundingClientRect()
+        if (rect.width === 0 && rect.height === 0) {
+          closePopover()
+          return
+        }
+        setPopover((prev) => (prev ? { ...prev, anchor: rect } : prev))
+      })
     }
     window.addEventListener('scroll', reanchor, true)
     window.addEventListener('resize', reanchor)
     return () => {
       window.removeEventListener('scroll', reanchor, true)
       window.removeEventListener('resize', reanchor)
+      if (frame != null) window.cancelAnimationFrame(frame)
     }
-  }, [popover, closePopover])
+  }, [hasPopover, closePopover])
 
   // ── 文本被替换后关闭 popover（选区已失效）───────────────────
   useEffect(() => {
+    if (selectionTimer.current) clearTimeout(selectionTimer.current)
     closePopover()
-  }, [text, closePopover])
+  }, [text, readonly, busy, closePopover])
 
   // ── 变更高亮：平滑滚动到变更片段 ────────────────────────────
   useEffect(() => {
     if (!highlight) return
-    markRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    markRef.current?.scrollIntoView({
+      behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth',
+      block: 'nearest',
+    })
   }, [highlight])
 
   const submitEdit = useCallback(
@@ -190,7 +210,8 @@ export function FinalTextPanel({ text, emptyHint, readonly, busy = false, highli
           if (e.shiftKey || e.key === 'Shift') inspectSelection()
         }}
         className={[
-          'poem-text min-h-56 outline-none',
+          'poem-text break-words outline-none focus-visible:rounded-md focus-visible:ring-2 focus-visible:ring-pine/30',
+          text ? 'min-h-32 max-h-[65vh] overflow-y-auto overscroll-contain pr-1' : 'min-h-0 py-2 text-sm leading-6',
           readonly ? 'cursor-default text-ink-2' : '',
         ].join(' ')}
       >
@@ -209,4 +230,4 @@ export function FinalTextPanel({ text, emptyHint, readonly, busy = false, highli
       )}
     </div>
   )
-}
+})

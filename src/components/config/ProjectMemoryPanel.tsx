@@ -382,7 +382,7 @@ export function ProjectMemoryPanel({ notify }: { notify?: NotifyFn }) {
       failures.push(t('project.detail.suggestionsError', { error: errorText(suggestionResult.reason, t) }))
     }
 
-    setDetailError(failures.length > 0 ? failures.join('；') : null)
+    setDetailError(failures.length > 0 ? failures.join('。') : null)
     setDetailLoading(false)
   }, [t])
 

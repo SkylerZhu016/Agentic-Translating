@@ -3,7 +3,18 @@ import {
   BUILTIN_AGENT_ARCHETYPES,
   BUILTIN_AGENT_VARIANTS,
   BUILTIN_DIRECTION_BUNDLES,
+  SOURCE_LED_STYLE_EN,
+  SOURCE_LED_STYLE_ZH,
 } from '../../src/lib/prompts/bidirectional'
+import {
+  semanticOutputFormatForPrompt,
+  SEMANTIC_JSON_PROTOCOL_MARKER,
+} from '../../src/lib/protocol/semantic-output'
+import {
+  INTEGRATED_REVIEW_MARKER,
+  reviewCallCount,
+  reviewExecutionStrategy,
+} from '../../src/lib/prompts/review-strategy'
 
 function allPromptText(): string {
   return [
@@ -68,9 +79,10 @@ describe('bidirectional built-in catalog', () => {
 
   it('gives each translating role detailed focus, examples, checks, and final annotation rules', () => {
     for (const variant of BUILTIN_AGENT_VARIANTS) {
-      expect(variant.promptVersion).toBe(
-        variant.archetypeId === 'poetry-form' ? 18 : 17,
-      )
+      expect(variant.promptVersion).toBe(20)
+      expect(variant.rolePrompt).toContain(SEMANTIC_JSON_PROTOCOL_MARKER)
+      expect(variant.rolePrompt).toContain('"body"')
+      expect(variant.rolePrompt).toContain('"annotation"')
 
       if (variant.archetypeId === 'cultural-context') {
         expect(variant.rolePrompt.length).toBeGreaterThan(600)
@@ -93,8 +105,8 @@ describe('bidirectional built-in catalog', () => {
       )
       expect(variant.rolePrompt).toMatch(
         variant.promptLanguage === 'zh'
-          ? /# 注释[\s\S]+最后一条独立“---”/
-          : /# Annotation[\s\S]+final standalone "---"/,
+          ? /# 注释[\s\S]+裸 JSON 对象/
+          : /# Annotation[\s\S]+bare JSON object/,
       )
     }
   })
@@ -114,40 +126,73 @@ describe('bidirectional built-in catalog', () => {
     expect(poetry[1].rolePrompt).toMatch(/诗行|line/)
   })
 
-  it('forbids source-less dashes and semicolons throughout translation and editing prompts', () => {
+  it('shares one source-led style policy across every assembled translating role and stage', () => {
     for (const bundle of BUILTIN_DIRECTION_BUNDLES) {
-      expect(bundle.workerBasePrompt).toMatch(/破折号|dash/)
-      expect(bundle.workerBasePrompt).toMatch(/分号|semicolon/)
+      const policy = bundle.promptLanguage === 'en'
+        ? SOURCE_LED_STYLE_EN
+        : SOURCE_LED_STYLE_ZH
+      for (const prompt of [
+        bundle.mainAgentSystemPrompt,
+        bundle.workerBasePrompt,
+        bundle.reviewPrompt,
+        bundle.filterPrompt,
+        bundle.orchestratePrompt,
+        bundle.assemblePrompt,
+        bundle.editingPrompt,
+      ]) {
+        expect(prompt.split(policy)).toHaveLength(2)
+      }
       expect(bundle.editingPrompt).toMatch(/指定范围|requested scope/)
-    }
-
-    for (const variant of BUILTIN_AGENT_VARIANTS.filter(
-      (item) => item.archetypeId !== 'cultural-context',
-    )) {
-      const bundle = BUILTIN_DIRECTION_BUNDLES.find(
-        (item) => item.direction === variant.direction,
-      )!
-      const assembledWorkerPrompt = `${bundle.workerBasePrompt}\n${variant.rolePrompt}`
-      expect(assembledWorkerPrompt).toMatch(/破折号|dash/)
-      expect(assembledWorkerPrompt).toMatch(/分号|semicolon/)
+      for (const variant of BUILTIN_AGENT_VARIANTS.filter(
+        (item) =>
+          item.direction === bundle.direction &&
+          item.archetypeId !== 'cultural-context',
+      )) {
+        const assembledWorkerPrompt = `${bundle.workerBasePrompt}\n${variant.rolePrompt}`
+        expect(assembledWorkerPrompt.split(policy)).toHaveLength(2)
+        expect(semanticOutputFormatForPrompt(assembledWorkerPrompt)).toBe('json')
+      }
     }
   })
 
-  it('uses the final standalone divider throughout candidate and stage prompts', () => {
-    for (const variant of BUILTIN_AGENT_VARIANTS.filter(
-      (item) => item.archetypeId !== 'cultural-context',
-    )) {
-      expect(variant.rolePrompt).toMatch(/最后一条独立|final standalone/)
+  it('opts current built-ins into integrated review without changing the semantic output protocol', () => {
+    for (const bundle of BUILTIN_DIRECTION_BUNDLES) {
+      expect(reviewExecutionStrategy(bundle.reviewPrompt)).toBe('integrated')
+      expect(reviewCallCount(bundle.reviewPrompt)).toBe(1)
+      expect(semanticOutputFormatForPrompt(bundle.reviewPrompt)).toBe('json')
+      expect(bundle.reviewPrompt.split(/\r?\n/).filter(
+        (line) => line.trim() === INTEGRATED_REVIEW_MARKER,
+      )).toHaveLength(1)
+      for (const otherStage of [
+        bundle.filterPrompt,
+        bundle.orchestratePrompt,
+        bundle.assemblePrompt,
+      ]) {
+        expect(otherStage).not.toContain(INTEGRATED_REVIEW_MARKER)
+        expect(semanticOutputFormatForPrompt(otherStage)).toBe('json')
+      }
+    }
+  })
+
+  it('uses an explicit JSON envelope throughout candidate and stage prompts', () => {
+    for (const variant of BUILTIN_AGENT_VARIANTS) {
+      expect(variant.rolePrompt).toContain(SEMANTIC_JSON_PROTOCOL_MARKER)
+      expect(variant.rolePrompt).not.toMatch(/不要使用 JSON|Do not use JSON/)
     }
 
     for (const bundle of BUILTIN_DIRECTION_BUNDLES) {
-      expect(bundle.reviewPrompt).toMatch(/最后一条独立|final standalone/)
-      expect(bundle.filterPrompt).toMatch(/最后一条独立|final standalone/)
-      expect(bundle.orchestratePrompt).toMatch(
-        /最后一条独立|final standalone/,
-      )
-      expect(bundle.assemblePrompt).toMatch(/最后一条独立|final standalone/)
-      expect(bundle.version).toBe(22)
+      for (const prompt of [
+        bundle.reviewPrompt,
+        bundle.filterPrompt,
+        bundle.orchestratePrompt,
+        bundle.assemblePrompt,
+      ]) {
+        expect(prompt).toContain(SEMANTIC_JSON_PROTOCOL_MARKER)
+        expect(prompt).toMatch(/reasoning/)
+        expect(prompt).toContain('"annotation"')
+        expect(prompt).not.toMatch(/不要使用 JSON|Do not use JSON/)
+      }
+      expect(bundle.version).toBe(24)
       expect(bundle.editingPrompt).toMatch(/Requirement and audit closure|要求与审查闭环/)
       expect(bundle.workerBasePrompt).toMatch(
         /explicit requirement|用户明确提出的要求/,

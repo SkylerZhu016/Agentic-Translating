@@ -6,7 +6,7 @@
 // 点击非当前版本 → 确认弹层 → restore API → 全文刷新为新版本。
 // ---------------------------------------------------------------------------
 
-import { useState } from 'react'
+import { memo, useMemo, useRef, useState } from 'react'
 import { TID } from '@/src/lib/testids'
 import { Badge, Button, Modal, Spinner } from '@/src/components/ui'
 import { truncate, type FinalVersion } from './types'
@@ -15,6 +15,7 @@ import { useI18n } from '@/src/i18n/LocaleProvider'
 export interface VersionHistoryProps {
   versions: FinalVersion[]
   currentVersionNo: number | null
+  busy?: boolean
   /** 父级执行 restore API + 刷新；抛错则弹层内展示 */
   onRestore: (versionNo: number) => Promise<void>
 }
@@ -27,16 +28,18 @@ const SOURCE_VARIANT: Record<FinalVersion['source'], 'solid' | 'outline' | 'subt
   revert: 'subtle',
 }
 
-export function VersionHistory({ versions, currentVersionNo, onRestore }: VersionHistoryProps) {
+export const VersionHistory = memo(function VersionHistory({ versions, currentVersionNo, busy = false, onRestore }: VersionHistoryProps) {
   const { t, formatDate } = useI18n()
   const [pending, setPending] = useState<FinalVersion | null>(null)
   const [restoring, setRestoring] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const restoreLock = useRef(false)
 
-  const ordered = [...versions].sort((a, b) => b.version_no - a.version_no)
+  const ordered = useMemo(() => [...versions].sort((a, b) => b.version_no - a.version_no), [versions])
 
   const confirmRestore = async () => {
-    if (!pending || restoring) return
+    if (!pending || restoreLock.current || busy) return
+    restoreLock.current = true
     setRestoring(true)
     setError(null)
     try {
@@ -45,6 +48,7 @@ export function VersionHistory({ versions, currentVersionNo, onRestore }: Versio
     } catch (err) {
       setError(err instanceof Error ? err.message : t('versions.error.restore'))
     } finally {
+      restoreLock.current = false
       setRestoring(false)
     }
   }
@@ -52,7 +56,7 @@ export function VersionHistory({ versions, currentVersionNo, onRestore }: Versio
   return (
     <div data-testid={TID.edit.versionHistory}>
       {ordered.length === 0 ? (
-        <p className="px-5 py-6 text-center text-sm leading-6 text-ink-4">
+        <p className="px-4 py-3 text-sm leading-6 text-ink-4">
           {t('versions.empty')}
         </p>
       ) : (
@@ -75,7 +79,7 @@ export function VersionHistory({ versions, currentVersionNo, onRestore }: Versio
                   data-testid={TID.edit.versionItem}
                   data-version-no={version.version_no}
                   data-current={isCurrent ? 'true' : 'false'}
-                  disabled={isCurrent || restoring}
+                  disabled={isCurrent || restoring || busy}
                   onClick={() => {
                     setError(null)
                     setPending(version)
@@ -129,7 +133,7 @@ export function VersionHistory({ versions, currentVersionNo, onRestore }: Versio
             <Button variant="ghost" size="sm" onClick={() => setPending(null)} disabled={restoring}>
               {t('common.cancel')}
             </Button>
-            <Button size="sm" onClick={confirmRestore} disabled={restoring}>
+            <Button size="sm" onClick={confirmRestore} disabled={restoring || busy}>
               {restoring ? <Spinner size="sm" /> : t('versions.restoreConfirm')}
             </Button>
           </>
@@ -149,4 +153,4 @@ export function VersionHistory({ versions, currentVersionNo, onRestore }: Versio
       </Modal>
     </div>
   )
-}
+})

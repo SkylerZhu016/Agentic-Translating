@@ -25,6 +25,7 @@ declare global {
       openDataDirectory: () => Promise<string>
       openDiagnosticLogs: () => Promise<string>
       setLocale: (locale: 'zh-CN' | 'en') => Promise<'zh-CN' | 'en'>
+      onPrepareClose?: (callback: () => Promise<boolean> | boolean) => () => void
     }
   }
 }

@@ -12,6 +12,7 @@ import type {
   SessionPreflightStageEstimate,
 } from '../contracts/vnext'
 import { estimateTokens } from '../guards/tokens'
+import { reviewCallCount } from '../prompts/review-strategy'
 import {
   isOrdinarySnapshotObject,
   withoutSnapshotCredentials,
@@ -702,6 +703,7 @@ export function runSessionPreflight(
       })
     }
   } else {
+    const reviewCalls = reviewCallCount(bundle.reviewPrompt)
     const reviewOutput = outputFor(snapshot, snapshot.modelBindings.reviewAgent)
     const filterOutput = outputFor(snapshot, snapshot.modelBindings.filterAgent)
     const orchestrateOutput = outputFor(
@@ -714,7 +716,7 @@ export function runSessionPreflight(
         role: 'reviewAgent',
         binding: snapshot.modelBindings.reviewAgent,
         prompt: bundle.reviewPrompt,
-        calls: 3,
+        calls: reviewCalls,
         prior: 0,
       },
       {
@@ -723,7 +725,7 @@ export function runSessionPreflight(
         binding: snapshot.modelBindings.filterAgent,
         prompt: bundle.filterPrompt,
         calls: 1,
-        prior: reviewOutput * 3,
+        prior: reviewOutput * reviewCalls,
       },
       {
         stage: 'orchestrate',
@@ -731,7 +733,7 @@ export function runSessionPreflight(
         binding: snapshot.modelBindings.orchestrateAgent,
         prompt: bundle.orchestratePrompt,
         calls: 1,
-        prior: reviewOutput * 3 + filterOutput,
+        prior: reviewOutput * reviewCalls + filterOutput,
       },
       {
         stage: 'assemble',
@@ -739,7 +741,7 @@ export function runSessionPreflight(
         binding: snapshot.modelBindings.assembleAgent,
         prompt: bundle.assemblePrompt,
         calls: 1,
-        prior: reviewOutput * 3 + filterOutput + orchestrateOutput,
+        prior: reviewOutput * reviewCalls + filterOutput + orchestrateOutput,
       },
     ] as const
     for (const stage of stagesInOrder) {

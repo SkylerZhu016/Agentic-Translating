@@ -94,7 +94,7 @@ export function resolveCompletionTokenBudget(
   if (available < 1_024) {
     throw new Error(
       `上下文估算为 ${estimatedInput} tokens，端点上限 ${contextWindow}，` +
-      '不足以保留最小 1024-token 输出空间；未裁剪任何正文。',
+      '不足以保留最小 1024-token 输出空间。正文已完整保留。',
     )
   }
   return Math.min(target, available)

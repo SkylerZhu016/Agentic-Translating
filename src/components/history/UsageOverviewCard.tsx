@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { Badge, Card, Spinner } from '@/src/components/ui'
+import { Badge, Button, Card, Spinner } from '@/src/components/ui'
 import { useI18n, type MessageKey } from '@/src/i18n'
 import type {
   LlmAnalyticsOverview,
@@ -37,9 +37,12 @@ export function UsageOverviewCard() {
   const [overview, setOverview] = useState<LlmAnalyticsOverview | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [refresh, setRefresh] = useState(0)
 
   useEffect(() => {
     const controller = new AbortController()
+    setLoading(true)
+    setError(null)
 
     async function loadOverview() {
       try {
@@ -50,6 +53,7 @@ export function UsageOverviewCard() {
         if (!response.ok) throw new Error(t('usage.error.read'))
 
         const payload = await response.json() as LlmAnalyticsOverview
+        if (controller.signal.aborted) return
         setOverview(payload)
       } catch (loadError) {
         if (controller.signal.aborted) return
@@ -61,7 +65,7 @@ export function UsageOverviewCard() {
 
     void loadOverview()
     return () => controller.abort()
-  }, [t])
+  }, [refresh, t])
 
   const totalTokens = overview == null
     ? 0
@@ -78,11 +82,12 @@ export function UsageOverviewCard() {
     <Card
       overline={t('usage.overline')}
       title={t('usage.title')}
-      actions={overview != null ? (
-        <Badge variant="outline">
+      actions={<>
+        {overview != null && <Badge variant="outline">
           {t('usage.totalCallsBadge', { count: formatNumber(overview.calls.total) })}
-        </Badge>
-      ) : undefined}
+        </Badge>}
+        <Button size="sm" variant="outline" disabled={loading} onClick={() => setRefresh((current) => current + 1)}>{t('common.refresh')}</Button>
+      </>}
       testId="usage-overview-card"
     >
       {loading ? (

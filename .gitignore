@@ -37,6 +37,23 @@ src/lib/prompts/temp.txt
 
 # Root-level temporary iteration files (dev/gate logs, probe scripts)
 /.tmp-*
+/.tmp/
+
+# Local research, conversation history, and database backups
+/论文/
+/codex-thread-backups/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite.bak
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3.bak
+*.db
+*.db-wal
+*.db-shm
+*.db.bak
 
 # Packaging artifacts (beyond dist-electron)
 release/

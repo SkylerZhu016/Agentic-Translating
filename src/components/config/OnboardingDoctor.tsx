@@ -147,9 +147,11 @@ async function readJson<T>(response: Response, t: Translator): Promise<T> {
 export function OnboardingDoctor({
   endpoints,
   notify,
+  onManageEndpoints,
 }: {
   endpoints: Endpoint[]
   notify: NotifyFn
+  onManageEndpoints?: () => void
 }) {
   const { direction } = useDirection()
   const { t, formatDuration, formatNumber } = useI18n()
@@ -165,47 +167,59 @@ export function OnboardingDoctor({
 
   const selectedEndpoint = endpoints.find((item) => item.id === endpointId)
 
-  const loadStatus = useCallback(async () => {
+  const loadStatus = useCallback(async (signal: AbortSignal) => {
     setLoading(true)
     try {
       const next = await readJson<OnboardingStatus>(
-        await fetch('/api/onboarding/status', { cache: 'no-store' }),
+        await fetch('/api/onboarding/status', { cache: 'no-store', signal }),
         t,
       )
+      if (signal.aborted) return
       setStatus(next)
       setEndpointId((current) =>
-        current ??
-        next.state.selectedEndpointId ??
+        (endpoints.some((item) => item.id === current) ? current : null) ??
+        (endpoints.some((item) => item.id === next.state.selectedEndpointId) ? next.state.selectedEndpointId : null) ??
         endpoints[0]?.id ??
         null,
       )
       if (next.recommendedAction === 'none') setExpanded(false)
     } catch (error) {
+      if (signal.aborted) return
       notify(t('doctor.unavailable'), {
         message: error instanceof Error ? error.message : t('config.error.tryLater'),
       })
     } finally {
-      setLoading(false)
+      if (!signal.aborted) setLoading(false)
     }
   }, [endpoints, notify, t])
 
   useEffect(() => {
-    void loadStatus()
+    const controller = new AbortController()
+    void loadStatus(controller.signal)
+    return () => controller.abort()
   }, [loadStatus])
 
   useEffect(() => {
+    const controller = new AbortController()
     setModel('')
     setProfile(null)
     if (!endpointId) return
     void fetch(`/api/endpoints/${endpointId}/capabilities`, {
       cache: 'no-store',
+      signal: controller.signal,
     }).then(async (response) => {
       if (!response.ok) return
       const existing = await response.json() as EndpointCapabilityProfile
+      if (controller.signal.aborted) return
       setProfile(existing)
       if (existing.testedModel) setModel(existing.testedModel)
+    }).catch((error) => {
+      if (!controller.signal.aborted) notify(t('doctor.unavailable'), {
+        message: error instanceof Error ? error.message : t('config.error.tryLater'),
+      })
     })
-  }, [endpointId])
+    return () => controller.abort()
+  }, [endpointId, notify, t])
 
   // A provider that only returns JSON can still run through the existing
   // transport fallback.  Streaming is therefore an experience signal, not a
@@ -471,11 +485,12 @@ export function OnboardingDoctor({
                   className="mt-3"
                   size="sm"
                   variant="outline"
-                  onClick={() =>
-                    document
+                  onClick={() => {
+                    if (onManageEndpoints) onManageEndpoints()
+                    else document
                       .getElementById('endpoint-management')
                       ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-                  }
+                  }}
                 >
                   {t('doctor.endpoint.add')}
                 </Button>
@@ -487,6 +502,7 @@ export function OnboardingDoctor({
               >
                 <select
                   value={endpointId ?? ''}
+                  disabled={checking || creating}
                   aria-label={t('doctor.endpoint.aria')}
                   onChange={(event) =>
                     setEndpointId(Number(event.target.value) || null)
@@ -501,6 +517,7 @@ export function OnboardingDoctor({
                   ))}
                 </select>
                 <ModelPicker
+                  disabled={checking || creating}
                   endpointId={endpointId}
                   value={model}
                   onChange={(nextModel) => {

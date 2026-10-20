@@ -15,6 +15,7 @@ import type {
 import type { Endpoint } from './api'
 import type { NotifyFn } from './shared'
 import { ModelPicker } from './ModelPicker'
+import { MODEL_BUDGET_LAYOUT, OutputBudgetField, OutputBudgetHint, parseOutputBudget } from './OutputBudgetField'
 import { useI18n, type MessageKey } from '@/src/i18n'
 
 type ExecutionRole =
@@ -60,6 +61,10 @@ export function WorkflowPresetPanel({
   const [description, setDescription] = useState('')
   const [taskBrief, setTaskBrief] = useState('')
   const [model, setModel] = useState('')
+  const [workerOutputBudget, setWorkerOutputBudget] = useState('')
+  const [executionOutputBudgets, setExecutionOutputBudgets] = useState<Partial<Record<ExecutionRole, string>>>({})
+  const [analysisOutputBudgetA, setAnalysisOutputBudgetA] = useState('')
+  const [analysisOutputBudgetB, setAnalysisOutputBudgetB] = useState('')
   const [executionBindings, setExecutionBindings] = useState<
     Record<ExecutionRole, ModelBinding>
   >({ ...EMPTY_EXECUTION_BINDINGS })
@@ -76,19 +81,38 @@ export function WorkflowPresetPanel({
     revisions: WorkflowPresetRevision[]
   } | null>(null)
   const loadGeneration = useRef(0)
+  const loadController = useRef<AbortController | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [recoveringId, setRecoveringId] = useState<string | null>(null)
+  const activePresets = presets.filter((preset) => !preset.deletedAt)
+  const deletedPresets = presets.filter((preset) => preset.deletedAt)
+  const invalidOutputBudget = [
+    workerOutputBudget,
+    ...EXECUTION_ROLES.map(([key]) => executionOutputBudgets[key] ?? ''),
+    ...(analysisModelA.trim() ? [analysisOutputBudgetA] : []),
+    ...(analysisModelB.trim() ? [analysisOutputBudgetB] : []),
+  ].some((value) => parseOutputBudget(value) === undefined)
 
   const load = useCallback(async () => {
     const generation = ++loadGeneration.current
-    const [presetResponse, catalogueResponse] = await Promise.all([
-      fetch(`/api/workflow-presets?direction=${direction}`),
-      fetch(`/api/agent-catalog?direction=${direction}`),
-    ])
-    if (generation !== loadGeneration.current) return
-    if (presetResponse.ok) setPresets(await presetResponse.json())
-    if (catalogueResponse.ok) {
-      const payload = await catalogueResponse.json() as {
-        variants: AgentDirectionVariant[]
-      }
+    loadController.current?.abort()
+    const controller = new AbortController()
+    loadController.current = controller
+    setLoading(true)
+    setLoadError(null)
+    try {
+      const [presetResponse, catalogueResponse] = await Promise.all([
+        fetch(`/api/workflow-presets?direction=${direction}&includeDeleted=1`, { signal: controller.signal }),
+        fetch(`/api/agent-catalog?direction=${direction}`, { signal: controller.signal }),
+      ])
+      if (!presetResponse.ok || !catalogueResponse.ok) throw new Error(t('config.error.networkRetry'))
+      const [nextPresets, payload] = await Promise.all([
+        presetResponse.json() as Promise<WorkflowPreset[]>,
+        catalogueResponse.json() as Promise<{ variants: AgentDirectionVariant[] }>,
+      ])
+      if (generation !== loadGeneration.current || controller.signal.aborted) return
+      setPresets(nextPresets)
       setVariants(payload.variants)
       setSelectedIds((current) => {
         const validIds = new Set(payload.variants.map((variant) => variant.id))
@@ -97,15 +121,27 @@ export function WorkflowPresetPanel({
           ? compatible
           : payload.variants.slice(0, 2).map((variant) => variant.id)
       })
+      setEndpointId((current) => endpoints.some((endpoint) => endpoint.id === current) ? current : endpoints[0]?.id ?? null)
+    } catch (error) {
+      if (!controller.signal.aborted) setLoadError(error instanceof Error ? error.message : t('config.error.networkRetry'))
+    } finally {
+      if (!controller.signal.aborted) setLoading(false)
     }
-    setEndpointId((current) => current ?? endpoints[0]?.id ?? null)
-  }, [direction, endpoints])
+  }, [direction, endpoints, t])
 
   useEffect(() => {
     void load()
+    return () => {
+      loadGeneration.current += 1
+      loadController.current?.abort()
+    }
   }, [load])
 
   async function create() {
+    if (invalidOutputBudget) {
+      notify(t('outputBudget.error'))
+      return
+    }
     if (
       !name.trim() ||
       !model.trim() ||
@@ -123,17 +159,41 @@ export function WorkflowPresetPanel({
       .filter((variant): variant is AgentDirectionVariant => Boolean(variant))
     setSaving(true)
     try {
+      const bundleResponse = await fetch(
+        `/api/direction-prompt-bundles?direction=${encodeURIComponent(direction)}`,
+        { cache: 'no-store' },
+      )
+      if (!bundleResponse.ok) throw new Error(t('config.error.networkRetry'))
+      const bundle = await bundleResponse.json() as { version?: unknown }
+      if (
+        typeof bundle.version !== 'number' ||
+        !Number.isInteger(bundle.version) ||
+        bundle.version < 1
+      ) {
+        throw new Error(t('config.error.networkRetry'))
+      }
       const binding = {
         endpointId,
         model: model.trim(),
+        maxOutputTokens: parseOutputBudget(workerOutputBudget),
         contextWindow:
           endpoints.find((endpoint) => endpoint.id === endpointId)?.context_window ??
           null,
       }
-      const contextAnalysisBindings = [analysisModelA, analysisModelB]
-        .map((selectedModel) => selectedModel.trim())
-        .filter(Boolean)
-        .map((selectedModel) => ({ ...binding, model: selectedModel }))
+      const contextAnalysisBindings = [
+        [analysisModelA, analysisOutputBudgetA],
+        [analysisModelB, analysisOutputBudgetB],
+      ]
+        .filter(([selectedModel]) => selectedModel.trim())
+        .map(([selectedModel, outputBudget]) => ({
+          ...binding,
+          model: selectedModel.trim(),
+          maxOutputTokens: parseOutputBudget(outputBudget),
+        }))
+      const roleBindings = Object.fromEntries(EXECUTION_ROLES.map(([key]) => [
+        key,
+        { ...executionBindings[key], maxOutputTokens: parseOutputBudget(executionOutputBudgets[key] ?? '') },
+      ]))
       const response = await fetch('/api/workflow-presets', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -153,14 +213,14 @@ export function WorkflowPresetPanel({
             agentVariantSnapshots: snapshots,
             defaultWorkerBinding: binding,
             agentBindingOverrides: {},
-            mainAgentBinding: executionBindings.mainAgent,
-            reviewAgentBinding: executionBindings.reviewAgent,
-            filterAgentBinding: executionBindings.filterAgent,
-            orchestrateAgentBinding: executionBindings.orchestrateAgent,
-            assembleAgentBinding: executionBindings.assembleAgent,
-            editingAgentBinding: executionBindings.editingAgent,
+            mainAgentBinding: roleBindings.mainAgent,
+            reviewAgentBinding: roleBindings.reviewAgent,
+            filterAgentBinding: roleBindings.filterAgent,
+            orchestrateAgentBinding: roleBindings.orchestrateAgent,
+            assembleAgentBinding: roleBindings.assembleAgent,
+            editingAgentBinding: roleBindings.editingAgent,
             contextAnalysisBindings,
-            promptBundleVersion: 7,
+            promptBundleVersion: bundle.version,
             maxAgentCalls: 5,
             batchConcurrency: 2,
             constraints: {},
@@ -175,6 +235,10 @@ export function WorkflowPresetPanel({
       setDescription('')
       setTaskBrief('')
       setModel('')
+      setWorkerOutputBudget('')
+      setExecutionOutputBudgets({})
+      setAnalysisOutputBudgetA('')
+      setAnalysisOutputBudgetB('')
       setCandidateAnnotationMode('body_only')
       setExecutionBindings({ ...EMPTY_EXECUTION_BINDINGS })
       setAnalysisModelA('')
@@ -191,36 +255,59 @@ export function WorkflowPresetPanel({
   }
 
   async function inspect(preset: WorkflowPreset) {
-    const response = await fetch(`/api/workflow-presets/${encodeURIComponent(preset.id)}`)
-    if (response.ok) setDetails(await response.json())
+    try {
+      const response = await fetch(`/api/workflow-presets/${encodeURIComponent(preset.id)}`)
+      if (!response.ok) throw new Error(t('config.error.networkRetry'))
+      setDetails(await response.json())
+    } catch (error) {
+      notify(t('config.error.networkRetry'), { message: error instanceof Error ? error.message : t('config.error.tryLater') })
+    }
   }
 
   async function restore(revisionNo: number) {
     if (!details) return
-    const response = await fetch(
-      `/api/workflow-presets/${encodeURIComponent(details.preset.id)}/restore`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ revisionNo }),
-      },
-    )
-    if (!response.ok) {
-      notify(t('workflowPreset.error.restore'))
-      return
+    try {
+      const response = await fetch(
+        `/api/workflow-presets/${encodeURIComponent(details.preset.id)}/restore`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ revisionNo }),
+        },
+      )
+      if (!response.ok) throw new Error(t('workflowPreset.error.restore'))
+      notify(t('workflowPreset.restored'), { tone: 'inverted' })
+      await inspect(details.preset)
+      await load()
+    } catch (error) {
+      notify(t('workflowPreset.error.restore'), { message: error instanceof Error ? error.message : t('config.error.networkRetry') })
     }
-    notify(t('workflowPreset.restored'), { tone: 'inverted' })
-    await inspect(details.preset)
-    await load()
   }
 
   async function remove(preset: WorkflowPreset) {
-    const response = await fetch(`/api/workflow-presets/${encodeURIComponent(preset.id)}`, {
-      method: 'DELETE',
-    })
-    if (!response.ok) return notify(t('workflowPreset.error.delete'))
-    notify(t('workflowPreset.deleted'), { tone: 'inverted' })
-    await load()
+    try {
+      const response = await fetch(`/api/workflow-presets/${encodeURIComponent(preset.id)}`, { method: 'DELETE' })
+      if (!response.ok) throw new Error(t('workflowPreset.error.delete'))
+      notify(t('workflowPreset.deleted'), { tone: 'inverted' })
+      await load()
+    } catch (error) {
+      notify(t('workflowPreset.error.delete'), { message: error instanceof Error ? error.message : t('config.error.networkRetry') })
+    }
+  }
+
+  async function recover(preset: WorkflowPreset) {
+    if (recoveringId) return
+    setRecoveringId(preset.id)
+    try {
+      const response = await fetch(`/api/workflow-presets/${encodeURIComponent(preset.id)}/recover`, { method: 'POST' })
+      if (!response.ok) throw new Error(t('workflowPreset.error.restore'))
+      notify(t('workflowPreset.trash.restored'), { tone: 'inverted' })
+      await load()
+    } catch (error) {
+      notify(t('workflowPreset.error.restore'), { message: error instanceof Error ? error.message : t('config.error.networkRetry') })
+    } finally {
+      setRecoveringId(null)
+    }
   }
 
   return (
@@ -233,14 +320,17 @@ export function WorkflowPresetPanel({
         </Button>
       }
     >
-      {presets.length === 0 ? (
+      {loadError && <div role="alert" className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-sm border border-cinnabar/30 bg-cinnabar/5 p-3 text-sm text-cinnabar">
+        <p>{loadError}</p><Button size="sm" variant="outline" onClick={() => void load()}>{t('common.retry')}</Button>
+      </div>}
+      {loading ? <div className="flex min-h-24 items-center justify-center"><Spinner /></div> : activePresets.length === 0 ? (
         <p className="rounded-sm border border-dashed border-line-2 p-5 text-center text-sm text-ink-4">
           {t('workflowPreset.empty')}
         </p>
       ) : (
         <ul className="divide-y divide-line">
-          {presets.map((preset) => (
-            <li key={preset.id} className="flex items-center gap-3 py-3 first:pt-0 last:pb-0">
+          {activePresets.map((preset) => (
+            <li key={preset.id} className="flex flex-wrap items-center gap-3 py-3 first:pt-0 last:pb-0">
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
                   <p className="truncate text-sm font-medium text-ink">{preset.name}</p>
@@ -270,15 +360,38 @@ export function WorkflowPresetPanel({
         </ul>
       )}
 
+      <details className="mt-4 rounded-sm border border-line bg-paper/55">
+        <summary className="cursor-pointer px-3 py-2.5 text-sm font-medium text-ink-3">
+          {t('workflowPreset.trash')}
+          <span className="ml-2 text-xs font-normal text-ink-4">{formatNumber(deletedPresets.length)}</span>
+        </summary>
+        <div className="border-t border-line px-3 py-3">
+          <p className="mb-3 text-xs leading-5 text-ink-4">{t('workflowPreset.trash.description')}</p>
+          {deletedPresets.length === 0 ? <p className="text-sm text-ink-4">{t('workflowPreset.trash.empty')}</p> : (
+            <ul className="divide-y divide-line">
+              {deletedPresets.map((preset) => <li key={preset.id} className="flex flex-wrap items-center justify-between gap-3 py-3 first:pt-0 last:pb-0">
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-ink">{preset.name}</p>
+                  <p className="mt-1 text-xs text-ink-4">{t('workflowPreset.revisionShort', { revision: formatNumber(preset.currentRevisionNo) })}</p>
+                </div>
+                <Button size="sm" variant="outline" disabled={recoveringId !== null} onClick={() => void recover(preset)}>
+                  {recoveringId === preset.id && <Spinner size="sm" />}{t('workflowPreset.trash.restore')}
+                </Button>
+              </li>)}
+            </ul>
+          )}
+        </div>
+      </details>
+
       <Modal
         open={open}
         onClose={() => setOpen(false)}
         title={t('workflowPreset.newTitle')}
-        className="max-w-2xl"
+        className="sm:max-w-2xl"
         footer={
           <>
             <Button variant="ghost" size="sm" onClick={() => setOpen(false)}>{t('config.action.cancel')}</Button>
-            <Button size="sm" disabled={saving} onClick={() => void create()}>
+            <Button size="sm" disabled={saving || invalidOutputBudget} onClick={() => void create()}>
               {saving && <Spinner size="sm" />}{t('workflowPreset.saveInitial')}
             </Button>
           </>
@@ -298,6 +411,7 @@ export function WorkflowPresetPanel({
           />
           <div className="space-y-3 rounded-sm border border-line p-3">
             <p className="text-xs font-medium text-ink">{t('workflowPreset.models.title')}</p>
+            <OutputBudgetHint />
             <select
               value={endpointId ?? ''}
               onChange={(event) => {
@@ -314,27 +428,36 @@ export function WorkflowPresetPanel({
               ))}
             </select>
             <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-              <ModelPicker
-                endpointId={endpointId}
-                value={model}
-                onChange={setModel}
-                emptyLabel={t('workflowPreset.model.worker')}
-                ariaLabel={t('workflowPreset.model.workerAria')}
-              />
-              <ModelPicker
-                endpointId={endpointId}
-                value={analysisModelA}
-                onChange={setAnalysisModelA}
-                emptyLabel={t('workflowPreset.model.analysisA')}
-                ariaLabel={t('workflowPreset.model.analysisA')}
-              />
-              <ModelPicker
-                endpointId={endpointId}
-                value={analysisModelB}
-                onChange={setAnalysisModelB}
-                emptyLabel={t('workflowPreset.model.analysisB')}
-                ariaLabel={t('workflowPreset.model.analysisB')}
-              />
+              <div className={MODEL_BUDGET_LAYOUT}>
+                <ModelPicker
+                  endpointId={endpointId}
+                  value={model}
+                  onChange={setModel}
+                  emptyLabel={t('workflowPreset.model.worker')}
+                  ariaLabel={t('workflowPreset.model.workerAria')}
+                />
+                <OutputBudgetField value={workerOutputBudget} onChange={setWorkerOutputBudget} role={t('workflowPreset.model.workerAria')} />
+              </div>
+              <div className={MODEL_BUDGET_LAYOUT}>
+                <ModelPicker
+                  endpointId={endpointId}
+                  value={analysisModelA}
+                  onChange={setAnalysisModelA}
+                  emptyLabel={t('workflowPreset.model.analysisA')}
+                  ariaLabel={t('workflowPreset.model.analysisA')}
+                />
+                {analysisModelA.trim() && <OutputBudgetField value={analysisOutputBudgetA} onChange={setAnalysisOutputBudgetA} role={t('workflowPreset.model.analysisA')} />}
+              </div>
+              <div className={MODEL_BUDGET_LAYOUT}>
+                <ModelPicker
+                  endpointId={endpointId}
+                  value={analysisModelB}
+                  onChange={setAnalysisModelB}
+                  emptyLabel={t('workflowPreset.model.analysisB')}
+                  ariaLabel={t('workflowPreset.model.analysisB')}
+                />
+                {analysisModelB.trim() && <OutputBudgetField value={analysisOutputBudgetB} onChange={setAnalysisOutputBudgetB} role={t('workflowPreset.model.analysisB')} />}
+              </div>
             </div>
             <div className="space-y-2 border-t border-line pt-3">
               <p className="text-xs font-medium text-ink">{t('workflowPreset.roles.title')}</p>
@@ -356,6 +479,7 @@ export function WorkflowPresetPanel({
                         setExecutionBindings((current) => ({
                           ...current,
                           [key]: {
+                            ...current[key],
                             endpointId: selectedEndpointId,
                             model: '',
                             contextWindow:
@@ -374,18 +498,25 @@ export function WorkflowPresetPanel({
                         </option>
                       ))}
                     </select>
-                    <ModelPicker
-                      endpointId={role.endpointId}
-                      value={role.model}
-                      onChange={(selectedModel) =>
-                        setExecutionBindings((current) => ({
-                          ...current,
-                          [key]: { ...current[key], model: selectedModel },
-                        }))
-                      }
-                      emptyLabel={t('workflowPreset.role.modelSelect', { role: label })}
-                      ariaLabel={t('workflowPreset.role.modelAria', { role: label })}
-                    />
+                    <div className={MODEL_BUDGET_LAYOUT}>
+                      <ModelPicker
+                        endpointId={role.endpointId}
+                        value={role.model}
+                        onChange={(selectedModel) =>
+                          setExecutionBindings((current) => ({
+                            ...current,
+                            [key]: { ...current[key], model: selectedModel },
+                          }))
+                        }
+                        emptyLabel={t('workflowPreset.role.modelSelect', { role: label })}
+                        ariaLabel={t('workflowPreset.role.modelAria', { role: label })}
+                      />
+                      <OutputBudgetField
+                        value={executionOutputBudgets[key] ?? ''}
+                        onChange={(value) => setExecutionOutputBudgets((current) => ({ ...current, [key]: value }))}
+                        role={label}
+                      />
+                    </div>
                   </div>
                 )
               })}

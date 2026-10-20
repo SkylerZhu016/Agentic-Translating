@@ -19,7 +19,7 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(function Input(
       data-testid={testId}
       className={[
         'h-9 w-full rounded-sm border border-line bg-paper-raise px-3 text-sm text-ink transition-colors duration-150',
-        'placeholder:text-ink-4 hover:border-line-2 focus:border-ink focus:outline-none',
+        'placeholder:text-ink-4 hover:border-line-2 focus:border-pine focus:outline-none focus:ring-2 focus:ring-pine/10',
         'disabled:cursor-not-allowed disabled:opacity-50',
         className,
       ].join(' ')}

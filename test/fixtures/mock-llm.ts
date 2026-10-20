@@ -43,6 +43,8 @@ export interface MockBehaviorConfig {
   echoChars?: number;
   /** tool_call 是否使用流式响应，默认 false */
   stream?: boolean;
+  /** Explicit mixed-role fixture: tool_call returns normal text when no tools were offered. */
+  toolCallOnlyWhenToolsPresent?: boolean;
   /** error behavior 的 error.type 字段，默认 "server_error" */
   errorType?: string;
   /** error behavior 的 error.code 字段，默认 "mock_error" */
@@ -279,6 +281,24 @@ function buildStreamChunk(
   };
 }
 
+/**
+ * Ordinary successful fixtures follow the requested output contract. Explicit
+ * json_content and malformed_json behaviors stay byte-for-byte controllable so
+ * invalid-format tests can never be silently repaired by the mock.
+ */
+function semanticResponseText(requestBody: unknown, text: string): string {
+  if (!requestBody || typeof requestBody !== 'object') return text
+  const messages = (requestBody as Record<string, unknown>).messages
+  const structured = Array.isArray(messages) && messages.some((message) =>
+    message &&
+    typeof message === 'object' &&
+    message.role === 'system' &&
+    typeof message.content === 'string' &&
+    message.content.includes('[protocol:json-v1]'),
+  )
+  return structured ? JSON.stringify({ body: text, annotation: null }) : text
+}
+
 // ---------------------------------------------------------------------------
 // Server factory
 // ---------------------------------------------------------------------------
@@ -361,8 +381,10 @@ export async function startMockLLM(
           // stream — SSE delta 流
           // ---------------------------------------------------------------
           case 'stream': {
-            const content =
-              'This is a mock streaming response from the LLM fixture.';
+            const content = semanticResponseText(
+              body,
+              'This is a mock streaming response from the LLM fixture.',
+            );
             const tokens = content.split(/(\s+)/).filter(Boolean);
             const delayMs = config.chunkDelayMs ?? 10;
 
@@ -430,7 +452,7 @@ export async function startMockLLM(
               responseId,
               created,
               model,
-              'This is a mock non-streaming response.',
+              semanticResponseText(body, 'This is a mock non-streaming response.'),
             );
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(response));
@@ -498,7 +520,7 @@ export async function startMockLLM(
                 responseId,
                 created,
                 model,
-                'No tools response: operation successful.',
+                semanticResponseText(body, 'No tools response: operation successful.'),
               );
               res.writeHead(200, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify(response));
@@ -512,6 +534,35 @@ export async function startMockLLM(
           case 'tool_call': {
             const toolCallContent = 'I will search for that.';
             const useStream = config.stream ?? false;
+            if (config.toolCallOnlyWhenToolsPresent && !hasTools) {
+              const content = semanticResponseText(
+                body,
+                'Mock auxiliary analysis and planning response.',
+              );
+              if (useStream) {
+                res.writeHead(200, {
+                  'Content-Type': 'text/event-stream',
+                  'Cache-Control': 'no-cache',
+                  Connection: 'keep-alive',
+                });
+                const contentChunk = buildStreamChunk(
+                  responseId, created, model, { content }, null,
+                );
+                const finalChunk = buildStreamChunk(
+                  responseId, created, model, {}, 'stop',
+                );
+                res.write(`data: ${JSON.stringify(contentChunk)}\n\n`);
+                res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+                res.write('data: [DONE]\n\n');
+                res.end();
+              } else {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(buildChatCompletion(
+                  responseId, created, model, content,
+                )));
+              }
+              break;
+            }
             const requestedTool = buildRequestedToolCall(body);
 
             const toolCall = {
@@ -604,7 +655,7 @@ export async function startMockLLM(
               responseId,
               created,
               model,
-              echoText,
+              semanticResponseText(body, echoText),
             );
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(response));
@@ -619,7 +670,7 @@ export async function startMockLLM(
               responseId,
               created,
               model,
-              'Default mock response.',
+              semanticResponseText(body, 'Default mock response.'),
             );
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(response));

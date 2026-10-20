@@ -17,6 +17,8 @@ export {
   QUALITY_DISCIPLINE_ZH,
   SEMANTIC_BOUNDARY_EN,
   SEMANTIC_BOUNDARY_ZH,
+  SOURCE_LED_STYLE_EN,
+  SOURCE_LED_STYLE_ZH,
   STAGE_BOUNDARY_EN,
   STAGE_BOUNDARY_ZH,
 } from './common'
@@ -26,7 +28,7 @@ export const BUILTIN_AGENT_VARIANTS: AgentDirectionVariant[] = [
   ...ZH_TO_EN_VARIANTS,
 ].map((variant, index) => ({
   ...variant,
-  promptVersion: variant.archetypeId === 'poetry-form' ? 18 : 17,
+  promptVersion: 20,
   enabled: true,
   endpointOverrideId: null,
   modelOverride: null,

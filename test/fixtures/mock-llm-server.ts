@@ -36,6 +36,7 @@ export interface ControlPayload {
   errorType?: string
   errorCode?: string
   stream?: boolean
+  toolCallOnlyWhenToolsPresent?: boolean
   echoChars?: number
 }
 
@@ -136,6 +137,7 @@ export async function startMockLLMServer(
           errorType: payload.errorType,
           errorCode: payload.errorCode,
           stream: payload.stream,
+          toolCallOnlyWhenToolsPresent: payload.toolCallOnlyWhenToolsPresent,
           echoChars: payload.echoChars,
         }
         upstream.setBehavior(model, config)

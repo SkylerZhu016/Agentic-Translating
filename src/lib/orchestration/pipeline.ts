@@ -8,7 +8,9 @@ import { writeRunArtifact } from '../storage/run-artifacts';
 import type { Stage, TranslationResult, StageOutput } from '../contracts/types';
 import type { ChatCompletionResponse, LLMStreamEvent, ChatCompletionRequest } from '../llm/client';
 import { isAsyncIterable } from '../llm/client';
-import { semanticBody } from '../protocol/semantic-output';
+import { parseSemanticAgentOutput, semanticOutputFormatForPrompt } from '../protocol/semantic-output';
+import { createSemanticOutputStreamDecoder } from '../protocol/semantic-output-stream';
+import { createReasoningPreview, type ReasoningPreview } from '../llm/reasoning-preview';
 
 // ===========================================================================
 // Exported types
@@ -29,6 +31,9 @@ export interface StageRunResult {
 export interface PipelineCallbacks {
   onStageStart?(stage: Stage): void;
   onDelta?(stage: Stage, content: string): void;
+  onAnnotation?(stage: Stage, content: string): void;
+  onReasoning?(stage: Stage, preview: ReasoningPreview): void;
+  onReset?(stage: Stage): void;
   onStageComplete?(stage: Stage, result: StageRunResult): void;
   onError?(stage: Stage, error: Error): void;
   onAssembled?(finalText: string): void;
@@ -90,6 +95,21 @@ function isStreamingStage(stage: Stage): boolean {
   return stage === 'orchestrate' || stage === 'assemble';
 }
 
+export function buildPipelineStagePrompt(
+  stage: Stage,
+  template: string,
+  contextJson: string,
+  promptLanguage?: 'zh' | 'en',
+) {
+  return buildStagePrompt(
+    template,
+    contextJson,
+    promptLanguage === 'en' ? STAGE_GOALS_EN[stage] : STAGE_GOALS[stage],
+    promptLanguage,
+    semanticOutputFormatForPrompt(template) === 'json' ? 'json' : 'legacy',
+  );
+}
+
 // ===========================================================================
 // Public API — markDownstreamStale
 // ===========================================================================
@@ -145,6 +165,8 @@ export async function runStage(
   llmCall: LLMCaller,
 ): Promise<StageRunResult> {
   callbacks.onStageStart?.(stage);
+  const reasoning = createReasoningPreview((preview) => callbacks.onReasoning?.(stage, preview));
+  let invalidPreview = false;
 
   try {
     // ── 1. Check prerequisite ──────────────────────────────────
@@ -178,17 +200,14 @@ export async function runStage(
 
     // ── 3. Build stage prompt ──────────────────────────────────
     const stageTemplate = sessionContext.promptTemplates[stage] ?? '';
-    const stageGoal =
-      sessionContext.promptLanguage === 'en'
-        ? STAGE_GOALS_EN[stage]
-        : STAGE_GOALS[stage];
-
-    const { system, user } = buildStagePrompt(
+    const { system, user } = buildPipelineStagePrompt(
+      stage,
       stageTemplate,
       contextJson,
-      stageGoal,
       sessionContext.promptLanguage,
     );
+    const format = semanticOutputFormatForPrompt(system.content);
+    const decoder = format === 'json' ? createSemanticOutputStreamDecoder() : null;
 
     // ── 4. LLM call ────────────────────────────────────────────
     const streaming = isStreamingStage(stage);
@@ -201,6 +220,7 @@ export async function runStage(
       model: sessionContext.coordinatorModel,
       messages,
       stream: streaming,
+      onReasoning: (update) => reasoning.push(update),
     });
 
     // ── 5. Collect response text ───────────────────────────────
@@ -210,7 +230,16 @@ export async function runStage(
       for await (const event of llmResponse) {
         if (event.type === 'text') {
           rawText += event.content;
-          callbacks.onDelta?.(stage, event.content);
+          const decoded = decoder?.push(event.content);
+          if (!decoded) callbacks.onDelta?.(stage, event.content);
+          else if (decoded.invalid) {
+            if (!invalidPreview) callbacks.onReset?.(stage);
+            invalidPreview = true;
+          }
+          else if (!decoded.invalid) {
+            if (decoded.bodyDelta) callbacks.onDelta?.(stage, decoded.bodyDelta);
+            if (decoded.annotationDelta) callbacks.onAnnotation?.(stage, decoded.annotationDelta);
+          }
         } else if (event.type === 'done') {
           // Use accumulated content, or the done.content if available
           if (event.content && event.content.length > 0) {
@@ -224,11 +253,12 @@ export async function runStage(
 
     // ── 5b. Persist as txt artifact ─────────────────────────────
     writeRunArtifact(sessionContext.sessionId, stage, rawText);
+    const semantic = parseSemanticAgentOutput(rawText, { format });
 
     // ── 6. Build result ────────────────────────────────────────
     let finalText: string | undefined;
     if (stage === 'assemble') {
-      finalText = semanticBody(rawText);
+      finalText = semantic.body;
       if (finalText) {
         callbacks.onAssembled?.(finalText);
       }
@@ -244,6 +274,7 @@ export async function runStage(
     callbacks.onStageComplete?.(stage, result);
     return result;
   } catch (error: unknown) {
+    if (!invalidPreview) callbacks.onReset?.(stage);
     const err = error instanceof Error ? error : new Error(String(error));
     callbacks.onError?.(stage, err);
 
@@ -254,5 +285,7 @@ export async function runStage(
     };
     callbacks.onStageComplete?.(stage, result);
     return result;
+  } finally {
+    reasoning.dispose();
   }
 }

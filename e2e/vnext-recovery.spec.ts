@@ -10,7 +10,8 @@ import {
 
 const MOCK_URL = process.env.E2E_MOCK_LLM_URL ?? 'http://localhost:41099'
 
-test.beforeEach(async ({ request }) => {
+test.beforeEach(async ({ request, page }) => {
+  await page.addInitScript(() => window.localStorage.setItem('ui_locale', 'zh-CN'))
   await resetDb(request)
   await resetMockBehavior(request)
 })
@@ -19,6 +20,7 @@ test('pause after candidates, then resume without repeating Agent calls', async 
   page,
   request,
 }) => {
+  test.setTimeout(120_000)
   const endpointResponse = await request.post('/api/endpoints', {
     data: {
       name: 'vNext recovery mock',
@@ -51,6 +53,7 @@ test('pause after candidates, then resume without repeating Agent calls', async 
     behavior: 'tool_call',
     model: 'main-model',
     stream: true,
+    toolCallOnlyWhenToolsPresent: true,
   })
   await setMockBehavior(request, {
     behavior: 'stream',
@@ -68,6 +71,7 @@ test('pause after candidates, then resume without repeating Agent calls', async 
     `${tid(TID.translate.agentStreamCard)}[data-agent-kind="translation"]`,
   )
   await expect(candidateCards).toHaveCount(2, { timeout: 30_000 })
+  await page.getByTestId('workspace-tab-workflow').click()
   await page.getByRole('button', { name: '暂停自动成稿' }).click()
 
   await expect(
@@ -84,15 +88,24 @@ test('pause after candidates, then resume without repeating Agent calls', async 
   expect(invocationCount).toBeGreaterThanOrEqual(4)
 
   await page.getByRole('button', { name: '按冻结配置继续统筹' }).click()
-  await expect(page.getByText('v1 · 主 Agent 成稿')).toBeVisible({
-    timeout: 60_000,
-  })
+  await page.getByTestId('workspace-tab-editor').click()
+  await expect(byTid(page, TID.edit.finalText)).toContainText(
+    'Mock evidence-backed final translation.',
+    { timeout: 60_000 },
+  )
 
   const completed = await (
     await request.get(`/api/sessions/${sessionId}`)
   ).json()
   expect(completed.finalVersion).not.toBeNull()
-  expect(completed.invocations).toHaveLength(invocationCount)
+  const resumedCandidates = completed.invocations.filter(
+    (item: { agent_snapshot: string }) =>
+      JSON.parse(item.agent_snapshot).roleKind !== 'main_editor',
+  )
+  expect(resumedCandidates).toHaveLength(invocationCount)
+  expect(resumedCandidates.map((item: { id: string }) => item.id)).toEqual(
+    paused.invocations.map((item: { id: string }) => item.id),
+  )
   expect(
     completed.events.some(
       (event: { event_type: string }) => event.event_type === 'run.resumed',
@@ -141,6 +154,7 @@ test('poetry task runs one auxiliary rhyme plan without counting it as a candida
     behavior: 'tool_call',
     model: 'main-model',
     stream: true,
+    toolCallOnlyWhenToolsPresent: true,
   })
   await setMockBehavior(request, {
     behavior: 'stream',

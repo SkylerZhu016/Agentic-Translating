@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Badge, Button, Modal } from '@/src/components/ui'
 import type { DiffSpan, EvidenceReference } from '@/src/lib/contracts/vnext'
 import { useI18n } from '@/src/i18n/LocaleProvider'
@@ -18,11 +18,12 @@ export interface TextPatchView {
   created_at: string
 }
 
-function parseJson<T>(raw: string, fallback: T): T {
+function parseJsonArray<T>(raw: string): T[] {
   try {
-    return JSON.parse(raw) as T
+    const value: unknown = JSON.parse(raw)
+    return Array.isArray(value) ? value.filter((item) => item != null && typeof item === 'object') as T[] : []
   } catch {
-    return fallback
+    return []
   }
 }
 
@@ -30,20 +31,33 @@ export function RevisionEvidence({
   sessionId,
   patches,
   currentVersionId,
+  disabled = false,
+  onBusyChange,
   onChanged,
 }: {
   sessionId: string | null
   patches: TextPatchView[]
   currentVersionId: number | null
+  disabled?: boolean
+  onBusyChange?: (busy: boolean) => void
   onChanged: () => Promise<unknown>
 }) {
   const { t } = useI18n()
   const [selected, setSelected] = useState<TextPatchView | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const undoLock = useRef(false)
+  const mounted = useRef(true)
+
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
 
   async function undo() {
-    if (!sessionId || !selected) return
+    if (!sessionId || !selected || undoLock.current || disabled || selected.result_version_id !== currentVersionId) return
+    undoLock.current = true
+    onBusyChange?.(true)
     setBusy(true)
     setError(null)
     try {
@@ -60,12 +74,17 @@ export function RevisionEvidence({
           localizeDiagnosticError(t, payload?.error, t('evidence.error.undo')),
         )
       }
+      if (!mounted.current) return
       setSelected(null)
       await onChanged()
     } catch (undoError) {
-      setError(undoError instanceof Error ? undoError.message : t('evidence.error.undo'))
+      if (mounted.current) setError(undoError instanceof Error ? undoError.message : t('evidence.error.undo'))
     } finally {
-      setBusy(false)
+      undoLock.current = false
+      if (mounted.current) {
+        setBusy(false)
+        onBusyChange?.(false)
+      }
     }
   }
 
@@ -83,7 +102,9 @@ export function RevisionEvidence({
                 setSelected(patch)
                 setError(null)
               }}
-              className="rounded-xs border border-line-2 bg-paper px-2 py-1 text-xs text-ink-2 hover:bg-paper-sink"
+              disabled={busy}
+              title={patch.reason || t('evidence.defaultReason')}
+              className="max-w-full truncate rounded-md border border-line-2 bg-paper px-2 py-1 text-xs text-ink-2 hover:bg-paper-sink disabled:opacity-50"
             >
               {patch.reason || t('evidence.defaultReason')}
             </button>
@@ -92,17 +113,18 @@ export function RevisionEvidence({
       </div>
       <Modal
         open={selected != null}
-        onClose={() => setSelected(null)}
+        onClose={() => { if (!busy) setSelected(null) }}
         title={t('evidence.modal.title')}
         footer={
           <>
-            <Button variant="ghost" size="sm" onClick={() => setSelected(null)}>
+            <Button variant="ghost" size="sm" disabled={busy} onClick={() => setSelected(null)}>
               {t('common.close')}
             </Button>
             <Button
               size="sm"
               disabled={
                 busy ||
+                disabled ||
                 selected == null ||
                 selected.result_version_id !== currentVersionId
               }
@@ -122,7 +144,7 @@ export function RevisionEvidence({
             <div>
               <p className="mb-1 text-xs font-medium text-ink-3">{t('evidence.diff')}</p>
               <div className="rounded-sm border border-line bg-paper p-3 font-serif leading-7">
-                {parseJson<DiffSpan[]>(selected.diff_spans_json, []).map((span, index) => (
+                {parseJsonArray<DiffSpan>(selected.diff_spans_json).map((span, index) => (
                   <span
                     key={`${index}-${span.type}`}
                     className={
@@ -145,9 +167,8 @@ export function RevisionEvidence({
             <div>
               <p className="text-xs font-medium text-ink-3">{t('evidence.candidates')}</p>
               <p className="mt-1 font-mono text-xs leading-5 text-ink-3">
-                {parseJson<EvidenceReference[]>(
+                {parseJsonArray<EvidenceReference>(
                   selected.evidence_refs_json,
-                  [],
                 ).map((reference) => reference.invocationId).join(' · ') || t('evidence.noCandidate')}
               </p>
             </div>

@@ -4,15 +4,20 @@
 // runStageStream —— POST stages/[stage]/run 的 SSE 客户端
 // 事件序（C1）：stage_start → stage_delta(orch/assemble) →
 //   stage_complete | stage_error → done
-// 解析复用契约层 parseSSEChunk（累积 buffer + 已处理计数跳过重放）
+// 解析复用契约层 parseSSEChunk（仅保留尚未结束的帧）
 // ---------------------------------------------------------------------------
 
-import { parseSSEChunk } from '@/src/lib/contracts/sse'
+import { parseSSEChunk, takeCompleteSSEText } from '@/src/lib/contracts/sse'
 import type { Stage } from '@/src/lib/contracts/types'
+import type { ReasoningPreview } from '@/src/lib/llm/reasoning-preview'
 
 export interface StageStreamHandlers {
+  signal?: AbortSignal
   onStart?: (stage: Stage) => void
   onDelta?: (stage: Stage, content: string) => void
+  onAnnotation?: (stage: Stage, content: string) => void
+  onReasoning?: (stage: Stage, preview: ReasoningPreview) => void
+  onReset?: (stage: Stage) => void
   onComplete?: (stage: Stage, rawText: string | null) => void
   onError?: (stage: Stage, message: string) => void
   localizeError?: (value: unknown, fallback: string) => string
@@ -38,6 +43,7 @@ export async function runStageStream(
   stage: Stage,
   handlers: StageStreamHandlers,
 ): Promise<void> {
+  if (handlers.signal?.aborted) return
   const errorText = (value: unknown, fallback: string) =>
     handlers.localizeError?.(value, fallback)
       ?? (value instanceof Error
@@ -49,18 +55,22 @@ export async function runStageStream(
   try {
     res = await fetch(`/api/sessions/${sessionId}/stages/${stage}/run`, {
       method: 'POST',
+      signal: handlers.signal,
     })
   } catch (e) {
+    if (handlers.signal?.aborted) return
     handlers.onError?.(
       stage,
       errorText(e, handlers.messages?.network ?? '网络错误'),
     )
     return
   }
+  if (handlers.signal?.aborted) return
 
   // 守卫类失败（409 前置未达成 / 404 会话不存在 等）以 JSON 返回
   if (!res.ok || !res.body) {
     const body = (await res.json().catch(() => null)) as { error?: string } | null
+    if (handlers.signal?.aborted) return
     handlers.onError?.(
       stage,
       errorText(
@@ -74,53 +84,105 @@ export async function runStageStream(
   const reader = res.body.getReader()
   const decoder = new TextDecoder()
   let rawBuffer = ''
-  let processedEventCount = 0
+  let sawTerminalEvent = false
+
+  const flush = () => {
+    const { completeText, remainder } = takeCompleteSSEText(rawBuffer)
+    rawBuffer = remainder
+    for (const ev of parseSSEChunk(completeText)) {
+      if (handlers.signal?.aborted) return
+      const data = safeJson(ev.data)
+      const evStage = (typeof data.stage === 'string' ? data.stage : stage) as Stage
+
+      switch (ev.event) {
+        case 'stage_start':
+        case 'stage.started':
+          handlers.onStart?.(evStage)
+          break
+        case 'stage_delta':
+        case 'stage.delta':
+          handlers.onDelta?.(
+            evStage,
+            typeof data.content === 'string'
+              ? data.content : typeof data.delta === 'string' ? data.delta : '',
+          )
+          break
+        case 'stage_annotation':
+        case 'stage.annotation':
+          handlers.onAnnotation?.(
+            evStage,
+            typeof data.content === 'string'
+              ? data.content : typeof data.delta === 'string' ? data.delta : '',
+          )
+          break
+        case 'stage_reasoning':
+        case 'stage.reasoning':
+        case 'stage.reasoning.completed':
+          handlers.onReasoning?.(evStage, {
+            reasoningPreview: typeof data.reasoningPreview === 'string'
+              ? data.reasoningPreview.slice(-4_000) : '',
+            reasoningCharacters: typeof data.reasoningCharacters === 'number'
+              ? Math.max(0, data.reasoningCharacters) : 0,
+            reasoningTruncated: data.reasoningTruncated === true,
+          })
+          break
+        case 'stage_reset':
+        case 'stage.reset':
+          handlers.onReset?.(evStage)
+          break
+        case 'stage_complete':
+        case 'stage.completed':
+          sawTerminalEvent = true
+          handlers.onComplete?.(evStage, typeof data.raw_text === 'string' ? data.raw_text : null)
+          break
+        case 'stage_error':
+        case 'stage.failed':
+          sawTerminalEvent = true
+          handlers.onError?.(
+            evStage,
+            errorText(
+              typeof data.error === 'string' ? data.error : data.detail,
+              handlers.messages?.stage ?? '阶段运行失败',
+            ),
+          )
+          break
+        case 'done':
+          sawTerminalEvent = true
+          break
+        default:
+          break
+      }
+    }
+  }
 
   try {
     for (;;) {
+      if (handlers.signal?.aborted) return
       const { done, value } = await reader.read()
+      if (handlers.signal?.aborted) return
       if (done) break
       rawBuffer += decoder.decode(value, { stream: true })
-
-      // parseSSEChunk 无状态：每次重解析累积 buffer，跳过已处理事件
-      const events = parseSSEChunk(rawBuffer)
-      for (let i = processedEventCount; i < events.length; i++) {
-        const ev = events[i]
-        const data = safeJson(ev.data)
-        const evStage = (typeof data.stage === 'string' ? data.stage : stage) as Stage
-
-        switch (ev.event) {
-          case 'stage_start':
-            handlers.onStart?.(evStage)
-            break
-          case 'stage_delta':
-            handlers.onDelta?.(evStage, typeof data.content === 'string' ? data.content : '')
-            break
-          case 'stage_complete':
-            handlers.onComplete?.(evStage, typeof data.raw_text === 'string' ? data.raw_text : null)
-            break
-          case 'stage_error':
-            handlers.onError?.(
-              evStage,
-              errorText(
-                typeof data.error === 'string' ? data.error : data.detail,
-                handlers.messages?.stage ?? '阶段运行失败',
-              ),
-            )
-            break
-          case 'done':
-          default:
-            break
-        }
-      }
-      processedEventCount = events.length
+      flush()
+    }
+    rawBuffer += decoder.decode()
+    flush()
+    if (handlers.signal?.aborted) return
+    // A clean transport EOF can still cut a frame or end before the protocol's
+    // completion/failure marker. Keep that visible instead of implying success.
+    if (rawBuffer.trim() || !sawTerminalEvent) {
+      handlers.onError?.(
+        stage,
+        handlers.messages?.connection ?? '连接中断',
+      )
     }
   } catch (e) {
+    if (handlers.signal?.aborted) return
     handlers.onError?.(
       stage,
       errorText(e, handlers.messages?.connection ?? '连接中断'),
     )
   } finally {
-    reader.cancel().catch(() => {})
+    await reader.cancel().catch(() => {})
+    reader.releaseLock()
   }
 }

@@ -12,14 +12,14 @@ export async function register() {
     const { getDb } = await import('@/src/lib/db')
     const { migrate } = await import('@/src/lib/db/migrate')
     const { seed } = await import('@/src/lib/db/seed')
-    const { recoverInterruptedWork } = await import(
+    const { recoverInterruptedWorkOnce } = await import(
       '@/src/lib/db/startup-recovery'
     )
     const db = getDb()
     migrate(db)
     seed(db)
 
-    recoverInterruptedWork(db)
+    recoverInterruptedWorkOnce(db)
 
     // Ensure run artifacts directory exists
     const dataDir = process.env.AGENTIC_DATA_DIR

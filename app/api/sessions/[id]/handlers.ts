@@ -26,10 +26,11 @@ export function createHandlers(db: Database.Database) {
     // GET /api/sessions/:id — full session with child records
     // ────────────────────────────────────────────────────────────
     async GET(
-      _request: NextRequest,
+      request: NextRequest,
       { params }: { params: Promise<{ id: string }> },
     ) {
       const { id } = await params
+      const workspaceView = new URL(request.url).searchParams.get('view') === 'workspace'
       const full = service.getSessionFull(id)
 
       if (!full) {
@@ -144,7 +145,13 @@ export function createHandlers(db: Database.Database) {
           }
       const events = hasVNext
         ? db.prepare(
-            'SELECT * FROM run_events WHERE session_id=? ORDER BY id',
+            workspaceView
+              ? `SELECT id, event_type, payload_json FROM run_events
+                 WHERE session_id=? AND event_type='tool.called'
+                   AND CASE WHEN json_valid(payload_json)
+                     THEN json_extract(payload_json, '$.name') END = 'call_agents'
+                 ORDER BY id DESC LIMIT 1`
+              : 'SELECT * FROM run_events WHERE session_id=? ORDER BY id',
           ).all(id)
         : []
       const finalVersion =
@@ -160,8 +167,7 @@ export function createHandlers(db: Database.Database) {
             full.session.config_snapshot,
           ) as ConfigSnapshot
           finalEvidence = checkTranslationEvidence({
-            direction:
-              full.session.direction === 'zh_to_en' ? 'zh_to_en' : 'en_to_zh',
+            direction: full.session.direction,
             sourceText: full.session.source_text,
             taskBrief: full.session.task_brief,
             translatedText: finalVersion.text,

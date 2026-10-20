@@ -107,9 +107,9 @@ describe('DB Migrations — In-Memory DB', () => {
   it('is idempotent — 3x migrate → 1 version', () => {
     migrate(db); migrate(db); migrate(db)
     const version = (db.prepare('SELECT MAX(version) as v FROM migrations').get() as { v: number | null }).v
-    expect(version).toBe(18)
+    expect(version).toBe(19)
     const count = (db.prepare('SELECT COUNT(*) as c FROM migrations').get() as { c: number }).c
-    expect(count).toBe(18)
+    expect(count).toBe(19)
   })
 
   it('creates config_presets and child tables (migration 0002)', () => {
@@ -212,7 +212,7 @@ describe('DB Migrations — File DB', () => {
     db2.pragma('foreign_keys = ON')
     migrate(db2)
     const v = (db2.prepare('SELECT MAX(version) as v FROM migrations').get() as { v: number | null }).v
-    expect(v).toBe(18)
+    expect(v).toBe(19)
     expect(listTables(db2)).toContain('endpoints')
     expect(listTables(db2)).toContain('config_presets')
     expect(listTables(db2)).toContain('agent_direction_variants')

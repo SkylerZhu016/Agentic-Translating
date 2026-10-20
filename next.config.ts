@@ -24,7 +24,20 @@ const nextConfig: NextConfig = {
     process.env.AGENTIC_NEXT_DEV_SERVER === '1',
   ),
   output: 'standalone',
-  serverExternalPackages: ['better-sqlite3'],
+  serverExternalPackages: [
+    'better-sqlite3',
+    'pinyin-pro',
+  ],
+  // CMU is ESM. Let Webpack compile its lazy require as an internal module;
+  // forcing it external makes Next's strict ESM rules reject the sync loader.
+  outputFileTracingIncludes: {
+    // The pronunciation helper uses createRequire only when a rhyme check is
+    // needed. Include these lazy runtime assets in every standalone release.
+    '/**': [
+      './node_modules/cmu-pronouncing-dictionary/**/*',
+      './node_modules/pinyin-pro/**/*',
+    ],
+  },
   outputFileTracingExcludes: {
     // Best-effort tracing reduction: `/**` covers application routes without
     // matching Next's internal `next-server` trace. Next 15 on Windows can

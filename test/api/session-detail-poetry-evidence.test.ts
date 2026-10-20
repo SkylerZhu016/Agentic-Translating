@@ -61,4 +61,27 @@ describe('session detail poetry evidence', () => {
       }),
     )
   })
+
+  it('retains a custom language direction in final evidence', async () => {
+    db.prepare(`
+      INSERT INTO sessions (
+        id, source_text, source_lang, target_lang, direction, state, config_snapshot
+      ) VALUES ('custom-detail', 'Bonjour', 'French', 'German', 'custom', 'assembled', '{}')
+    `).run()
+    const version = db.prepare(`
+      INSERT INTO final_versions (session_id, version_no, text, source)
+      VALUES ('custom-detail', 1, 'Guten Tag', 'assemble') RETURNING id
+    `).get() as { id: number }
+    db.prepare(
+      "UPDATE sessions SET final_version_id=? WHERE id='custom-detail'",
+    ).run(version.id)
+    const response = await createHandlers(db).GET(
+      new NextRequest('http://localhost/api/sessions/custom-detail'),
+      { params: Promise.resolve({ id: 'custom-detail' }) },
+    )
+    expect(response.status).toBe(200)
+    expect(checkTranslationEvidence).toHaveBeenCalledWith(
+      expect.objectContaining({ direction: 'custom', translatedText: 'Guten Tag' }),
+    )
+  })
 })

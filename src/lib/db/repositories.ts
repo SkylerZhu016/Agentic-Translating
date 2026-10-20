@@ -259,12 +259,35 @@ export function createSettingsRepo(db: Database.Database) {
 // ── Sessions Repository ───────────────────────────────────────────
 
 export function createSessionsRepo(db: Database.Database) {
+  const hasDirection = (
+    db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>
+  ).some((column) => column.name === 'direction')
   const insertStmt = db.prepare('INSERT INTO sessions (id, source_text, source_lang, target_lang, state, config_snapshot) VALUES (@id, @source_text, @source_lang, @target_lang, @state, @config_snapshot)')
   const getByIdStmt = db.prepare('SELECT * FROM sessions WHERE id = ?')
   const updateStmt = db.prepare("UPDATE sessions SET source_text = @source_text, source_lang = @source_lang, target_lang = @target_lang, state = @state, config_snapshot = @config_snapshot, updated_at = datetime('now') WHERE id = @id")
   const updateStateStmt = db.prepare("UPDATE sessions SET state = ?, updated_at = datetime('now') WHERE id = ?")
   const deleteStmt = db.prepare('DELETE FROM sessions WHERE id = ?')
-  const listStmt = db.prepare('SELECT * FROM sessions ORDER BY updated_at DESC')
+  const listStmt = db.prepare('SELECT * FROM sessions ORDER BY updated_at DESC, id DESC')
+  const listPageStmt = db.prepare(
+    'SELECT * FROM sessions ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?',
+  )
+  const listCreatedPageStmt = db.prepare(
+    'SELECT * FROM sessions ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?',
+  )
+  const countStmt = db.prepare('SELECT COUNT(*) AS total FROM sessions')
+  const listDirectionPageStmt = hasDirection
+    ? db.prepare(
+        'SELECT * FROM sessions WHERE direction=? ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?',
+      )
+    : null
+  const listDirectionCreatedPageStmt = hasDirection
+    ? db.prepare(
+        'SELECT * FROM sessions WHERE direction=? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?',
+      )
+    : null
+  const countDirectionStmt = hasDirection
+    ? db.prepare('SELECT COUNT(*) AS total FROM sessions WHERE direction=?')
+    : null
 
   return {
     insert: (row: Pick<SessionRow, 'id' | 'source_text' | 'source_lang' | 'target_lang' | 'state' | 'config_snapshot'>) => insertStmt.run(row as any),
@@ -273,6 +296,33 @@ export function createSessionsRepo(db: Database.Database) {
     updateState: (state: string, id: string) => updateStateStmt.run(state, id),
     delete: (id: string) => deleteStmt.run(id),
     list: () => listStmt.all() as SessionRow[],
+    listPage: (options: {
+      limit: number
+      offset: number
+      direction?: SessionRow['direction']
+      order?: 'updated' | 'created'
+    }) => {
+      const directionPage = options.order === 'created'
+        ? listDirectionCreatedPageStmt
+        : listDirectionPageStmt
+      if (options.direction && directionPage) {
+        return directionPage.all(
+          options.direction, options.limit, options.offset,
+        ) as SessionRow[]
+      }
+      // Before migration 3, every session belonged to the English-to-Chinese
+      // workspace. Keep the old database API usable without loading all rows.
+      if (options.direction && options.direction !== 'en_to_zh') return []
+      const page = options.order === 'created' ? listCreatedPageStmt : listPageStmt
+      return page.all(options.limit, options.offset) as SessionRow[]
+    },
+    count: (direction?: SessionRow['direction']) => {
+      if (direction && countDirectionStmt) {
+        return (countDirectionStmt.get(direction) as { total: number }).total
+      }
+      if (direction && direction !== 'en_to_zh') return 0
+      return (countStmt.get() as { total: number }).total
+    },
   }
 }
 

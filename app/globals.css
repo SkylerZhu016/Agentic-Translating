@@ -1,7 +1,7 @@
 @import "tailwindcss";
 
 /* ==========================================================================
-   设计 Tokens —— 墨色 × 宣纸（单色浅色主题）
+   设计 Tokens —— 明亮工作区、清晰纸面与可切换主题
    Tailwind v4 @theme: 生成颜色/字体/圆角/阴影等工具类
    ========================================================================== */
 @theme {
@@ -13,38 +13,39 @@
   --font-mono: "Sarasa Mono SC", "JetBrains Mono", ui-monospace, SFMono-Regular,
     Menlo, Consolas, "Courier New", monospace;
 
-  /* ---- 色板：宣纸（暖白纸面） ---- */
-  --color-paper: #f7f4ec;        /* 页面基底 */
-  --color-paper-raise: #fdfcf7;  /* 抬升面（卡片/输入） */
-  --color-paper-sink: #efece1;   /* 下沉面（hover/填充） */
+  /* ---- 首次使用的清爽蓝。已保存主题会在首绘前覆盖这些变量。 ---- */
+  --color-paper: #f3f6fc;        /* 安静的工作区背景 */
+  --color-paper-raise: #ffffff; /* 清晰的阅读和编辑表面 */
+  --color-paper-sink: #e9eeff;  /* 分组与悬停 */
 
   /* ---- 色板：墨色（单色阶） ---- */
-  --color-ink: #1c1a15;          /* 主文 */
-  --color-ink-2: #45413a;        /* 次文 */
-  --color-ink-3: #736d60;        /* 弱文/辅助 */
-  --color-ink-4: #a8a294;        /* 占位/禁用 */
+  --color-ink: #202a44;          /* 主文 */
+  --color-ink-2: #475572;        /* 次文 */
+  --color-ink-3: #626f89;        /* 弱文/辅助 */
+  --color-ink-4: #727f96;        /* 占位/禁用 */
 
   /* ---- 色板：界（发丝线） ---- */
-  --color-line: #e3ddcb;         /* 常规描边 */
-  --color-line-2: #c9c1ab;       /* 强调描边 */
+  --color-line: #dce3f0;         /* 常规描边 */
+  --color-line-2: #b5c1d8;       /* 强调描边 */
 
-  /* ---- 色板：状态语义（传统设色：墨绿/朱红/琥珀，宣纸显色） ---- */
-  --color-pine: #2e5d45;         /* 墨绿——完成/成功 */
-  --color-moss: #2e5d45;         /* pine 别名（edit-flash / ChatPanel 引用） */
+  /* ---- 保留现有工具类名称，主操作色由外观偏好统一管理。 ---- */
+  --color-pine: #3857d2;         /* 主操作与完成状态 */
+  --color-moss: #3857d2;
   --color-cinnabar: #b5442c;     /* 朱红——失败/错误（印泥朱砂） */
   --color-amber: #a67c1b;        /* 琥珀——过期/需重跑 */
 
-  /* ---- 圆角刻度：近直角，印刷感 ---- */
-  --radius-xs: 0.125rem;
-  --radius-sm: 0.25rem;
-  --radius-md: 0.375rem;
-  --radius-lg: 0.625rem;
-  --radius-xl: 0.875rem;
+  /* ---- 圆角刻度：紧凑控件与柔和工作面板 ---- */
+  --radius-xs: 0.25rem;
+  --radius-sm: 0.5rem;
+  --radius-md: 0.75rem;
+  --radius-lg: 1rem;
+  --radius-xl: 1.25rem;
+  --container-7xl: 90rem;
 
   /* ---- 阴影刻度：纸面低对比 ---- */
-  --shadow-card: 0 1px 2px rgb(28 26 21 / 0.05), 0 4px 12px -6px rgb(28 26 21 / 0.08);
-  --shadow-pop: 0 2px 6px rgb(28 26 21 / 0.06), 0 12px 32px -12px rgb(28 26 21 / 0.18);
-  --shadow-modal: 0 4px 12px rgb(28 26 21 / 0.08), 0 28px 72px -20px rgb(28 26 21 / 0.32);
+  --shadow-card: 0 1px 3px rgb(34 36 44 / 0.035);
+  --shadow-pop: 0 2px 6px rgb(34 36 44 / 0.06), 0 12px 32px -12px rgb(34 36 44 / 0.18);
+  --shadow-modal: 0 4px 12px rgb(34 36 44 / 0.08), 0 28px 72px -20px rgb(34 36 44 / 0.32);
 
   /* ---- 动效 ---- */
   --ease-out-soft: cubic-bezier(0.22, 1, 0.36, 1);
@@ -85,11 +86,6 @@
     font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
-    /* 宣纸气息：顶部暖光 + 底部淡晕，单色不喧哗 */
-    background-image:
-      radial-gradient(1100px 520px at 85% -12%, rgb(255 255 255 / 0.65), transparent 62%),
-      radial-gradient(900px 480px at -10% 110%, rgb(28 26 21 / 0.035), transparent 60%);
-    background-attachment: fixed;
     min-height: 100dvh;
   }
 
@@ -103,7 +99,7 @@
   }
 
   :focus-visible {
-    outline: 2px solid var(--color-ink);
+    outline: 2px solid var(--color-pine);
     outline-offset: 2px;
     border-radius: var(--radius-xs);
   }
@@ -116,6 +112,31 @@
   * {
     scrollbar-width: thin;
     scrollbar-color: var(--color-line-2) transparent;
+  }
+
+  button:not(:disabled), summary, select {
+    cursor: pointer;
+  }
+
+  input[type="checkbox"], input[type="radio"] {
+    accent-color: var(--color-pine);
+  }
+
+  summary {
+    border-radius: var(--radius-sm);
+  }
+
+  :target {
+    scroll-margin-top: calc(var(--spacing-topbar) + 1.25rem);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }
 
@@ -213,8 +234,8 @@ html[lang="en"] .poem-text-sm {
 @utility poem-text {
   font-family: var(--font-serif);
   font-size: 1.0625rem;      /* 17px：中文长文舒适字号 */
-  line-height: 2.05;         /* 松行距，透气 */
-  letter-spacing: 0.045em;   /* 微字距，去拥挤 */
+  line-height: 1.9;
+  letter-spacing: 0.018em;
   color: var(--color-ink);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -226,8 +247,8 @@ html[lang="en"] .poem-text-sm {
 @utility poem-text-sm {
   font-family: var(--font-serif);
   font-size: 0.9375rem;
-  line-height: 1.9;
-  letter-spacing: 0.04em;
+  line-height: 1.8;
+  letter-spacing: 0.015em;
   color: var(--color-ink);
   white-space: pre-wrap;
   hanging-punctuation: first allow-end;
@@ -237,7 +258,7 @@ html[lang="en"] .poem-text-sm {
 @utility overline-label {
   font-size: 0.6875rem;
   font-weight: 500;
-  letter-spacing: 0.22em;
+  letter-spacing: 0.12em;
   color: var(--color-ink-3);
   text-transform: uppercase;
 }
@@ -257,11 +278,11 @@ html[lang="en"] .poem-text-sm {
   width: 1.75rem;
   height: 1.75rem;
   border-radius: var(--radius-xs);
-  background: var(--color-ink);
-  color: var(--color-paper);
+  background: var(--color-pine);
+  color: #ffffff;
   font-family: var(--font-serif);
   font-size: 1rem;
   line-height: 1;
-  box-shadow: inset 0 0 0 1px rgb(247 244 236 / 0.22);
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.22);
   user-select: none;
 }

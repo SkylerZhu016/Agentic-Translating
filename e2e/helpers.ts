@@ -7,7 +7,7 @@
 //   - DB reset helper (POST /api/test-only/reset-db)
 //   - evidence screenshot helper (saves to .omo/evidence/e2e/)
 //   - SSE event collector (for direct API SSE consumption tests)
-//   - C2 schema-compliant mock JSON payloads for stage outputs
+//   - Semantic JSON payloads for successful stage outputs
 // ---------------------------------------------------------------------------
 
 import { expect, type Page, type APIRequestContext, type Locator } from '@playwright/test'
@@ -31,6 +31,7 @@ export interface ControlOptions {
   errorType?: string
   errorCode?: string
   stream?: boolean
+  toolCallOnlyWhenToolsPresent?: boolean
   echoChars?: number
 }
 
@@ -224,27 +225,31 @@ export function sseData<T = unknown>(events: SSEEvent[], name: string): T | null
   }
 }
 
-// ---- FSBP free-text stage payloads ----------------------------------------
-// The mock fixture calls the response field `jsonContent`, but that field is
-// simply message.content. Product stage output remains free text.
+// ---- Semantic JSON stage payloads ----------------------------------------
+// jsonContent is the provider's message.content. Explicit malformed fixtures
+// bypass these helpers so the mock never repairs a protocol failure.
+
+function semanticStageOutput(body: string, annotation: string | null = null): string {
+  return JSON.stringify({ body, annotation })
+}
 
 export function buildReviewOutput(agentNames: string[]): string {
-  return [
+  return semanticStageOutput([
     '审查意见',
     ...agentNames.map(
       (name, index) =>
         `${index + 1}. ${name}：用词准确、节奏得当；部分衔接可进一步打磨。`,
     ),
-  ].join('\n')
+  ].join('\n'))
 }
 
 export function buildFilterOutput(
   selected: string[],
   rejected: string[],
 ): string {
-  return `保留：${selected.join('、')}。这些候选风格互补。\n淘汰：${
+  return semanticStageOutput(`保留：${selected.join('、')}。这些候选风格互补。\n淘汰：${
     rejected.join('、') || '无'
-  }。`
+  }。`)
 }
 
 export function buildOrchestrateOutput(
@@ -256,7 +261,7 @@ export function buildOrchestrateOutput(
   }>,
   notes = '按意群编排',
 ): string {
-  return [
+  return semanticStageOutput([
     `总体方案：${notes}`,
     ...assignments.map(
       (item) =>
@@ -264,11 +269,11 @@ export function buildOrchestrateOutput(
           item.source_segment
         }”：${item.rationale}`,
     ),
-  ].join('\n')
+  ].join('\n'))
 }
 
 export function buildAssembleOutput(finalText: string, notes = ''): string {
-  return notes ? `${finalText}\n---\n${notes}` : finalText
+  return semanticStageOutput(finalText, notes || null)
 }
 
 // Backwards-compatible defaults using agent names "Agent 1" / "Agent 2" /

@@ -7,9 +7,10 @@
 // 输入框 Enter 发送 / Shift+Enter 换行。
 // ---------------------------------------------------------------------------
 
-import { useEffect, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useRef, useState } from 'react'
 import { TID } from '@/src/lib/testids'
 import { Button, Spinner, Textarea } from '@/src/components/ui'
+import { BoundedText, CollapsibleText } from '@/src/components/ui/BoundedText'
 import { truncate, type ChatMessageView, type ToolCallView } from './types'
 import { useI18n } from '@/src/i18n/LocaleProvider'
 
@@ -24,6 +25,7 @@ export interface ChatPanelProps {
   activityPhase?: 'waiting_for_model' | 'thinking' | 'generating' | 'applying_edits'
   /** 会话处于可聊天状态（assembled/refining） */
   canChat: boolean
+  disabled?: boolean
   /** 不可聊天时的占位提示 */
   disabledHint: string
   onSend: (message: string) => void
@@ -33,7 +35,7 @@ export interface ChatPanelProps {
 
 // ── 工具调用徽章 ──────────────────────────────────────────────
 
-function ToolCallBadge({ call }: { call: ToolCallView }) {
+const ToolCallBadge = memo(function ToolCallBadge({ call }: { call: ToolCallView }) {
   const { t } = useI18n()
   const isReplace = !call.toolName || call.toolName === 'replace_text'
   const label = isReplace
@@ -85,20 +87,29 @@ function ToolCallBadge({ call }: { call: ToolCallView }) {
       )}
     </div>
   )
-}
+})
 
 // ── 单条消息 ─────────────────────────────────────────────────
 
-function MessageItem({ message }: { message: ChatMessageView }) {
+const MessageItem = memo(function MessageItem({
+  message,
+  followRequest,
+  onFollowChange,
+}: {
+  message: ChatMessageView
+  followRequest: number
+  onFollowChange: (following: boolean) => void
+}) {
+  const { t } = useI18n()
   if (message.role === 'tool') {
     // 系统条（如"已恢复到版本 N"）
     return (
       <li data-testid={TID.edit.chatMessage} data-role="tool" className="flex justify-center">
-        <span className="inline-flex items-center gap-2 text-[0.6875rem] tracking-wide text-ink-4">
+        <div className="inline-flex min-w-0 max-w-full items-center gap-2 text-[0.6875rem] tracking-wide text-ink-4">
           <span className="h-px w-6 bg-line" aria-hidden />
-          {message.content}
+          <BoundedText text={message.content} viewportClassName="max-h-40" textClassName="text-[0.6875rem] leading-5 text-ink-4" />
           <span className="h-px w-6 bg-line" aria-hidden />
-        </span>
+        </div>
       </li>
     )
   }
@@ -106,8 +117,15 @@ function MessageItem({ message }: { message: ChatMessageView }) {
   if (message.role === 'user') {
     return (
       <li data-testid={TID.edit.chatMessage} data-role="user" className="flex justify-end">
-        <div className="max-w-[85%] whitespace-pre-wrap break-words rounded-md rounded-br-xs bg-ink px-3 py-2 text-sm leading-6 text-paper">
-          {message.content}
+        <div className="min-w-0 max-w-[92%] rounded-lg rounded-br-sm bg-pine px-3 py-2">
+          <BoundedText
+            text={message.content}
+            downloadFileName="message.txt"
+            viewportClassName="max-h-64"
+            textClassName="text-sm leading-6 text-paper"
+            className="[&_button]:text-paper [&_[data-text-controls]]:border-paper/20 [&_[data-text-controls]]:text-paper/80"
+            onFollowChange={onFollowChange}
+          />
         </div>
       </li>
     )
@@ -116,21 +134,50 @@ function MessageItem({ message }: { message: ChatMessageView }) {
   // assistant
   return (
     <li data-testid={TID.edit.chatMessage} data-role="assistant" className="flex justify-start">
-      <div className="max-w-[92%] rounded-md rounded-bl-xs border border-line bg-paper px-3 py-2">
-        <div className="whitespace-pre-wrap break-words text-sm leading-6 text-ink-2">
-          {message.content}
-          {message.streaming && (
-            <span className="ml-0.5 inline-block h-4 w-[2px] translate-y-[3px] animate-pulse bg-ink" aria-hidden />
-          )}
-        </div>
+      <div className="min-w-0 max-w-[92%] rounded-md rounded-bl-xs border border-line bg-paper px-3 py-2">
+        {message.reasoningPreview ? (
+          <CollapsibleText
+            className={message.content ? 'mb-2 border-b border-line pb-2' : ''}
+            title={t('reasoning.preview')}
+            meta={t('reasoning.received', { count: message.reasoningCharacters ?? message.reasoningPreview?.length ?? 0 })}
+            description={t('reasoning.limited')}
+            text={message.reasoningPreview ?? ''}
+            tailPreview
+            streaming={message.streaming}
+            viewportClassName="max-h-44"
+            textClassName="font-mono text-xs leading-5 text-ink-3"
+            followRequest={followRequest}
+            onFollowChange={onFollowChange}
+          />
+        ) : (message.reasoningCharacters ?? 0) > 0 ? (
+          <p className="mb-2 text-[0.6875rem] leading-5 text-ink-4">
+            {t('reasoning.stats', { count: message.reasoningCharacters ?? 0 })}
+          </p>
+        ) : null}
+        {(message.content || !(message.reasoningCharacters ?? 0)) && (
+          <BoundedText
+            text={message.content}
+            streaming={message.streaming}
+            downloadFileName="assistant-message.txt"
+            viewportClassName="max-h-72"
+            followRequest={followRequest}
+            onFollowChange={onFollowChange}
+          />
+        )}
         {message.toolCalls?.map((call) => <ToolCallBadge key={call.id} call={call} />)}
         {message.error && (
-          <p role="alert" className="mt-1.5 text-[0.75rem] leading-4 text-cinnabar">{message.error}</p>
+          <div role="alert" className="mt-1.5">
+            <BoundedText
+              text={message.error}
+              viewportClassName="max-h-40"
+              textClassName="text-[0.75rem] leading-5 text-cinnabar"
+            />
+          </div>
         )}
       </div>
     </li>
   )
-}
+})
 
 // ── 面板 ─────────────────────────────────────────────────────
 
@@ -141,6 +188,7 @@ export function ChatPanel({
   activityStartedAt = null,
   activityPhase = 'waiting_for_model',
   canChat,
+  disabled = false,
   disabledHint,
   onSend,
   onSuggest,
@@ -151,15 +199,48 @@ export function ChatPanel({
   const [suggestionStartedAt, setSuggestionStartedAt] = useState<number | null>(null)
   const [suggestionError, setSuggestionError] = useState<string | null>(null)
   const [clock, setClock] = useState(() => Date.now())
+  const [visibleCount, setVisibleCount] = useState(40)
+  const [followingLatest, setFollowingLatest] = useState(true)
+  const [followRequest, setFollowRequest] = useState(0)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const messageListRef = useRef<HTMLOListElement>(null)
+  const followingLatestRef = useRef(true)
+  const draftRef = useRef('')
+  const suggestingRef = useRef(false)
+  const suggestionSequence = useRef(0)
+  const previousMessageCount = useRef(messages.length)
+  followingLatestRef.current = followingLatest
 
-  // 新内容出现（含流式 delta）时吸附到底部
+  const handleTextFollowChange = useCallback((following: boolean) => {
+    // Reading inside an individual message must also stop the outer list moving.
+    if (!following) setFollowingLatest(false)
+  }, [])
+
+  // Follow new output only while the reader is already at the bottom.
   const lastMessage = messages[messages.length - 1]
   const scrollSignal = `${messages.length}:${lastMessage?.content.length ?? 0}:${lastMessage?.toolCalls?.length ?? 0}`
   useEffect(() => {
     const el = scrollRef.current
-    if (el) el.scrollTop = el.scrollHeight
-  }, [scrollSignal])
+    if (el && followingLatest) el.scrollTop = el.scrollHeight
+    const newMessages = Math.max(0, messages.length - previousMessageCount.current)
+    if (newMessages > 0 && !followingLatest) setVisibleCount((count) => count + newMessages)
+    previousMessageCount.current = messages.length
+  }, [scrollSignal, followingLatest, messages.length])
+
+  useEffect(() => {
+    const list = messageListRef.current
+    if (!list || typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(() => {
+      const element = scrollRef.current
+      if (element && followingLatestRef.current) element.scrollTop = element.scrollHeight
+    })
+    observer.observe(list)
+    return () => observer.disconnect()
+  }, [messages.length > 0])
+
+  useEffect(() => () => {
+    suggestionSequence.current += 1
+  }, [])
 
   useEffect(() => {
     if (!streaming && !suggesting) return
@@ -173,33 +254,44 @@ export function ChatPanel({
     : formatDuration(clock - activityStartedAt, { maxParts: 2 })
 
   const send = () => {
-    const value = draft.trim()
-    if (!value || streaming || !canChat) return
+    const value = draftRef.current.trim()
+    if (!value || streaming || disabled || suggestingRef.current || !canChat) return
+    draftRef.current = ''
     setDraft('')
+    setSuggestionError(null)
+    setFollowingLatest(true)
     onSend(value)
   }
 
   const suggest = async () => {
-    const value = draft.trim()
-    if (!value || streaming || suggesting || !canChat || !onSuggest) return
+    const value = draftRef.current.trim()
+    if (!value || streaming || disabled || suggestingRef.current || !canChat || !onSuggest) return
+    suggestingRef.current = true
+    const sequence = ++suggestionSequence.current
     setSuggesting(true)
     setSuggestionStartedAt(Date.now())
     setSuggestionError(null)
     try {
       const feedback = (await onSuggest(value)).trim()
+      if (suggestionSequence.current !== sequence) return
       if (!feedback) throw new Error(t('chat.suggestion.empty'))
+      draftRef.current = feedback
       setDraft(feedback)
     } catch (error) {
+      if (suggestionSequence.current !== sequence) return
       setSuggestionError(
         error instanceof Error ? error.message : t('chat.suggestion.failed'),
       )
     } finally {
-      setSuggesting(false)
-      setSuggestionStartedAt(null)
+      if (suggestionSequence.current === sequence) {
+        suggestingRef.current = false
+        setSuggesting(false)
+        setSuggestionStartedAt(null)
+      }
     }
   }
 
-  const inputDisabled = !canChat || streaming || suggesting
+  const inputDisabled = !canChat || streaming || suggesting || disabled
   const activityLabel = activityPhase === 'waiting_for_model'
     ? t('chat.activity.waiting')
     : activityPhase === 'thinking'
@@ -214,7 +306,14 @@ export function ChatPanel({
   return (
     <div data-testid={TID.edit.chatPanel} className="flex h-full flex-col">
       {/* 消息流 */}
-      <div ref={scrollRef} className="max-h-96 min-h-56 flex-1 overflow-y-auto px-5 py-4">
+      <div
+        ref={scrollRef}
+        onScroll={(event) => {
+          const element = event.currentTarget
+          setFollowingLatest(element.scrollHeight - element.scrollTop - element.clientHeight < 48)
+        }}
+        className={`max-h-[28rem] flex-1 overflow-y-auto overscroll-contain px-4 py-3 ${messages.length > 0 ? 'min-h-28' : ''}`}
+      >
         {streaming && (
           <div
             role="status"
@@ -232,25 +331,56 @@ export function ChatPanel({
           </div>
         )}
         {messages.length === 0 ? (
-          <div className="flex h-full min-h-44 items-center justify-center">
-            <p className="max-w-60 text-center text-sm leading-6 text-ink-4">
-              {t('chat.empty')}
+          <div className="rounded-md bg-paper-sink/60 px-3 py-3">
+            <p className="text-sm leading-6 text-ink-3">
+              {canChat ? t('chat.empty') : disabledHint}
             </p>
           </div>
         ) : (
-          <ol className="space-y-3">
-            {messages.map((m) => (
-              <MessageItem key={m.id} message={m} />
-            ))}
-          </ol>
+          <>
+            {messages.length > visibleCount && (
+              <Button
+                size="sm"
+                variant="ghost"
+                className="mb-3 w-full"
+                onClick={() => {
+                  setFollowingLatest(false)
+                  setVisibleCount((count) => count + 40)
+                }}
+              >
+                {t('chat.showEarlier', { count: Math.min(40, messages.length - visibleCount) })}
+              </Button>
+            )}
+            <ol ref={messageListRef} className="space-y-3">
+              {messages.slice(-visibleCount).map((m) => (
+                <MessageItem
+                  key={m.id}
+                  message={m}
+                  followRequest={m.id === lastMessage?.id ? followRequest : 0}
+                  onFollowChange={handleTextFollowChange}
+                />
+              ))}
+            </ol>
+          </>
         )}
       </div>
+      {!followingLatest && messages.length > 0 && (
+        <Button size="sm" variant="ghost" className="mx-4 mb-2" onClick={() => {
+          setFollowingLatest(true)
+          setFollowRequest((value) => value + 1)
+        }}>
+          {t('chat.jumpLatest')}
+        </Button>
+      )}
 
       {/* 输入区 */}
-      <div className="border-t border-line px-5 py-3">
+      <div className="border-t border-line px-4 py-3">
         <Textarea
           value={draft}
-          onChange={(e) => setDraft(e.target.value)}
+          onChange={(e) => {
+            draftRef.current = e.target.value
+            setDraft(e.target.value)
+          }}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
               e.preventDefault()
@@ -263,7 +393,7 @@ export function ChatPanel({
           aria-label={t('chat.input.aria')}
           className="resize-none"
         />
-        <div className="mt-2 flex items-center justify-between">
+        <div className="mt-2 flex flex-wrap items-center justify-between gap-y-2">
           <span className={`min-w-0 pr-2 text-[0.6875rem] ${suggestionError ? 'text-cinnabar' : 'text-ink-4'}`}>
             {suggestionError
               ? suggestionError
@@ -290,7 +420,7 @@ export function ChatPanel({
                 variant="ghost"
                 onClick={() => void suggest()}
                 disabled={inputDisabled || draft.trim().length === 0}
-                title={t('chat.suggestion.title')}
+                title={t('chat.suggestion.costHint')}
               >
                 {suggesting ? <Spinner size="sm" /> : t('chat.suggestion.action')}
               </Button>

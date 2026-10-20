@@ -60,7 +60,7 @@ async function seedZhToEnPreset(
         agentBindingOverrides: {},
         mainAgentBinding: binding,
         editingAgentBinding: binding,
-        promptBundleVersion: 1,
+        promptBundleVersion: (await (await request.get('/api/direction-prompt-bundles?direction=' + 'zh_to_en')).json()).version,
         maxAgentCalls: 5,
         batchConcurrency: 2,
         constraints: {},
@@ -328,15 +328,9 @@ test.describe('bidirectional workspace switching', () => {
     page,
     request,
   }) => {
-    const initialAutosave = page.waitForResponse((response) =>
-      response.url().includes('/api/workspace-drafts/en_to_zh') &&
-      response.request().method() === 'PUT' &&
-      response.ok(),
-    )
     await page.goto('/?direction=en_to_zh')
     const source = byTid(page, TID.translate.sourceInput)
-    await source.waitFor()
-    await initialAutosave
+    await expect(source).toBeEditable()
 
     let releaseFirst!: () => void
     const firstGate = new Promise<void>((resolve) => {

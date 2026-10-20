@@ -65,9 +65,13 @@ describe('independent Agent text testing', () => {
     expect(chatCompletion).not.toHaveBeenCalled()
   })
 
-  it('tests a built-in Agent and preserves the FSBP body boundary', async () => {
+  it('tests a built-in Agent and decodes its structured body and annotation', async () => {
+    const raw = JSON.stringify({
+      body: '独立测试译文',
+      annotation: '只供用户查看的说明',
+    })
     vi.mocked(chatCompletion).mockResolvedValue({
-      content: '独立测试译文\n---\n只供用户查看的说明',
+      content: raw,
     })
 
     const response = await testSavedAgent(request({
@@ -82,14 +86,33 @@ describe('independent Agent text testing', () => {
 
     expect(response.status).toBe(200)
     await expect(response.json()).resolves.toEqual({
-      raw: '独立测试译文\n---\n只供用户查看的说明',
+      raw,
       body: '独立测试译文',
       annotation: '只供用户查看的说明',
     })
     const [, llmRequest] = vi.mocked(chatCompletion).mock.calls[0]
     expect(llmRequest.messages[0].content).toContain('# 工作重点')
+    expect(llmRequest.messages[0].content).toContain('[protocol:json-v1]')
     expect(llmRequest.messages[1].content).toContain('A source passage.')
     expect(llmRequest.messages[1].content).toContain('重点检查动作施受。')
+  })
+
+  it('rejects malformed built-in output without a hidden repair request', async () => {
+    vi.mocked(chatCompletion).mockResolvedValue({
+      content: '{"body":"partial translation"',
+    })
+
+    const response = await testSavedAgent(request({
+      sourceText: 'A source passage.',
+      endpointId,
+      model: 'test-model',
+    }), {
+      params: Promise.resolve({ id: 'semantic-fidelity.en-to-zh' }),
+    })
+
+    expect(response.status).toBe(502)
+    expect(await response.json()).toMatchObject({ error: 'agent_test_failed' })
+    expect(chatCompletion).toHaveBeenCalledTimes(1)
   })
 
   it('uses the same saved-Agent route for a custom Agent', async () => {

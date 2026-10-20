@@ -23,6 +23,17 @@ const repoRoot = path.resolve(
 const prepareScript = path.join(repoRoot, 'scripts', 'prepare-standalone.mjs')
 const verifyScript = path.join(repoRoot, 'scripts', 'verify-release-tree.mjs')
 const temporaryRoots: string[] = []
+const localReleaseFixtures = [
+  '.tmp/draft.txt',
+  '.acceptance/private.txt',
+  '.acceptance-data/runs/stage.txt',
+  '.acceptance-next-round/result.txt',
+  'codex-thread-backups/thread.md',
+  '论文/thesis.docx',
+  '.env',
+  '.env.local',
+  '更换key.txt',
+]
 const require = createRequire(import.meta.url)
 const picomatch = require('picomatch') as (
   pattern: string,
@@ -76,7 +87,15 @@ describe('standalone release-tree boundary', () => {
     write(root, '.next/standalone/.omo/cache/private.txt')
     write(root, '.next/standalone/data/app.db')
     write(root, '.next/standalone/FSBP_Test/private/round/private.txt')
+    for (const fixture of localReleaseFixtures) {
+      write(root, fixture, 'source fixture must remain')
+      write(root, `.next/standalone/${fixture}`, 'traced local fixture')
+    }
+    write(root, '.next/standalone/runtime-assets/dictionary.bin')
+    write(root, '.next/standalone/node_modules/example-package/test/runtime-fixture.json', '{}')
     write(root, '.next/static/chunks/app.js')
+    write(root, 'public/icon.svg', '<svg/>')
+    write(root, '.next/standalone/public/stale.txt')
     write(root, 'src/lib/db/migrations/0001_fixture.sql', 'SELECT 1;')
 
     const result = spawnSync(process.execPath, [prepareScript], {
@@ -91,6 +110,16 @@ describe('standalone release-tree boundary', () => {
     expect(existsSync(
       path.join(root, '.next', 'standalone', 'FSBP_Test'),
     )).toBe(false)
+    for (const fixture of localReleaseFixtures) {
+      expect(existsSync(path.join(root, '.next', 'standalone', fixture))).toBe(false)
+      expect(readFileSync(path.join(root, fixture), 'utf8')).toBe('source fixture must remain')
+    }
+    expect(existsSync(path.join(root, '.next/standalone/runtime-assets/dictionary.bin'))).toBe(true)
+    expect(readFileSync(path.join(root, '.next/standalone/public/icon.svg'), 'utf8')).toBe('<svg/>')
+    expect(existsSync(path.join(root, '.next/standalone/public/stale.txt'))).toBe(false)
+    expect(existsSync(path.join(
+      root, '.next/standalone/node_modules/example-package/test/runtime-fixture.json',
+    ))).toBe(true)
     expect(existsSync(path.join(
       root,
       '.next',
@@ -107,14 +136,36 @@ describe('standalone release-tree boundary', () => {
       'migrations',
       '0001_fixture.sql',
     ))).toBe(true)
+    const verification = spawnSync(process.execPath, [verifyScript], {
+      cwd: root,
+      encoding: 'utf8',
+      windowsHide: true,
+    })
+    expect(verification.status, verification.stderr).toBe(0)
   })
 
-  it.each(['.omo', 'data'])(
+  it.each([
+    '.omo',
+    'data',
+    '.tmp',
+    '.acceptance',
+    '.acceptance-data',
+    '.acceptance-next-round',
+    'codex-thread-backups',
+    '论文',
+    '.env',
+    '.env.local',
+    '更换key.txt',
+    'FSBP_Test',
+  ])(
     'rejects a release tree containing %s',
     (entry) => {
       const root = temporaryRoot()
       const releaseRoot = path.join(root, 'release')
-      write(releaseRoot, `${entry}/private.txt`)
+      const relative = entry.startsWith('.env') || entry === '更换key.txt'
+        ? entry
+        : `${entry}/private.txt`
+      write(releaseRoot, relative, 'synthetic local fixture')
 
       const result = spawnSync(process.execPath, [verifyScript, releaseRoot], {
         cwd: root,
@@ -126,6 +177,40 @@ describe('standalone release-tree boundary', () => {
       expect(`${result.stdout}\n${result.stderr}`).toContain('forbidden path:')
     },
   )
+
+  for (const kind of ['build-root', 'cleanup-target', 'public-target'] as const) {
+    it(`refuses a linked ${kind} without deleting the source directory`, (context) => {
+      const root = temporaryRoot()
+      const source = path.join(root, '.tmp')
+      write(source, 'keep.txt', 'source fixture must remain')
+      write(root, '.next/static/chunks/app.js')
+      write(root, 'public/keep.txt', 'public runtime asset')
+      mkdirSync(path.join(root, '.next'), { recursive: true })
+      const standalone = path.join(root, '.next', 'standalone')
+      if (kind !== 'build-root') mkdirSync(standalone, { recursive: true })
+      const link = kind === 'build-root'
+        ? standalone
+        : path.join(standalone, kind === 'cleanup-target' ? '.tmp' : 'public')
+      try {
+        symlinkSync(source, link, process.platform === 'win32' ? 'junction' : 'dir')
+      } catch (error) {
+        if (isUnavailableLinkError(error)) {
+          context.skip()
+          return
+        }
+        throw error
+      }
+
+      const result = spawnSync(process.execPath, [prepareScript], {
+        cwd: root,
+        encoding: 'utf8',
+        windowsHide: true,
+      })
+      expect(result.status).not.toBe(0)
+      expect(`${result.stdout}\n${result.stderr}`).toContain('Refusing to')
+      expect(readFileSync(path.join(source, 'keep.txt'), 'utf8')).toBe('source fixture must remain')
+    })
+  }
 
   it('rejects a file symbolic link without reading its target', (context) => {
     const root = temporaryRoot()

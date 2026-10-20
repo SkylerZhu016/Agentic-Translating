@@ -21,6 +21,9 @@ import type {
   ChatCompletionResponse,
   LLMStreamEvent,
 } from '../llm/client';
+import { createReasoningPreview, type ReasoningPreview } from '../llm/reasoning-preview';
+import { parseSemanticAgentOutput } from '../protocol/semantic-output';
+import { createSemanticOutputStreamDecoder } from '../protocol/semantic-output-stream';
 import {
   isAsyncIterable,
   LLMError,
@@ -42,6 +45,8 @@ export interface AgentRuntime {
   timeoutMs?: number;
   /** Frozen per-call output ceiling established by session preflight. */
   maxTokens?: number;
+  /** New marked prompts use strict JSON; frozen older prompts keep legacy. */
+  outputFormat?: 'json' | 'auto' | 'legacy';
 }
 
 /** Result for a single agent after fan-out execution */
@@ -50,6 +55,7 @@ export interface AgentResult {
   status: 'complete' | 'error' | 'aborted';
   content?: string;
   error?: string;
+  reasoningCharacters?: number;
 }
 
 /** Summary of the entire fan-out run */
@@ -65,7 +71,11 @@ export interface FanOutCallbacks {
   onAgentStart?(agentKey: string): void;
   /** Network activity heartbeat; reasoning text is intentionally not exposed. */
   onAgentActivity?(agentKey: string): void;
+  onAgentReasoning?(agentKey: string, preview: ReasoningPreview): void;
+  onAgentAttemptStart?(agentKey: string, attempt: number): void;
+  onAgentOutputInvalid?(agentKey: string): void;
   onToken?(agentKey: string, content: string): void;
+  onAnnotation?(agentKey: string, content: string): void;
   onAgentComplete?(agentKey: string, result: AgentResult): void;
   onAgentError?(agentKey: string, error: Error): void;
 }
@@ -196,6 +206,41 @@ async function runOneAgent(
     }
 
     let accumulatedContent = '';
+    callbacks.onAgentAttemptStart?.(agent.agentKey, attempt);
+    const decoder = agent.outputFormat === 'json'
+      ? createSemanticOutputStreamDecoder()
+      : null;
+    const reasoning = createReasoningPreview((preview) =>
+      callbacks.onAgentReasoning?.(agent.agentKey, preview));
+    let invalidPreview = false;
+    const emitToken = (content: string) => {
+      if (!decoder) {
+        callbacks.onToken?.(agent.agentKey, content);
+        return;
+      }
+      const decoded = decoder.push(content);
+      if (decoded.invalid) {
+        if (!invalidPreview) callbacks.onAgentOutputInvalid?.(agent.agentKey);
+        invalidPreview = true;
+        return;
+      }
+      if (decoded.bodyDelta) callbacks.onToken?.(agent.agentKey, decoded.bodyDelta);
+      if (decoded.annotationDelta) callbacks.onAnnotation?.(agent.agentKey, decoded.annotationDelta);
+    };
+    const assertFormat = (content: string) => {
+      if (agent.outputFormat !== 'json') return;
+      try {
+        parseSemanticAgentOutput(content, { format: 'json' });
+      } catch (error) {
+        if (!invalidPreview) callbacks.onAgentOutputInvalid?.(agent.agentKey);
+        invalidPreview = true;
+        throw new LLMError(
+          'semantic_output_invalid',
+          error instanceof Error ? error.message : 'Invalid structured model output',
+          { retryable: true },
+        );
+      }
+    };
     try {
       // Track concurrency
       if (counter) {
@@ -225,6 +270,7 @@ async function runOneAgent(
         maxDurationMs: remainingMs,
         ...(agent.maxTokens ? { maxTokens: agent.maxTokens } : {}),
         onActivity: () => callbacks.onAgentActivity?.(agent.agentKey),
+        onReasoning: (update) => reasoning.push(update),
         signal,
       };
 
@@ -234,10 +280,17 @@ async function runOneAgent(
       // If non-streaming (shouldn't happen with stream:true, but handle gracefully)
       if (!isAsyncIterable(response)) {
         const content = (response as { content: string }).content ?? '';
+        accumulatedContent = content;
+        assertFormat(content);
+        if (!content.trim()) {
+          throw new LLMError('empty_response', 'Agent returned an empty body', { retryable: true });
+        }
+        emitToken(content);
         const result: AgentResult = {
           agentKey: agent.agentKey,
           status: 'complete',
           content,
+          reasoningCharacters: reasoning.getSnapshot().reasoningCharacters,
         };
         callbacks.onAgentComplete?.(agent.agentKey, result);
         return result;
@@ -247,13 +300,14 @@ async function runOneAgent(
       for await (const event of response) {
         if (event.type === 'text') {
           accumulatedContent += event.content;
-          callbacks.onToken?.(agent.agentKey, event.content);
+          emitToken(event.content);
         } else if (event.type === 'done') {
           if (event.content && event.content.length > 0) {
             accumulatedContent = event.content;
           }
         }
       }
+      assertFormat(accumulatedContent);
 
       // Write draft txt artifact (best-effort)
       if (sessionId) {
@@ -274,6 +328,7 @@ async function runOneAgent(
         agentKey: agent.agentKey,
         status: accumulatedContent.trim() ? 'complete' : 'error',
         content: accumulatedContent,
+        reasoningCharacters: reasoning.getSnapshot().reasoningCharacters,
         ...(accumulatedContent.trim()
           ? {}
           : { error: 'Agent returned an empty body before the FSBP boundary' }),
@@ -327,10 +382,12 @@ async function runOneAgent(
         agentKey: agent.agentKey,
         status: 'error',
         ...(accumulatedContent ? { content: accumulatedContent } : {}),
+        reasoningCharacters: reasoning.getSnapshot().reasoningCharacters,
         error: errorMessage,
       };
       return result;
     } finally {
+      reasoning.dispose();
       // Track concurrency
       if (counter) {
         counter.current = Math.max(0, counter.current - 1);

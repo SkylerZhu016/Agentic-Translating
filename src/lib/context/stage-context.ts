@@ -1,5 +1,5 @@
 import type { Stage, TranslationResult, StageOutput, ChatMessage } from '../contracts/types'
-import { semanticBody } from '../protocol/semantic-output'
+import { parseSemanticAgentOutput, semanticOutputFormatForPrompt } from '../protocol/semantic-output'
 
 export interface StageContextTranslationEntry {
   agent_id: string
@@ -51,12 +51,19 @@ function stageOutputToIndexed(
 ): StageContextJson['prior_stages'] {
   const result: StageContextJson['prior_stages'] = {}
   for (const stage of stages) {
+    if (stage.status !== 'complete') continue
     if (
       stage.stage === 'review' ||
       stage.stage === 'filter' ||
       stage.stage === 'orchestrate'
     ) {
-      result[stage.stage] = { body: semanticBody(stage.raw_output) }
+      result[stage.stage] = {
+        body: parseSemanticAgentOutput(stage.raw_output ?? '', {
+          format: semanticOutputFormatForPrompt(stage.prompt_used ?? '') === 'json'
+            ? 'json'
+            : 'legacy',
+        }).body,
+      }
     }
   }
   return result
@@ -91,7 +98,7 @@ export function buildStageContext(
         agent_id: translation.agent_key,
         name: agent.name,
         model: agent.model,
-        text: semanticBody(translation.output_text),
+        text: parseSemanticAgentOutput(translation.output_text ?? '', { format: 'legacy' }).body,
       }
     }),
     prior_stages: stageOutputToIndexed(params.priorStages),

@@ -138,6 +138,29 @@ describe('MockLLM', () => {
       expect(body.choices[0].message.content).toBeTruthy();
       expect(body.choices[0].finish_reason).toBe('stop');
     });
+
+    it('wraps ordinary output only when the system prompt requests semantic JSON', async () => {
+      llm = await startMockLLM();
+      const structured = await postChatCompletion(llm.url, {
+        model: 'test-model',
+        messages: [
+          { role: 'system', content: '[protocol:json-v1]' },
+          { role: 'user', content: 'Translate the text.' },
+        ],
+      });
+      const structuredResponse = await structured.json();
+      expect(JSON.parse(structuredResponse.choices[0].message.content)).toEqual({
+        body: 'This is a mock non-streaming response.',
+        annotation: null,
+      });
+
+      const legacy = await postChatCompletion(llm.url, {
+        model: 'test-model',
+        messages: [{ role: 'user', content: 'A source quotes [protocol:json-v1].' }],
+      });
+      expect((await legacy.json()).choices[0].message.content)
+        .toBe('This is a mock non-streaming response.');
+    });
   });
 
   // =========================================================================
@@ -162,6 +185,21 @@ describe('MockLLM', () => {
       // Should contain our mock streaming text
       const joined = contents.join('');
       expect(joined).toContain('mock streaming response');
+    });
+
+    it('streams one decodable semantic JSON envelope for a marked system prompt', async () => {
+      llm = await startMockLLM();
+      llm.setBehavior('stream-model', { behavior: 'stream', chunkDelayMs: 0 });
+      const response = await postChatCompletion(llm.url, {
+        model: 'stream-model',
+        messages: [{ role: 'system', content: '[protocol:json-v1]' }],
+      });
+      const chunks = await collectSSEContent(response);
+      expect(chunks.length).toBeGreaterThan(1);
+      expect(JSON.parse(chunks.join(''))).toEqual({
+        body: 'This is a mock streaming response from the LLM fixture.',
+        annotation: null,
+      });
     });
   });
 
@@ -248,6 +286,19 @@ describe('MockLLM', () => {
   // =========================================================================
 
   describe('json_content behavior', () => {
+    it('keeps explicit malformed content intact even when the request requires JSON', async () => {
+      llm = await startMockLLM();
+      const malformed = '{"body":"incomplete"';
+      llm.setBehavior('json-model', {
+        behavior: 'json_content',
+        jsonContent: malformed,
+      });
+      const response = await postChatCompletion(llm.url, {
+        model: 'json-model',
+        messages: [{ role: 'system', content: '[protocol:json-v1]' }],
+      });
+      expect((await response.json()).choices[0].message.content).toBe(malformed);
+    });
     it('returns configurable JSON string as content via setBehavior', async () => {
       llm = await startMockLLM();
       const customJson = JSON.stringify({
@@ -352,6 +403,55 @@ describe('MockLLM', () => {
   // =========================================================================
 
   describe('tool_call behavior', () => {
+    it.each([false, true])(
+      'can explicitly separate ordinary analysis from tool requests (stream=%s)',
+      async (stream) => {
+        llm = await startMockLLM();
+        llm.setBehavior('mixed-role-model', {
+          behavior: 'tool_call',
+          stream,
+          toolCallOnlyWhenToolsPresent: true,
+        });
+        const messages = [
+          { role: 'system', content: '[protocol:json-v1]' },
+          { role: 'user', content: 'Analyze this source.' },
+        ];
+        const analysis = await postChatCompletion(llm.url, {
+          model: 'mixed-role-model',
+          messages,
+        });
+        const analysisContent = stream
+          ? (await collectSSEContent(analysis)).join('')
+          : (await analysis.json()).choices[0].message.content;
+        expect(JSON.parse(analysisContent)).toEqual({
+          body: 'Mock auxiliary analysis and planning response.',
+          annotation: null,
+        });
+
+        const toolResponse = await postChatCompletion(llm.url, {
+          model: 'mixed-role-model',
+          messages,
+          tools: [{
+            type: 'function',
+            function: { name: 'replace_text', parameters: { type: 'object' } },
+          }],
+        });
+        if (stream) {
+          const events = (await toolResponse.text()).split('\n')
+            .filter((line) => line.startsWith('data: ') && line !== 'data: [DONE]')
+            .map((line) => JSON.parse(line.slice(6)));
+          expect(events.some((event) =>
+            event.choices?.[0]?.delta?.tool_calls?.[0]?.function?.name === 'replace_text',
+          )).toBe(true);
+        } else {
+          const response = await toolResponse.json();
+          expect(response.choices[0].message.tool_calls[0].function.name)
+            .toBe('replace_text');
+          expect(response.choices[0].finish_reason).toBe('tool_calls');
+        }
+      },
+    );
+
     it('returns non-stream response with tool_calls', async () => {
       llm = await startMockLLM();
       llm.setBehavior('tool-model', {

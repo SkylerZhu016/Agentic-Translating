@@ -175,7 +175,7 @@ describe('session creation idempotency', () => {
           agentBindingOverrides: {},
           mainAgentBinding: binding,
           editingAgentBinding: binding,
-          promptBundleVersion: 1,
+          promptBundleVersion: vnext.directionPrompts.getLatest('en_to_zh')!.version,
           maxAgentCalls: 5,
           batchConcurrency: 2,
           constraints: {},

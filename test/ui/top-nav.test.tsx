@@ -6,6 +6,7 @@ import { TopNav } from '@/src/components/shell/TopNav'
 
 vi.mock('next/navigation', () => ({
   usePathname: () => '/config',
+  useRouter: () => ({ push: vi.fn() }),
 }))
 
 vi.mock('@/src/components/direction/DirectionProvider', () => ({

@@ -9,6 +9,7 @@ import {
   createSessionService,
   InvalidCustomDirectionError,
   NoAgentsConfiguredError,
+  PresetPromptBundleNotFoundError,
   SessionIdempotencyConflictError,
 } from '@/src/lib/services/session-service'
 import {
@@ -136,6 +137,20 @@ export function createHandlers(db: Database.Database) {
             { status: 409 },
           )
         }
+        if (err instanceof PresetPromptBundleNotFoundError) {
+          return NextResponse.json(
+            {
+              error: err.code,
+              message: err.message,
+              params: {
+                direction: err.direction,
+                version: err.version,
+                presetRevisionId: err.presetRevisionId,
+              },
+            },
+            { status: 422 },
+          )
+        }
         if (err instanceof SessionPreflightError) {
           return NextResponse.json(
             {
@@ -184,40 +199,46 @@ export function createHandlers(db: Database.Database) {
     async GET(request: NextRequest) {
       const { searchParams } = new URL(request.url)
       const limit = Math.max(1, Math.min(100, parseInt(searchParams.get('limit') || '20', 10) || 20))
-      const offset = Math.max(0, parseInt(searchParams.get('offset') || '0', 10) || 0)
+      const offset = Math.min(
+        Number.MAX_SAFE_INTEGER,
+        Math.max(0, parseInt(searchParams.get('offset') || '0', 10) || 0),
+      )
 
       const direction = searchParams.get('direction')
-      const all = service.listSessions({ limit: Number.MAX_SAFE_INTEGER, offset: 0 })
-      const filtered =
+      const selectedDirection =
         direction === 'en_to_zh' ||
         direction === 'zh_to_en' ||
         direction === 'custom'
-          ? all.filter((session) => (session.direction ?? 'en_to_zh') === direction)
-          : all
-      const sessions = filtered.slice(offset, offset + limit)
+          ? direction
+          : undefined
+      const order = searchParams.get('order') === 'created' ? 'created' : 'updated'
+      const sessions = service.listSessions({
+        limit, offset, direction: selectedDirection, order,
+      })
+      const total = repos.sessions.count(selectedDirection)
       const hasInvocations = Boolean(
         db.prepare(
           "SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_invocations'",
         ).get(),
       )
+      const invocationSummary = hasInvocations
+        ? db.prepare(`
+            SELECT COUNT(*) AS count, GROUP_CONCAT(DISTINCT model) AS models
+            FROM agent_invocations WHERE session_id=?
+          `)
+        : null
+      const latestVersion = db.prepare(`
+        SELECT id, version_no, text, source, created_at
+        FROM final_versions WHERE session_id=?
+        ORDER BY version_no DESC LIMIT 1
+      `)
       return NextResponse.json(
         {
           sessions: sessions.map((session) => {
-            const actual = hasInvocations
-              ? db.prepare(`
-                  SELECT COUNT(*) AS count,
-                    GROUP_CONCAT(DISTINCT model) AS models
-                  FROM agent_invocations
-                  WHERE session_id=?
-                `).get(session.id) as { count: number; models: string | null }
+            const actual = invocationSummary
+              ? invocationSummary.get(session.id) as { count: number; models: string | null }
               : { count: 0, models: null }
-            const latest = db.prepare(`
-              SELECT id, version_no, text, source, created_at
-              FROM final_versions
-              WHERE session_id=?
-              ORDER BY version_no DESC
-              LIMIT 1
-            `).get(session.id) ?? null
+            const latest = latestVersion.get(session.id) ?? null
             return {
               ...toPublicSessionDto(session),
               agent_invocation_count: actual.count,
@@ -225,7 +246,7 @@ export function createHandlers(db: Database.Database) {
               latest_version: latest,
             }
           }),
-          total: filtered.length,
+          total,
         },
         { status: 200 },
       )

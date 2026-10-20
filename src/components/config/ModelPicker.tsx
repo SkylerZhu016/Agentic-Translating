@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Button, Input, Spinner } from '@/src/components/ui'
 import {
   localizeDiagnosticError,
@@ -80,20 +80,25 @@ export function ModelPicker({
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [manual, setManual] = useState(false)
+  const loadGeneration = useRef(0)
 
   async function load(force = false) {
+    const generation = ++loadGeneration.current
     if (!endpointId) return
     setLoading(true)
     setError('')
     try {
-      setModels(await fetchModels(endpointId, t, force))
+      const nextModels = await fetchModels(endpointId, t, force)
+      if (generation !== loadGeneration.current) return
+      setModels(nextModels)
     } catch (loadError) {
+      if (generation !== loadGeneration.current) return
       setModels([])
       setError(
         loadError instanceof Error ? loadError.message : t('modelPicker.error.load'),
       )
     } finally {
-      setLoading(false)
+      if (generation === loadGeneration.current) setLoading(false)
     }
   }
 
@@ -101,7 +106,9 @@ export function ModelPicker({
     setManual(false)
     setModels(endpointId ? modelCache.get(endpointId) ?? [] : [])
     setError('')
+    setLoading(false)
     if (endpointId) void load()
+    return () => { loadGeneration.current += 1 }
     // endpointId is intentionally the only trigger. Model changes should not
     // refetch the provider catalogue.
     // eslint-disable-next-line react-hooks/exhaustive-deps

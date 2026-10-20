@@ -37,6 +37,7 @@ import {
 import { getChatActivity } from '@/src/lib/chat/activity'
 import { runSessionPreflight } from '@/src/lib/services/session-preflight'
 import { currentRuntimeEndpoint } from '@/src/lib/services/runtime-endpoint-credentials'
+import { SEMANTIC_JSON_PROTOCOL_MARKER } from '@/src/lib/protocol/semantic-output'
 
 // Inline migration SQL
 const MIGRATION_SQL_0001 = fs.readFileSync(
@@ -633,6 +634,359 @@ describe('Chat SSE Route', () => {
   // ===========================================================================
 
   describe('message turn (pure discussion)', () => {
+    it.each(['legacy', 'json'] as const)(
+      'uses the saved %s stage contract for tool evidence and subsequent chat context',
+      async (format) => {
+        // Freeze the legacy session before adding the tool-evidence tables,
+        // matching a historical session opened after an application upgrade.
+        // This focused fixture does not model current workspace creation.
+        const sid = await createAssembledSession()
+        // This case enables the real tool runtime on the otherwise legacy
+        // route fixture. Existing parent placeholders contain no rows.
+        db.exec('DROP TABLE agent_invocations')
+        db.exec('DROP TABLE orchestration_runs')
+        for (const migration of [
+          '0003_vnext_bidirectional_agents.sql',
+          '0015_translation_tool_traces.sql',
+        ]) {
+          db.exec(fs.readFileSync(
+            path.join(process.cwd(), 'src/lib/db/migrations', migration),
+            'utf8',
+          ))
+        }
+        db.exec('ALTER TABLE agent_tool_calls ADD COLUMN provider_tool_call_id TEXT')
+        db.exec('ALTER TABLE agent_tool_calls ADD COLUMN logical_call_key TEXT')
+
+        enableZhEditingBundle(db, sid)
+        const raw = JSON.stringify({
+          body: 'Review body.\n---\nThe divider belongs to this body.',
+          annotation: 'ANNOTATION_FIELD_IS_LITERAL_IN_LEGACY',
+        })
+        const expectedBody = format === 'json'
+          ? 'Review body.\n---\nThe divider belongs to this body.'
+          : raw
+        const stage = repos.stageOutputs.insert({
+          session_id: sid,
+          stage: 'review',
+          status: 'complete',
+          prompt_used: format === 'json'
+            ? `${SEMANTIC_JSON_PROTOCOL_MARKER}\nReturn body and annotation.`
+            : 'Historical plain-text review prompt.',
+          raw_output: raw,
+          error: null,
+        })
+        const validEvidenceId = `stage:review:${stage.lastInsertRowid}`
+        const corrupt = repos.stageOutputs.insert({
+          session_id: sid,
+          stage: 'filter',
+          status: 'complete',
+          prompt_used: `${SEMANTIC_JSON_PROTOCOL_MARKER}\nReturn body and annotation.`,
+          raw_output: '{"body":"CORRUPT_MARKED_OUTPUT_MUST_BE_SKIPPED"',
+          error: null,
+        })
+        const failed = repos.stageOutputs.insert({
+          session_id: sid,
+          stage: 'orchestrate',
+          status: 'failed',
+          prompt_used: `${SEMANTIC_JSON_PROTOCOL_MARKER}\nReturn body and annotation.`,
+          raw_output: JSON.stringify({ body: 'FAILED_STAGE_MUST_BE_SKIPPED', annotation: null }),
+          error: 'semantic_output_invalid_json',
+        })
+
+        const http = await import('http')
+        const providerRequests: Array<{
+          messages: Array<{ role: string; content: string; tool_call_id?: string }>
+        }> = []
+        const server = http.createServer((request, response) => {
+          const chunks: Buffer[] = []
+          request.on('data', (chunk: Buffer) => chunks.push(chunk))
+          request.once('end', () => {
+            const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+            providerRequests.push(payload)
+            const hasToolResult = payload.messages.some(
+              (message: { role: string }) => message.role === 'tool',
+            )
+            response.writeHead(200, { 'Content-Type': 'application/json' })
+            response.end(JSON.stringify({
+              choices: [{
+                index: 0,
+                message: hasToolResult
+                  ? { role: 'assistant', content: '检查完成。' }
+                  : {
+                      role: 'assistant',
+                      content: '',
+                      tool_calls: [{
+                        id: 'inspect-stage-contract',
+                        type: 'function',
+                        function: {
+                          name: 'inspect_evidence',
+                          arguments: JSON.stringify({
+                            evidenceIds: [validEvidenceId],
+                            inheritanceMode: 'body_only',
+                          }),
+                        },
+                      }],
+                    },
+                finish_reason: hasToolResult ? 'stop' : 'tool_calls',
+              }],
+            }))
+          })
+        })
+        await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+        const address = server.address() as { port: number }
+
+        try {
+          pointLiveEndpointAt(`http://127.0.0.1:${address.port}`)
+          const response = await handlers.POST(
+            new NextRequest(`http://localhost/api/sessions/${sid}/chat`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ message: '请读取已有审查证据后回答。' }),
+            }),
+            { params: Promise.resolve({ id: sid }) },
+          )
+          expect(response.status).toBe(200)
+          const events = await readSSEEvents(response)
+          expect(events.find((event) => event.event === 'message_complete')?.data)
+            .toMatchObject({ kind: 'message' })
+          expect(providerRequests).toHaveLength(2)
+
+          const firstContext = providerRequests[0].messages.map((message) => message.content).join('\n')
+          expect(firstContext).toContain(expectedBody)
+          const manifest = providerRequests[0].messages.find(
+            (message) => message.content.startsWith('Translation tool evidence manifest'),
+          )!
+          expect(JSON.parse(manifest.content.slice(manifest.content.indexOf('\n') + 1)).evidence)
+            .toEqual([{
+              evidenceId: validEvidenceId,
+              sourceType: 'stage_output',
+              sourceId: validEvidenceId,
+            }])
+
+          const toolMessage = providerRequests[1].messages.find(
+            (message) => message.role === 'tool' && message.tool_call_id === 'inspect-stage-contract',
+          )!
+          expect(JSON.parse(toolMessage.content)).toEqual({
+            inheritanceMode: 'body_only',
+            items: [{
+              evidenceId: validEvidenceId,
+              sourceType: 'stage_output',
+              sourceId: validEvidenceId,
+              body: expectedBody,
+            }],
+          })
+          const allContext = JSON.stringify(providerRequests)
+          expect(allContext).not.toContain('CORRUPT_MARKED_OUTPUT_MUST_BE_SKIPPED')
+          expect(allContext).not.toContain('FAILED_STAGE_MUST_BE_SKIPPED')
+          expect(allContext).not.toContain(`stage:filter:${corrupt.lastInsertRowid}`)
+          expect(allContext).not.toContain(`stage:orchestrate:${failed.lastInsertRowid}`)
+          if (format === 'json') {
+            expect(allContext).not.toContain('ANNOTATION_FIELD_IS_LITERAL_IN_LEGACY')
+          } else {
+            expect(firstContext).toContain('ANNOTATION_FIELD_IS_LITERAL_IN_LEGACY')
+          }
+        } finally {
+          await new Promise<void>((resolve, reject) => {
+            server.close((error) => error ? reject(error) : resolve())
+            server.closeAllConnections()
+          })
+        }
+      },
+    )
+
+    it('streams bounded reasoning separately from the body and keeps it out of persisted chat and later context', async () => {
+      const http = await import('http')
+      const providerRequests: string[] = []
+      const reasoningFragment = 'PRIVATE_REASONING_'.repeat(60)
+      const server = http.createServer((request, response) => {
+        const chunks: Buffer[] = []
+        request.on('data', (chunk: Buffer) => chunks.push(chunk))
+        request.once('end', () => {
+          providerRequests.push(Buffer.concat(chunks).toString('utf8'))
+          response.writeHead(200, { 'Content-Type': 'text/event-stream' })
+          for (let index = 0; index < 50; index += 1) {
+            response.write(`data: ${JSON.stringify({
+              choices: [{ index: 0, delta: { reasoning_content: reasoningFragment } }],
+            })}\n\n`)
+          }
+          response.write(`data: ${JSON.stringify({
+            choices: [{ index: 0, delta: { content: '正文保持独立。' } }],
+          })}\n\n`)
+          response.write(`data: ${JSON.stringify({
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          })}\n\n`)
+          response.end('data: [DONE]\n\n')
+        })
+      })
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+      const address = server.address() as { port: number }
+
+      try {
+        pointLiveEndpointAt(`http://127.0.0.1:${address.port}`)
+        const sid = await createAssembledSession()
+        const postChat = (message: string) => handlers.POST(
+          new NextRequest(`http://localhost/api/sessions/${sid}/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message }),
+          }),
+          { params: Promise.resolve({ id: sid }) },
+        )
+        const firstEvents = await readSSEEvents(await postChat('请检查译文。'))
+        const previews = firstEvents
+          .filter((event) => event.event === 'reasoning')
+          .map((event) => event.data as {
+            reasoningPreview: string
+            reasoningCharacters: number
+            reasoningTruncated: boolean
+          })
+
+        expect(previews.length).toBeGreaterThan(0)
+        expect(previews.every((preview) => preview.reasoningPreview.length <= 4_000)).toBe(true)
+        expect(previews.at(-1)).toMatchObject({
+          reasoningCharacters: 54_000,
+          reasoningTruncated: true,
+        })
+        expect(firstEvents.filter((event) => event.event === 'delta').map(
+          (event) => (event.data as { text: string }).text,
+        ).join('')).toBe('正文保持独立。')
+        expect(firstEvents.find((event) => event.event === 'message_complete')?.data)
+          .toMatchObject({ kind: 'message' })
+
+        await readSSEEvents(await postChat('再确认一下。'))
+        expect(providerRequests).toHaveLength(2)
+        expect(providerRequests.join('')).not.toContain('PRIVATE_REASONING')
+        const storedMessages = repos.chatMessages.listBySession(sid)
+        expect(storedMessages.filter((message) => message.role === 'assistant').map(
+          (message) => message.content,
+        )).toEqual(['正文保持独立。', '正文保持独立。'])
+        expect(JSON.stringify(storedMessages)).not.toContain('PRIVATE_REASONING')
+        expect(JSON.stringify(db.prepare('SELECT * FROM llm_call_records').all()))
+          .not.toContain('PRIVATE_REASONING')
+      } finally {
+        await new Promise<void>((resolve, reject) => {
+          server.close((error) => error ? reject(error) : resolve())
+          server.closeAllConnections()
+        })
+      }
+    })
+
+    it.each(['reasoning_content', 'thinking', 'reasoning'])(
+      'redacts credential echoes in %s previews while retaining a bounded tail and body-only history',
+      async (reasoningField) => {
+        const http = await import('http')
+        const providerRequests: string[] = []
+        const credentials = {
+          current: 'fixture-A7',
+          other: 'fixture-B8',
+          header: 'fixture-bearer-token-123',
+          recognizable: 'sk-fixture-format-token-123',
+        }
+        const reasoningFragment = [
+          'PRIVATE_REASONING',
+          credentials.current,
+          credentials.other,
+          `Authorization: Bearer ${credentials.header}`,
+          credentials.recognizable,
+        ].join(' ') + '\n'
+        const latestProgress = 'LATEST_PRIVATE_REASONING_PROGRESS'
+        const server = http.createServer((request, response) => {
+          const chunks: Buffer[] = []
+          request.on('data', (chunk: Buffer) => chunks.push(chunk))
+          request.once('end', () => {
+            providerRequests.push(Buffer.concat(chunks).toString('utf8'))
+            response.writeHead(200, { 'Content-Type': 'text/event-stream' })
+            for (const fragment of [
+              ...Array.from({ length: 50 }, () => reasoningFragment),
+              latestProgress,
+            ]) {
+              response.write(`data: ${JSON.stringify({
+                choices: [{ index: 0, delta: { [reasoningField]: fragment } }],
+              })}\n\n`)
+            }
+            response.write(`data: ${JSON.stringify({
+              choices: [{
+                index: 0,
+                delta: { content: '正文保持独立。' },
+                finish_reason: 'stop',
+              }],
+            })}\n\n`)
+            response.end('data: [DONE]\n\n')
+          })
+        })
+        await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+        const address = server.address() as { port: number }
+
+        try {
+          pointLiveEndpointAt(`http://127.0.0.1:${address.port}`, credentials.current)
+          repos.endpoints.insert({
+            name: 'other-synthetic-endpoint',
+            base_url: 'http://127.0.0.1:1',
+            api_key: credentials.other,
+          })
+          const sid = await createAssembledSession()
+          const postChat = (message: string) => handlers.POST(
+            new NextRequest(`http://localhost/api/sessions/${sid}/chat`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ message }),
+            }),
+            { params: Promise.resolve({ id: sid }) },
+          )
+          const firstResponse = await postChat('请检查译文。')
+          expect(firstResponse.status).toBe(200)
+          const firstEvents = await readSSEEvents(firstResponse)
+          const previews = firstEvents
+            .filter((event) => event.event === 'reasoning')
+            .map((event) => event.data as {
+              reasoningPreview: string
+              reasoningCharacters: number
+              reasoningTruncated: boolean
+            })
+
+          expect(previews.length).toBeGreaterThan(0)
+          expect(previews.every((preview) => preview.reasoningPreview.length <= 4_000)).toBe(true)
+          expect(previews.at(-1)).toMatchObject({
+            reasoningCharacters: reasoningFragment.length * 50 + latestProgress.length,
+            reasoningTruncated: true,
+          })
+          expect(previews.at(-1)!.reasoningPreview).toHaveLength(4_000)
+          expect(previews.at(-1)!.reasoningPreview.endsWith(latestProgress)).toBe(true)
+          expect(previews.at(-1)!.reasoningPreview).toContain('[REDACTED_CREDENTIAL]')
+          for (const credential of Object.values(credentials)) {
+            expect(JSON.stringify(firstEvents)).not.toContain(credential)
+          }
+          expect(firstEvents.filter((event) => event.event === 'delta').map(
+            (event) => (event.data as { text: string }).text,
+          ).join('')).toBe('正文保持独立。')
+          expect(firstEvents.find((event) => event.event === 'message_complete')?.data)
+            .toMatchObject({ kind: 'message' })
+
+          await readSSEEvents(await postChat('再确认一下。'))
+          expect(providerRequests).toHaveLength(2)
+          expect(providerRequests.join('')).not.toContain('PRIVATE_REASONING')
+          const storedMessages = repos.chatMessages.listBySession(sid)
+          expect(storedMessages.filter((message) => message.role === 'assistant').map(
+            (message) => message.content,
+          )).toEqual(['正文保持独立。', '正文保持独立。'])
+          const retainedData = JSON.stringify([
+            storedMessages,
+            db.prepare('SELECT * FROM llm_call_records').all(),
+            providerRequests,
+          ])
+          expect(retainedData).not.toContain('PRIVATE_REASONING')
+          for (const credential of Object.values(credentials)) {
+            expect(retainedData).not.toContain(credential)
+          }
+        } finally {
+          await new Promise<void>((resolve, reject) => {
+            server.close((error) => error ? reject(error) : resolve())
+            server.closeAllConnections()
+          })
+        }
+      },
+    )
+
     it('reuses an unfinished identical user turn instead of duplicating it', async () => {
       mockLLM.setBehavior('echo-model', { behavior: 'echo' })
       const sid = await createAssembledSession()

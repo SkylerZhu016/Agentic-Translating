@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Badge, Button, Modal, Spinner } from '@/src/components/ui'
 import { useDirection } from '@/src/components/direction/DirectionProvider'
 import {
@@ -50,57 +50,131 @@ export function BatchManager() {
   const [concurrency, setConcurrency] = useState(2)
   const [files, setFiles] = useState<PreparedFile[]>([])
   const [busy, setBusy] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [presetsLoading, setPresetsLoading] = useState(false)
+  const [actionBusy, setActionBusy] = useState<string | null>(null)
+  const [preparing, setPreparing] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [listError, setListError] = useState<string | null>(null)
+  const [pollRevision, setPollRevision] = useState(0)
   const [desktop, setDesktop] = useState(false)
   const [exportMessage, setExportMessage] = useState<string | null>(null)
   const folderInput = useRef<HTMLInputElement | null>(null)
+  const jobsController = useRef<AbortController | null>(null)
+  const revisionController = useRef<AbortController | null>(null)
+  const mounted = useRef(true)
+  const fileGeneration = useRef(0)
 
-  async function load() {
-    const [jobsResponse, presetsResponse] = await Promise.all([
-      fetch('/api/batches', { cache: 'no-store' }),
-      fetch(`/api/workflow-presets?direction=${direction}`),
-    ])
-    if (jobsResponse.ok) setJobs(await jobsResponse.json())
-    if (presetsResponse.ok) setPresets(await presetsResponse.json())
-  }
+  const load = useCallback(async () => {
+    jobsController.current?.abort()
+    const controller = new AbortController()
+    jobsController.current = controller
+    try {
+      const response = await fetch('/api/batches', { cache: 'no-store', signal: controller.signal })
+      if (!response.ok) throw new Error(t('batch.error.load'))
+      const nextJobs = await response.json() as BatchJobView[]
+      if (controller.signal.aborted) return
+      setJobs(nextJobs)
+      setListError(null)
+    } catch (loadError) {
+      if (!controller.signal.aborted) setListError(loadError instanceof Error ? loadError.message : t('batch.error.load'))
+    } finally {
+      if (!controller.signal.aborted) {
+        setLoading(false)
+        setPollRevision((current) => current + 1)
+      }
+    }
+  }, [t])
 
   useEffect(() => {
+    mounted.current = true
     setDesktop(Boolean(window.agenticDesktop))
     void load()
-    const timer = window.setInterval(() => void load(), 2000)
-    return () => window.clearInterval(timer)
-  }, [direction])
+    const onVisible = () => { if (document.visibilityState === 'visible') void load() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      mounted.current = false
+      jobsController.current?.abort()
+      revisionController.current?.abort()
+      fileGeneration.current += 1
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [load])
+
+  useEffect(() => {
+    if (!listError && !jobs.some((job) => job.status === 'running' || job.status === 'queued')) return
+    const timer = window.setTimeout(() => {
+      if (document.visibilityState === 'visible') void load()
+    }, listError ? 12000 : 4000)
+    return () => window.clearTimeout(timer)
+  }, [jobs, listError, load, pollRevision])
+
+  useEffect(() => {
+    if (!open) return
+    const controller = new AbortController()
+    setPresetsLoading(true)
+    setPresets([])
+    setPresetId('')
+    setRevisionId('')
+    revisionController.current?.abort()
+    void fetch(`/api/workflow-presets?direction=${direction}`, { signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(t('batch.error.presets'))
+        const nextPresets = await response.json() as WorkflowPreset[]
+        if (!controller.signal.aborted) setPresets(nextPresets)
+      })
+      .catch((loadError) => {
+        if (!controller.signal.aborted) setError(loadError instanceof Error ? loadError.message : t('batch.error.presets'))
+      })
+      .finally(() => { if (!controller.signal.aborted) setPresetsLoading(false) })
+    return () => {
+      controller.abort()
+      revisionController.current?.abort()
+    }
+  }, [open, direction, t])
 
   useEffect(() => {
     folderInput.current?.setAttribute('webkitdirectory', '')
   }, [open])
 
   async function selectPreset(value: string) {
+    revisionController.current?.abort()
+    const controller = new AbortController()
+    revisionController.current = controller
     setPresetId(value)
     setRevisionId('')
     if (!value) return
-    const response = await fetch(`/api/workflow-presets/${encodeURIComponent(value)}`)
-    if (!response.ok) return
-    const payload = await response.json() as {
-      preset: WorkflowPreset
-      revisions: WorkflowPresetRevision[]
+    try {
+      const response = await fetch(`/api/workflow-presets/${encodeURIComponent(value)}`, { signal: controller.signal })
+      if (!response.ok) throw new Error(t('batch.error.presets'))
+      const payload = await response.json() as {
+        preset: WorkflowPreset
+        revisions: WorkflowPresetRevision[]
+      }
+      if (controller.signal.aborted) return
+      const revision = payload.revisions.find(
+        (item) => item.revisionNo === payload.preset.currentRevisionNo,
+      )
+      setRevisionId(revision?.id ?? '')
+    } catch (loadError) {
+      if (!controller.signal.aborted) setError(loadError instanceof Error ? loadError.message : t('batch.error.presets'))
     }
-    const revision = payload.revisions.find(
-      (item) => item.revisionNo === payload.preset.currentRevisionNo,
-    )
-    setRevisionId(revision?.id ?? '')
   }
 
   async function prepareFiles(list: FileList | null) {
     if (!list) return
+    const generation = ++fileGeneration.current
     setError(null)
+    setFiles([])
     if (list.length > 500) {
       setError(t('batch.error.maxFiles', { count: formatNumber(500) }))
       return
     }
+    setPreparing(true)
     const prepared: PreparedFile[] = []
     try {
       for (const file of Array.from(list)) {
+        if (generation !== fileGeneration.current) return
         const relativePath =
           (file as File & { webkitRelativePath?: string }).webkitRelativePath ||
           file.name
@@ -128,9 +202,11 @@ export function BatchManager() {
         })
       }
       if (prepared.length === 0) throw new Error(t('batch.error.noFiles'))
-      setFiles(prepared)
+      if (generation === fileGeneration.current) setFiles(prepared)
     } catch (prepareError) {
-      setError(prepareError instanceof Error ? prepareError.message : t('batch.error.read'))
+      if (generation === fileGeneration.current) setError(prepareError instanceof Error ? prepareError.message : t('batch.error.read'))
+    } finally {
+      if (generation === fileGeneration.current) setPreparing(false)
     }
   }
 
@@ -138,20 +214,18 @@ export function BatchManager() {
     const bridge = window.agenticDesktop
     if (!bridge) return
     setError(null)
-    const result =
-      kind === 'files'
-        ? await bridge.selectFiles()
-        : await bridge.selectFolder()
-    if (result.canceled) return
-    if (result.error) {
-      setError(result.error)
-      return
+    setPreparing(true)
+    try {
+      const result = kind === 'files' ? await bridge.selectFiles() : await bridge.selectFolder()
+      if (!mounted.current || result.canceled) return
+      if (result.error) throw new Error(result.error)
+      if (result.files.length === 0) throw new Error(t('batch.error.noFiles'))
+      setFiles(result.files)
+    } catch (prepareError) {
+      if (mounted.current) setError(prepareError instanceof Error ? prepareError.message : t('batch.error.read'))
+    } finally {
+      if (mounted.current) setPreparing(false)
     }
-    if (result.files.length === 0) {
-      setError(t('batch.error.noFiles'))
-      return
-    }
-    setFiles(result.files)
   }
 
   async function create() {
@@ -182,6 +256,7 @@ export function BatchManager() {
           t('batch.error.create'),
         ))
       }
+      if (!mounted.current) return
       setOpen(false)
       setName('')
       setPresetId('')
@@ -189,17 +264,25 @@ export function BatchManager() {
       setFiles([])
       await load()
     } catch (createError) {
-      setError(createError instanceof Error ? createError.message : t('batch.error.create'))
+      if (mounted.current) setError(createError instanceof Error ? createError.message : t('batch.error.create'))
     } finally {
-      setBusy(false)
+      if (mounted.current) setBusy(false)
     }
   }
 
   async function action(id: string, actionName: string) {
-    await fetch(`/api/batches/${encodeURIComponent(id)}/${actionName}`, {
-      method: 'POST',
-    })
-    await load()
+    if (actionBusy) return
+    setActionBusy(id)
+    setError(null)
+    try {
+      const response = await fetch(`/api/batches/${encodeURIComponent(id)}/${actionName}`, { method: 'POST' })
+      if (!response.ok) throw new Error(t('batch.error.action'))
+      if (mounted.current) await load()
+    } catch (actionError) {
+      if (mounted.current) setError(actionError instanceof Error ? actionError.message : t('batch.error.action'))
+    } finally {
+      if (mounted.current) setActionBusy(null)
+    }
   }
 
   async function exportBatch(id: string) {
@@ -208,10 +291,12 @@ export function BatchManager() {
     setExportMessage(null)
     try {
       const result = await bridge.exportBatch(id, true)
+      if (!mounted.current) return
       if (result.outputDirectory) {
         setExportMessage(t('batch.exported', { path: result.outputDirectory }))
       }
     } catch (exportError) {
+      if (!mounted.current) return
       setExportMessage(
         exportError instanceof Error ? exportError.message : t('batch.error.export'),
       )
@@ -220,17 +305,23 @@ export function BatchManager() {
 
   return (
     <div>
-      <div className="mb-3 flex justify-end">
-        <Button size="sm" variant="outline" onClick={() => setOpen(true)}>
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <p className="text-xs text-ink-4">{t('common.itemCount', { count: formatNumber(jobs.length) })}</p>
+        <div className="flex gap-2">
+        <Button size="sm" variant="outline" disabled={loading} onClick={() => void load()}>{t('common.refresh')}</Button>
+        <Button size="sm" onClick={() => { setError(null); setOpen(true) }}>
           {t('batch.new')}
         </Button>
+        </div>
       </div>
+      {error && !open && <p role="alert" className="mb-3 rounded-sm border border-cinnabar/30 bg-cinnabar/5 p-3 text-sm text-cinnabar">{error}</p>}
+      {listError && <p role="alert" className="mb-3 rounded-sm border border-cinnabar/30 bg-cinnabar/5 p-3 text-sm text-cinnabar">{listError}</p>}
       {exportMessage && (
         <p className="mb-3 rounded-sm border border-line bg-paper px-3 py-2 text-xs text-ink-2">
           {exportMessage}
         </p>
       )}
-      {jobs.length === 0 ? (
+      {loading ? <div className="flex min-h-32 items-center justify-center"><Spinner /></div> : jobs.length === 0 && !listError ? (
         <div className="rounded-sm border border-dashed border-line-2 p-8 text-center text-sm text-ink-4">
           {t('batch.empty')}
         </div>
@@ -257,7 +348,7 @@ export function BatchManager() {
                     })}
                   </p>
                 </div>
-                <div className="flex flex-wrap gap-1">
+                <fieldset disabled={actionBusy !== null} className="flex min-w-0 flex-wrap gap-1">
                   {job.status === 'running' && (
                     <Button variant="ghost" size="sm" onClick={() => void action(job.id, 'pause')}>{t('batch.action.pause')}</Button>
                   )}
@@ -287,7 +378,7 @@ export function BatchManager() {
                       {t('batch.action.exportZip')}
                     </Button>
                   )}
-                </div>
+                </fieldset>
               </div>
             </li>
           ))}
@@ -296,12 +387,12 @@ export function BatchManager() {
 
       <Modal
         open={open}
-        onClose={() => setOpen(false)}
+        onClose={() => { if (!busy && !preparing) setOpen(false) }}
         title={t('batch.new')}
         footer={
           <>
-            <Button variant="ghost" size="sm" onClick={() => setOpen(false)}>{t('common.cancel')}</Button>
-            <Button size="sm" disabled={busy} onClick={() => void create()}>
+            <Button variant="ghost" size="sm" disabled={busy || preparing} onClick={() => setOpen(false)}>{t('common.cancel')}</Button>
+            <Button size="sm" disabled={busy || preparing || presetsLoading || !revisionId || !name.trim() || files.length === 0} onClick={() => void create()}>
               {busy && <Spinner size="sm" />}{t('batch.create')}
             </Button>
           </>
@@ -317,10 +408,12 @@ export function BatchManager() {
           />
           <select
             value={presetId}
+            aria-label={t('batch.preset.select')}
+            disabled={presetsLoading || busy}
             onChange={(event) => void selectPreset(event.target.value)}
             className="h-9 w-full rounded-sm border border-line-2 bg-paper-raise px-2 text-sm"
           >
-            <option value="">{t('batch.preset.select')}</option>
+            <option value="">{presetsLoading ? t('ui.spinner.loading') : t('batch.preset.select')}</option>
             {presets.map((preset) => (
               <option key={preset.id} value={preset.id}>
                 {t('batch.preset.revision', {
@@ -341,7 +434,7 @@ export function BatchManager() {
               className="mt-2 w-full accent-ink"
             />
           </label>
-          <div className="flex flex-wrap gap-2">
+          <fieldset disabled={busy || preparing} className="flex min-w-0 flex-wrap gap-2">
             {desktop ? (
               <>
                 <Button
@@ -386,7 +479,7 @@ export function BatchManager() {
             <span className="self-center text-xs text-ink-4">
               {t('batch.selectedFiles', { count: formatNumber(files.length) })}
             </span>
-          </div>
+          </fieldset>
           {error && <p role="alert" className="text-sm text-cinnabar">{error}</p>}
         </div>
       </Modal>

@@ -40,6 +40,58 @@ describe('GET /api/sessions/:id/export error redaction', () => {
     db.close()
   })
 
+  it('preserves literal JSON in legacy exports and decodes only marked successful stage output', async () => {
+    const legacyJson = '{"body":"Literal object in the translation","annotation":"Also part of that object"}'
+    const markedJson = '{"body":"Decoded stage body","annotation":"Human-only note"}'
+    repos.translationResults.insert({
+      session_id: 'session-export-redaction',
+      agent_key: 'legacy-json',
+      agent_snapshot: '{}',
+      status: 'complete',
+      output_text: legacyJson,
+      error: null,
+      latency_ms: 1,
+      attempt: 1,
+    })
+    for (const stage of [
+      { stage: 'review' as const, status: 'complete' as const, prompt: 'Frozen free-form stage', raw: legacyJson },
+      { stage: 'filter' as const, status: 'complete' as const, prompt: '[protocol:json-v1]', raw: markedJson },
+      { stage: 'orchestrate' as const, status: 'complete' as const, prompt: '[protocol:json-v1]', raw: '{"body":"unfinished"' },
+      { stage: 'assemble' as const, status: 'failed' as const, prompt: '[protocol:json-v1]', raw: markedJson },
+    ]) {
+      repos.stageOutputs.insert({
+        session_id: 'session-export-redaction',
+        stage: stage.stage,
+        status: stage.status,
+        prompt_used: stage.prompt,
+        raw_output: stage.raw,
+        error: null,
+      })
+    }
+    const response = await GET(
+      new Request('http://localhost/api/sessions/session-export-redaction/export?format=json'),
+      { params: Promise.resolve({ id: 'session-export-redaction' }) },
+    )
+    expect(response.status).toBe(200)
+    const payload = await response.json()
+    expect(payload.legacy_results[0].semantic).toEqual({
+      raw: legacyJson, body: legacyJson, annotation: null,
+    })
+    const stages = Object.fromEntries(payload.stages.map((stage: { stage: string }) => [stage.stage, stage]))
+    expect(stages.review.semantic).toEqual({ raw: legacyJson, body: legacyJson, annotation: null })
+    expect(stages.filter.semantic).toEqual({
+      raw: markedJson, body: 'Decoded stage body', annotation: 'Human-only note',
+    })
+    expect(stages.orchestrate).toMatchObject({
+      status: 'failed', raw_output: '{"body":"unfinished"', semantic: null,
+      semanticError: 'semantic_output_invalid_json',
+    })
+    expect(stages.assemble.semantic).toBeNull()
+    expect(stages.assemble.status).toBe('failed')
+    expect(repos.stageOutputs.getBySessionAndStage('session-export-redaction', 'orchestrate')!.status)
+      .toBe('complete')
+  })
+
   it('redacts historical result and stage errors in JSON and Markdown without rewriting the database', async () => {
     const rawResultError =
       'Bearer sk-export-result https://result.private/v1 LEAKED_RESULT_SOURCE LEAKED_RESULT_PROMPT'

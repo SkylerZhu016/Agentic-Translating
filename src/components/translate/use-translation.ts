@@ -7,13 +7,17 @@
 // - 配置检测（agents/endpoints 是否就绪，决定 CTA 或翻译视图）
 // - 会话创建（POST /api/sessions）→ 从 config_snapshot 播种卡片
 // - 翻译 SSE 消费（POST translate / 单卡 retry，fetch + ReadableStream
-//   + parseSSEChunk 累积缓冲模式，与 src/lib/llm/client.ts 同款）
+//   + parseSSEChunk 增量缓冲模式）
 // - 断流兜底：流结束未见 done / 网络异常 → 在飞卡片转 error，绝不永远 streaming
 // - 卸载AbortController 取消在飞流
 // ---------------------------------------------------------------------------
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { parseSSEChunk, type SSEEvent } from '@/src/lib/contracts/sse'
+import {
+  parseSSEChunk,
+  takeCompleteSSEText,
+  type SSEEvent,
+} from '@/src/lib/contracts/sse'
 import type { ConfigSnapshot, SessionRow } from '@/src/lib/contracts/types'
 import { emitSessionChanged } from '@/src/components/coordinator/session-bus'
 import type {
@@ -29,6 +33,7 @@ import type { SessionPreflightSnapshot } from '@/src/lib/contracts/vnext'
 import { useI18n } from '@/src/i18n/LocaleProvider'
 import { localizeDiagnosticError } from '@/src/i18n/diagnostic'
 import type { Translator } from '@/src/i18n/types'
+import { emitStageStreamEvent } from '@/src/lib/client/stage-stream-bus'
 
 // ── Public types ────────────────────────────────────────────────
 
@@ -45,6 +50,9 @@ export interface AgentCardState {
   text: string
   error: string | null
   lastActivityAt?: string
+  reasoningPreview?: string
+  reasoningCharacters?: number
+  reasoningTruncated?: boolean
   annotation?: string | null
   evidence?: TranslationEvidenceReport | null
   attempts?: RestorableInvocation[]
@@ -106,7 +114,25 @@ interface RestorableInvocation {
   error: string | null
 }
 
-// ── SSE 消费（累积缓冲 + processedEventCount 跳过已处理事件） ────
+interface RestorableSessionPayload {
+  session: SessionRow
+  projectContext?: SessionProjectContext | null
+  invocations?: RestorableInvocation[]
+  invocationChains?: Array<{
+    rootInvocationId: string
+    currentInvocation: RestorableInvocation
+    attempts: RestorableInvocation[]
+    attemptCount: number
+  }>
+  runs?: Array<{ status: string }>
+  events?: Array<{
+    id: number
+    event_type: string
+    payload_json: string
+  }>
+}
+
+// ── SSE 消费（仅保留未完成帧，避免反复解析整段历史） ────────────
 
 async function consumeSSE(
   response: Response,
@@ -118,24 +144,27 @@ async function consumeSSE(
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let rawBuffer = ''
-  let processedEventCount = 0
 
   const flush = () => {
-    const events = parseSSEChunk(rawBuffer)
-    for (let i = processedEventCount; i < events.length; i++) {
-      onEvent(events[i])
+    const { completeText, remainder } = takeCompleteSSEText(rawBuffer)
+    rawBuffer = remainder
+    for (const event of parseSSEChunk(completeText)) {
+      onEvent(event)
     }
-    processedEventCount = events.length
   }
 
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    rawBuffer += decoder.decode(value, { stream: true })
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      rawBuffer += decoder.decode(value, { stream: true })
+      flush()
+    }
+    rawBuffer += decoder.decode()
     flush()
+  } finally {
+    reader.releaseLock()
   }
-  rawBuffer += decoder.decode()
-  flush()
 }
 
 /** 从失败响应中提炼错误文案（兼容 {error} 与 {error, message} 两种形状） */
@@ -192,11 +221,121 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
   const abortRef = useRef<AbortController | null>(null)
   const clientRequestIdRef = useRef<string | null>(null)
   const mountedRef = useRef(true)
+  const sessionIdRef = useRef<string | null>(null)
+  const startingRef = useRef<AbortController | null>(null)
+  const restoringRef = useRef<AbortController | null>(null)
+  const restorePromiseRef = useRef<{
+    id: string
+    direction: BuiltinDirection
+    controller: AbortController | null
+    promise: Promise<RestoredTranslationState>
+  } | null>(null)
+  const retryingKeyRef = useRef<string | null>(null)
+  const pendingUpdatesRef = useRef(
+    new Map<string, {
+      text: string
+      annotation?: string
+      lastActivityAt?: string
+      reasoningPreview?: string
+      reasoningCharacters?: number
+      reasoningTruncated?: boolean
+    }>(),
+  )
+  const updateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const discardPendingUpdates = useCallback(() => {
+    if (updateTimerRef.current !== null) {
+      clearTimeout(updateTimerRef.current)
+      updateTimerRef.current = null
+    }
+    pendingUpdatesRef.current.clear()
+  }, [])
+
+  // A token burst produces at most one text render every 50 ms. Terminal
+  // events flush first so a delayed token can never overwrite a final body.
+  const flushPendingUpdates = useCallback(() => {
+    if (updateTimerRef.current !== null) {
+      clearTimeout(updateTimerRef.current)
+      updateTimerRef.current = null
+    }
+    const updates = pendingUpdatesRef.current
+    if (updates.size === 0) return
+    pendingUpdatesRef.current = new Map()
+    if (!mountedRef.current) return
+    setCards((previous) => {
+      let changed = false
+      const next = previous.map((card) => {
+        const update = updates.get(card.agentKey)
+        if (!update) return card
+        changed = true
+        return {
+          ...card,
+          ...(update.text
+            ? { status: 'streaming' as const, text: card.text + update.text }
+            : {}),
+          ...(update.lastActivityAt
+            ? { lastActivityAt: update.lastActivityAt }
+            : {}),
+          ...(update.annotation
+            ? { annotation: (card.annotation ?? '') + update.annotation }
+            : {}),
+          ...(update.reasoningCharacters !== undefined
+            ? {
+                reasoningPreview: update.reasoningPreview ?? card.reasoningPreview,
+                reasoningCharacters: update.reasoningCharacters,
+                reasoningTruncated: update.reasoningTruncated,
+              }
+            : {}),
+        }
+      })
+      return changed ? next : previous
+    })
+  }, [])
+
+  const queueCardUpdate = useCallback((
+    agentKey: string,
+    text: string,
+    lastActivityAt?: string,
+  ) => {
+    if (!text && !lastActivityAt) return
+    const pending = pendingUpdatesRef.current.get(agentKey)
+    pendingUpdatesRef.current.set(agentKey, {
+      ...pending,
+      text: (pending?.text ?? '') + text,
+      lastActivityAt: lastActivityAt ?? pending?.lastActivityAt,
+    })
+    if (updateTimerRef.current === null) {
+      updateTimerRef.current = setTimeout(flushPendingUpdates, 50)
+    }
+  }, [flushPendingUpdates])
+
+  const isCurrentRequest = useCallback((controller: AbortController) =>
+    mountedRef.current &&
+    abortRef.current === controller &&
+    !controller.signal.aborted,
+  [])
+
+  const beginRequest = useCallback(() => {
+    abortRef.current?.abort()
+    discardPendingUpdates()
+    const controller = new AbortController()
+    abortRef.current = controller
+    startingRef.current = null
+    restoringRef.current = null
+    retryingKeyRef.current = null
+    setRetryingKey(null)
+    return controller
+  }, [discardPendingUpdates])
 
   useEffect(() => {
     abortRef.current?.abort()
     abortRef.current = null
+    discardPendingUpdates()
     clientRequestIdRef.current = null
+    sessionIdRef.current = null
+    startingRef.current = null
+    restoringRef.current = null
+    retryingKeyRef.current = null
     setPhase('idle')
     setCards([])
     setSessionId(null)
@@ -205,7 +344,7 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
     setPreflight(null)
     setPreflightErrorCode(null)
     setPreflightActions([])
-  }, [direction])
+  }, [direction, discardPendingUpdates])
 
   useEffect(() => {
     setLangPair(
@@ -221,8 +360,9 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
     return () => {
       mountedRef.current = false
       abortRef.current?.abort()
+      discardPendingUpdates()
     }
-  }, [])
+  }, [discardPendingUpdates])
 
   // ── 配置检测（首访一次性，非轮询） ─────────────────────────────
   useEffect(() => {
@@ -279,6 +419,19 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
       } catch {
         return
       }
+      if (sessionIdRef.current && event.event.startsWith('stage.')) {
+        emitStageStreamEvent(sessionIdRef.current, event, data)
+      }
+
+      if (
+        event.event !== 'agent.delta' &&
+        event.event !== 'token' &&
+        event.event !== 'agent.annotation' &&
+        event.event !== 'agent.reasoning' &&
+        event.event !== 'agent.activity'
+      ) {
+        flushPendingUpdates()
+      }
 
       switch (event.event) {
         case 'agent.started': {
@@ -301,6 +454,10 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
                         typeof data.model === 'string' ? data.model : card.model,
                       status: 'streaming',
                       text: '',
+                      annotation: null,
+                      reasoningPreview: '',
+                      reasoningCharacters: 0,
+                      reasoningTruncated: false,
                       error: null,
                     }
                   : card,
@@ -333,23 +490,60 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
         case 'agent.delta': {
           const invocationId = data.invocationId as string
           const delta = typeof data.delta === 'string' ? data.delta : ''
-          setCards((previous) =>
-            previous.map((card) =>
-              card.agentKey === invocationId
-                ? { ...card, status: 'streaming', text: card.text + delta }
-                : card,
-            ),
-          )
+          queueCardUpdate(invocationId, delta)
+          break
+        }
+        case 'agent.annotation': {
+          const invocationId = data.invocationId as string
+          const delta = typeof data.delta === 'string' ? data.delta : ''
+          const pending = pendingUpdatesRef.current.get(invocationId)
+          pendingUpdatesRef.current.set(invocationId, {
+            ...pending,
+            text: pending?.text ?? '',
+            annotation: (pending?.annotation ?? '') + delta,
+          })
+          if (updateTimerRef.current === null) {
+            updateTimerRef.current = setTimeout(flushPendingUpdates, 50)
+          }
+          break
+        }
+        case 'agent.reasoning':
+        case 'agent.reasoning.completed': {
+          const invocationId = data.invocationId as string
+          const pending = pendingUpdatesRef.current.get(invocationId)
+          pendingUpdatesRef.current.set(invocationId, {
+            ...pending,
+            text: pending?.text ?? '',
+            reasoningPreview: typeof data.reasoningPreview === 'string'
+              ? data.reasoningPreview.slice(-4_000)
+              : pending?.reasoningPreview,
+            reasoningCharacters: typeof data.reasoningCharacters === 'number'
+              ? data.reasoningCharacters
+              : 0,
+            reasoningTruncated: data.reasoningTruncated === true,
+          })
+          if (updateTimerRef.current === null) {
+            updateTimerRef.current = setTimeout(flushPendingUpdates, 50)
+          }
+          break
+        }
+        case 'agent.reset': {
+          const invocationId = data.invocationId as string
+          patchCard(invocationId, {
+            text: '', annotation: null,
+            reasoningPreview: '', reasoningCharacters: 0, reasoningTruncated: false,
+          })
           break
         }
         case 'agent.activity': {
           const invocationId = data.invocationId as string
-          patchCard(invocationId, {
-            lastActivityAt:
-              typeof data.receivedAt === 'string'
-                ? data.receivedAt
-                : new Date().toISOString(),
-          })
+          queueCardUpdate(
+            invocationId,
+            '',
+            typeof data.receivedAt === 'string'
+              ? data.receivedAt
+              : new Date().toISOString(),
+          )
           break
         }
         case 'agent.completed': {
@@ -360,6 +554,9 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
             annotation:
               typeof data.annotation === 'string' ? data.annotation : null,
             error: null,
+            ...(typeof data.reasoningCharacters === 'number'
+              ? { reasoningCharacters: data.reasoningCharacters }
+              : {}),
           })
           break
         }
@@ -414,18 +611,13 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
         case 'token': {
           const key = data.agent_key as string
           const delta = typeof data.delta === 'string' ? data.delta : ''
-          if (!delta) return
-          setCards((prev) =>
-            prev.map((c) =>
-              c.agentKey === key ? { ...c, status: 'streaming', text: c.text + delta } : c,
-            ),
-          )
+          queueCardUpdate(key, delta)
           break
         }
         case 'agent_complete': {
           const key = data.agent_key as string
           const content = typeof data.content === 'string' ? data.content : null
-          const semantic = parseSemanticAgentOutput(content ?? '')
+          const semantic = parseSemanticAgentOutput(content ?? '', { format: 'legacy' })
           setCards((prev) =>
             prev.map((c) =>
               c.agentKey === key
@@ -466,32 +658,85 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
         // 'done' 由流收尾逻辑统一处理
       }
     },
-    [patchCard, t],
+    [flushPendingUpdates, patchCard, queueCardUpdate, t],
   )
 
-  const restoreSessionImpl = useCallback(async (id: string) => {
-    setGlobalError(null)
-    const response = await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
-      cache: 'no-store',
-    })
-    if (!response.ok) throw new Error(t('error.session.restore'))
-    const payload = await response.json() as {
-      session: SessionRow
-      projectContext?: SessionProjectContext | null
-      invocations?: RestorableInvocation[]
-      invocationChains?: Array<{
-        rootInvocationId: string
-        currentInvocation: RestorableInvocation
-        attempts: RestorableInvocation[]
-        attemptCount: number
-      }>
-      runs?: Array<{ status: string }>
-      events?: Array<{
-        id: number
-        event_type: string
-        payload_json: string
-      }>
+  const restoreSessionImpl = useCallback(async (
+    id: string,
+    activeController?: AbortController,
+  ) => {
+    // Publishing a freshly created session in the URL triggers a form reload.
+    // That read must leave the start request (including its /run POST) intact.
+    const startingController = startingRef.current
+    const preserveStartingRequest =
+      !activeController &&
+      sessionIdRef.current === id &&
+      startingController !== null &&
+      isCurrentRequest(startingController)
+    const controller = preserveStartingRequest
+      ? startingController
+      : activeController ?? beginRequest()
+    const assertCurrentRequest = () => {
+      if (!isCurrentRequest(controller)) {
+        throw new DOMException('Session restoration was superseded', 'AbortError')
+      }
     }
+    assertCurrentRequest()
+    // Block actions on the previous session while its replacement is loading.
+    if (!preserveStartingRequest) {
+      restoringRef.current = controller
+      setGlobalError(null)
+    }
+    let payload: RestorableSessionPayload
+    try {
+      const response = await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
+        cache: 'no-store',
+        signal: controller.signal,
+      })
+      assertCurrentRequest()
+      if (!response.ok) throw new Error(t('error.session.restore'))
+      payload = await response.json() as RestorableSessionPayload
+      assertCurrentRequest()
+    } catch (error) {
+      assertCurrentRequest()
+      if (!preserveStartingRequest) {
+        restoringRef.current = null
+        failInFlight(t('error.connection.interrupted'))
+        setGlobalError(
+          error instanceof Error ? error.message : t('error.session.restore'),
+        )
+      }
+      throw error
+    }
+    let snapshot: ConfigSnapshot | null = null
+    try {
+      snapshot = JSON.parse(payload.session.config_snapshot) as ConfigSnapshot
+    } catch {
+      snapshot = null
+    }
+    const restoredState = {
+      sourceText: payload.session.source_text,
+      taskBrief: payload.session.task_brief ?? '',
+      reviewMode: payload.session.review_mode ?? 'main_editor',
+      mainEditorRunMode:
+        snapshot?.orchestrationPolicy?.mainEditorRunMode ?? 'fixed_pipeline',
+      selectedPresetRevisionId: payload.session.preset_revision_id ?? null,
+      promptBundleRevisionId: snapshot?.promptBundleRevisionId ?? null,
+      constraints: snapshot?.constraints ?? {},
+      allowedAgentVariantIds:
+        snapshot?.agentVariantSnapshots?.map((variant) => variant.id) ?? [],
+      selectedProjectId:
+        payload.projectContext?.projectId ?? snapshot?.projectId ?? null,
+      projectSnapshotId:
+        payload.projectContext?.projectSnapshotId ??
+        snapshot?.projectSnapshotId ??
+        null,
+      projectTokenEstimate: payload.projectContext?.tokenEstimate ?? null,
+      projectApprovedResourceCount:
+        payload.projectContext?.resourceRevisionIds.length ?? null,
+    } satisfies RestoredTranslationState
+    if (preserveStartingRequest) return restoredState
+    restoringRef.current = null
     const chains =
       payload.invocationChains ??
       (payload.invocations ?? []).map((invocation) => ({
@@ -501,7 +746,32 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
         attemptCount: 1,
       }))
     const evidenceByInvocation = new Map<string, TranslationEvidenceReport>()
+    const reasoningByInvocation = new Map<string, number>()
     for (const event of payload.events ?? []) {
+      if (event.event_type.startsWith('stage.')) {
+        try {
+          emitStageStreamEvent(id, {
+            event: event.event_type,
+            id: String(event.id),
+            data: event.payload_json,
+          }, JSON.parse(event.payload_json) as Record<string, unknown>)
+        } catch {
+          // Malformed historical preview events do not prevent restoration.
+        }
+      }
+      if (event.event_type === 'agent.reasoning.completed' || event.event_type === 'agent.completed') {
+        try {
+          const value = JSON.parse(event.payload_json) as {
+            invocationId?: string
+            reasoningCharacters?: number
+          }
+          if (value.invocationId && typeof value.reasoningCharacters === 'number') {
+            reasoningByInvocation.set(value.invocationId, value.reasoningCharacters)
+          }
+        } catch {
+          // Historical reasoning statistics are optional diagnostics.
+        }
+      }
       if (event.event_type !== 'evidence.checked') continue
       try {
         const value = JSON.parse(event.payload_json) as {
@@ -515,6 +785,7 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
         // Ignore malformed historical audit events.
       }
     }
+    sessionIdRef.current = id
     setSessionId(id)
     setLangPair(
       direction === 'en_to_zh'
@@ -560,6 +831,7 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
             ? localizeDiagnosticError(t, invocation.error, t('error.unknown'))
             : null,
           annotation: invocation.annotation_output,
+          reasoningCharacters: reasoningByInvocation.get(invocation.id),
           evidence: evidenceByInvocation.get(invocation.id) ?? null,
           attempts: chain.attempts,
         }
@@ -572,34 +844,33 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
       payload.events && payload.events.length > 0
         ? payload.events[payload.events.length - 1].id
         : 0
-    let snapshot: ConfigSnapshot | null = null
-    try {
-      snapshot = JSON.parse(payload.session.config_snapshot) as ConfigSnapshot
-    } catch {
-      snapshot = null
-    }
     setPreflight(snapshot?.version === 3 ? snapshot.preflight ?? null : null)
     setPreflightErrorCode(null)
     setPreflightActions([])
     setPhase(active ? 'streaming' : 'done')
     if (active) {
-      const controller = new AbortController()
-      abortRef.current?.abort()
-      abortRef.current = controller
       void (async () => {
         try {
           const events = await fetch(
             `/api/sessions/${encodeURIComponent(id)}/events?after=${afterEventId}`,
             { signal: controller.signal },
           )
+          if (!isCurrentRequest(controller)) return
           if (!events.ok) {
             throw new Error(
               await readErrorBody(events, t('error.session.events'), t),
             )
           }
-          await consumeSSE(events, applyEvent, t('error.stream.missing'))
+          await consumeSSE(events, (event) => {
+            if (isCurrentRequest(controller)) applyEvent(event)
+          }, t('error.stream.missing'))
+          if (!isCurrentRequest(controller)) return
+          flushPendingUpdates()
+          failInFlight(t('error.connection.interrupted'))
         } catch (error) {
-          if (!controller.signal.aborted && mountedRef.current) {
+          if (isCurrentRequest(controller)) {
+            flushPendingUpdates()
+            failInFlight(t('error.connection.interrupted'))
             setGlobalError(
               error instanceof Error ? error.message : t('error.session.eventsInterrupted'),
             )
@@ -607,37 +878,48 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
         }
       })()
     }
-    return {
-      sourceText: payload.session.source_text,
-      taskBrief: payload.session.task_brief ?? '',
-      reviewMode: payload.session.review_mode ?? 'main_editor',
-      mainEditorRunMode:
-        snapshot?.orchestrationPolicy?.mainEditorRunMode ?? 'fixed_pipeline',
-      selectedPresetRevisionId: payload.session.preset_revision_id ?? null,
-      promptBundleRevisionId: snapshot?.promptBundleRevisionId ?? null,
-      constraints: snapshot?.constraints ?? {},
-      allowedAgentVariantIds:
-        snapshot?.agentVariantSnapshots?.map((variant) => variant.id) ?? [],
-      selectedProjectId:
-        payload.projectContext?.projectId ?? snapshot?.projectId ?? null,
-      projectSnapshotId:
-        payload.projectContext?.projectSnapshotId ??
-        snapshot?.projectSnapshotId ??
-        null,
-      projectTokenEstimate: payload.projectContext?.tokenEstimate ?? null,
-      projectApprovedResourceCount:
-        payload.projectContext?.resourceRevisionIds.length ?? null,
-    } satisfies RestoredTranslationState
-  }, [applyEvent, direction, t])
-  const restoreSession = useLatestCallback(restoreSessionImpl)
+    return restoredState
+  }, [
+    applyEvent,
+    beginRequest,
+    direction,
+    failInFlight,
+    flushPendingUpdates,
+    isCurrentRequest,
+    t,
+  ])
+  const restoreSession = useLatestCallback((id: string) => {
+    const pending = restorePromiseRef.current
+    if (
+      pending?.id === id &&
+      pending.direction === direction &&
+      pending.controller !== null &&
+      isCurrentRequest(pending.controller)
+    ) {
+      return pending.promise
+    }
+    const promise = restoreSessionImpl(id)
+    const request = { id, direction, controller: abortRef.current, promise }
+    restorePromiseRef.current = request
+    const clearRequest = () => {
+      if (restorePromiseRef.current === request) {
+        restorePromiseRef.current = null
+      }
+    }
+    // Handle both outcomes here without creating an unhandled rejected
+    // finally-Promise. Every caller still receives the original result/error.
+    void promise.then(clearRequest, clearRequest)
+    return promise
+  })
 
   // ── 主流程：创建会话 → 触发翻译 SSE ────────────────────────────
   const start = useCallback(
     async (input: StartTranslationInput) => {
-      abortRef.current?.abort()
-      const controller = new AbortController()
-      abortRef.current = controller
+      const controller = beginRequest()
+      startingRef.current = controller
 
+      sessionIdRef.current = null
+      setSessionId(null)
       setGlobalError(null)
       setCards([])
       setPhase('creating')
@@ -659,6 +941,7 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
           }),
           signal: controller.signal,
         })
+        if (!isCurrentRequest(controller)) return
         if (!createRes.ok) {
           let errorPayload: CreateSessionErrorPayload | null = null
           try {
@@ -666,6 +949,7 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
           } catch {
             errorPayload = null
           }
+          if (!isCurrentRequest(controller)) return
           if (errorPayload?.preflight) {
             setPreflight(errorPayload.preflight)
             setPreflightErrorCode(errorPayload.error ?? null)
@@ -693,6 +977,7 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
         const session = (await createRes.json()) as SessionRow & {
           public_config_snapshot?: ConfigSnapshot
         }
+        if (!isCurrentRequest(controller)) return
         clientRequestIdRef.current = null
 
         // 2. 从配置快照播种卡片（快照即权威：名称+模型+数量）
@@ -705,7 +990,7 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
               ? snapshot.preflight ?? null
               : null,
         )
-        if (!mountedRef.current) return
+        sessionIdRef.current = session.id
         setSessionId(session.id)
         const sessionUrl = new URL(window.location.href)
         sessionUrl.search = ''
@@ -735,6 +1020,7 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
             : `/api/sessions/${session.id}/translate`,
           { method: 'POST', signal: controller.signal },
         )
+        if (!isCurrentRequest(controller)) return
         if (!runRes.ok) {
           throw new Error(
             await readErrorBody(
@@ -750,6 +1036,7 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
                 signal: controller.signal,
               })
             : runRes
+        if (!isCurrentRequest(controller)) return
         if (!sseRes.ok) {
           throw new Error(await readErrorBody(
             sseRes,
@@ -757,40 +1044,62 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
             t,
           ))
         }
-        await consumeSSE(sseRes, applyEvent, t('error.stream.missing'))
+        await consumeSSE(sseRes, (event) => {
+          if (isCurrentRequest(controller)) applyEvent(event)
+        }, t('error.stream.missing'))
 
         // 4. 流正常关闭：仍未完结的卡片按断流处理（杀 mock 场景）
-        if (!mountedRef.current) return
+        if (!isCurrentRequest(controller)) return
+        flushPendingUpdates()
         failInFlight(t('error.connection.interrupted'))
       } catch (err) {
-        if (controller.signal.aborted || !mountedRef.current) return
+        if (!isCurrentRequest(controller)) return
+        flushPendingUpdates()
         failInFlight(t('error.connection.interrupted'))
         setGlobalError(err instanceof Error ? err.message : String(err))
+      } finally {
+        if (startingRef.current === controller) startingRef.current = null
       }
     },
-    [applyEvent, failInFlight, t],
+    [
+      applyEvent,
+      beginRequest,
+      failInFlight,
+      flushPendingUpdates,
+      isCurrentRequest,
+      t,
+    ],
   )
 
   // ── 单卡重试：仅该卡重置流式，其余卡片原样不动 ─────────────────
   const retry = useCallback(
     async (agentKey: string) => {
-      if (!sessionId || retryingKey != null) return
-
-      abortRef.current?.abort()
-      const controller = new AbortController()
-      abortRef.current = controller
+      const activeSessionId = sessionIdRef.current
+      if (
+        !activeSessionId ||
+        restoringRef.current !== null ||
+        retryingKeyRef.current !== null
+      ) return
+      flushPendingUpdates()
+      const controller = beginRequest()
+      retryingKeyRef.current = agentKey
+      let retryInvocationId = agentKey
 
       setGlobalError(null)
       setRetryingKey(agentKey)
-      patchCard(agentKey, { status: 'streaming', text: '', error: null })
+      patchCard(agentKey, {
+        status: 'streaming', text: '', error: null, annotation: null,
+        reasoningPreview: '', reasoningCharacters: 0, reasoningTruncated: false,
+      })
 
       try {
-        const res = await fetch(`/api/sessions/${sessionId}/retry`, {
+        const res = await fetch(`/api/sessions/${activeSessionId}/retry`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ invocationId: agentKey }),
           signal: controller.signal,
         })
+        if (!isCurrentRequest(controller)) return
         if (!res.ok) {
           throw new Error(await readErrorBody(
             res,
@@ -802,10 +1111,13 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
           afterEventId: number
           invocationId: string
         }
+        if (!isCurrentRequest(controller)) return
+        retryInvocationId = retryRun.invocationId
         const events = await fetch(
-          `/api/sessions/${sessionId}/events?after=${retryRun.afterEventId}`,
+          `/api/sessions/${activeSessionId}/events?after=${retryRun.afterEventId}`,
           { signal: controller.signal },
         )
+        if (!isCurrentRequest(controller)) return
         if (!events.ok) {
           throw new Error(
             await readErrorBody(
@@ -815,9 +1127,12 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
             ),
           )
         }
-        await consumeSSE(events, applyEvent, t('error.stream.missing'))
+        await consumeSSE(events, (event) => {
+          if (isCurrentRequest(controller)) applyEvent(event)
+        }, t('error.stream.missing'))
 
-        if (!mountedRef.current) return
+        if (!isCurrentRequest(controller)) return
+        flushPendingUpdates()
         // 流关闭后该卡仍在飞 → 断流
         setCards((prev) =>
           prev.map((c) =>
@@ -828,35 +1143,50 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
           ),
         )
       } catch (err) {
-        if (controller.signal.aborted || !mountedRef.current) return
+        if (!isCurrentRequest(controller)) return
+        flushPendingUpdates()
         setCards((prev) =>
           prev.map((c) =>
-            c.agentKey === agentKey && (c.status === 'streaming' || c.status === 'pending')
+            (c.agentKey === agentKey || c.agentKey === retryInvocationId) &&
+              (c.status === 'streaming' || c.status === 'pending')
               ? { ...c, status: 'error', error: t('error.connection.interrupted') }
               : c,
           ),
         )
         setGlobalError(err instanceof Error ? err.message : String(err))
       } finally {
-        if (mountedRef.current) {
+        if (isCurrentRequest(controller)) {
+          retryingKeyRef.current = null
           setRetryingKey(null)
-          emitSessionChanged(sessionId)
+          emitSessionChanged(activeSessionId)
         }
       }
     },
-    [sessionId, retryingKey, applyEvent, patchCard, t],
+    [
+      applyEvent,
+      beginRequest,
+      flushPendingUpdates,
+      isCurrentRequest,
+      patchCard,
+      t,
+    ],
   )
 
   const retryAll = useCallback(
     async (configMode: 'frozen' | 'current') => {
-      if (!sessionId || retryingKey != null) return
-      const controller = new AbortController()
-      abortRef.current?.abort()
-      abortRef.current = controller
+      const activeSessionId = sessionIdRef.current
+      if (
+        !activeSessionId ||
+        restoringRef.current !== null ||
+        retryingKeyRef.current !== null
+      ) return
+      flushPendingUpdates()
+      const controller = beginRequest()
+      retryingKeyRef.current = '*'
       setGlobalError(null)
       setRetryingKey('*')
       try {
-        const response = await fetch(`/api/sessions/${sessionId}/retry`, {
+        const response = await fetch(`/api/sessions/${activeSessionId}/retry`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -865,6 +1195,7 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
           }),
           signal: controller.signal,
         })
+        if (!isCurrentRequest(controller)) return
         if (!response.ok) {
           throw new Error(
             await readErrorBody(
@@ -877,39 +1208,63 @@ export function useTranslation(direction: BuiltinDirection = 'en_to_zh') {
         const payload = (await response.json()) as {
           runs: Array<{ afterEventId: number }>
         }
+        if (!isCurrentRequest(controller)) return
+        if (payload.runs.length === 0) {
+          await restoreSessionImpl(activeSessionId, controller)
+          return
+        }
         const after = Math.min(
           ...payload.runs.map((run) => run.afterEventId),
         )
         const events = await fetch(
-          `/api/sessions/${sessionId}/events?after=${after}`,
+          `/api/sessions/${activeSessionId}/events?after=${after}`,
           { signal: controller.signal },
         )
+        if (!isCurrentRequest(controller)) return
         if (!events.ok) throw new Error(t('error.retry.subscribe'))
-        await consumeSSE(events, applyEvent, t('error.stream.missing'))
-        await restoreSession(sessionId)
+        await consumeSSE(events, (event) => {
+          if (isCurrentRequest(controller)) applyEvent(event)
+        }, t('error.stream.missing'))
+        if (!isCurrentRequest(controller)) return
+        flushPendingUpdates()
+        await restoreSessionImpl(activeSessionId, controller)
       } catch (error) {
-        if (!controller.signal.aborted) {
+        if (isCurrentRequest(controller)) {
+          flushPendingUpdates()
+          failInFlight(t('error.connection.interrupted'))
           setGlobalError(
             error instanceof Error ? error.message : String(error),
           )
         }
       } finally {
-        if (mountedRef.current) {
+        if (isCurrentRequest(controller)) {
+          retryingKeyRef.current = null
           setRetryingKey(null)
-          emitSessionChanged(sessionId)
+          emitSessionChanged(activeSessionId)
         }
       }
     },
-    [applyEvent, restoreSession, retryingKey, sessionId, t],
+    [
+      applyEvent,
+      beginRequest,
+      failInFlight,
+      flushPendingUpdates,
+      isCurrentRequest,
+      restoreSessionImpl,
+      t,
+    ],
   )
 
   const dismissError = useCallback(() => setGlobalError(null), [])
 
   // ── 派生状态 ───────────────────────────────────────────────────
   const busy = phase === 'creating' || phase === 'streaming' || retryingKey != null
-  const translationCards = cards.filter(
-    (card) =>
-      card.kind !== 'context_analysis' && card.kind !== 'poetry_plan',
+  const translationCards = useMemo(
+    () => cards.filter(
+      (card) =>
+        card.kind !== 'context_analysis' && card.kind !== 'poetry_plan',
+    ),
+    [cards],
   )
   const summary = useMemo(() => {
     if (translationCards.length === 0 || phase !== 'done') return null

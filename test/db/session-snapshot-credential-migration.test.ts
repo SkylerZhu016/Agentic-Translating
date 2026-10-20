@@ -15,10 +15,18 @@ function v16Database(): Database.Database {
     CREATE TABLE sessions (
       id TEXT PRIMARY KEY,
       source_text TEXT NOT NULL,
-      config_snapshot TEXT NOT NULL
+      config_snapshot TEXT NOT NULL,
+      direction TEXT NOT NULL DEFAULT 'en_to_zh',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE TABLE workspace_drafts (
       direction TEXT PRIMARY KEY
+    );
+    CREATE TABLE run_events (
+      id INTEGER PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      event_type TEXT NOT NULL
     );
   `)
   return db
@@ -70,7 +78,7 @@ describe('migration 17 session snapshot credential cleanup', () => {
     insert.run('v3-session', 'source', JSON.stringify(v3))
 
     migrate(db)
-    expect(getAppliedVersion(db)).toBe(18)
+    expect(getAppliedVersion(db)).toBe(19)
     const rows = db.prepare(
       'SELECT id, config_snapshot FROM sessions ORDER BY id',
     ).all() as Array<{ id: string; config_snapshot: string }>

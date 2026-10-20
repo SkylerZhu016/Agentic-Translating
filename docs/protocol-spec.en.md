@@ -1,12 +1,34 @@
-# Free-text Semantic Boundary Protocol (FSBP v2)
+# JSON Content Protocol and Legacy FSBP Compatibility
+
+## Current JSON contract
+
+New built-in role and stage prompts contain `[protocol:json-v1]`. Each content response must be one bare JSON object containing exactly `body: string` and `annotation: string | null`. The body must contain non-whitespace text. Annotations are brief translation notes or decision summaries. The original content response remains in `raw`, while decoded strings retain their content for the frozen downstream inheritance policy.
+
+Validation rejects incomplete objects, duplicate or extra fields, invalid types, code fences, and surrounding text. Failures follow existing bounded stage retry behavior and never turn an invalid object into a successful translation. Incremental decoding visits only new characters, emitting readable body and annotation deltas. Strict parsing still decides final success.
+
+For each physical request, the client decides whether to add `response_format: {"type":"json_object"}`. The current automatic conditions are an origin exactly equal to `https://api.deepseek.com`, a path of `/chat/completions` or `/v1/chat/completions`, a model of `deepseek-flash` or `deepseek-v4-pro`, and at least one system message selecting the JSON contract with `[protocol:json-v1]`. The request must also have no non-empty tool list or `toolChoice`, and the URL must have no username, password, query, or fragment. These conditions apply to streaming and non-streaming requests. Third-party gateways and models outside the allowlist retain their existing request format. Strict application field validation still applies to provider JSON output.
+
+Provider reasoning fields travel separately and never enter the body, annotation, or downstream prompts. The live interface retains at most 4,000 UTF-16 units of recent preview, while persistent records retain diagnostic counts. Literal tags inside ordinary content remain unchanged. Providers that place a leading `<think>` wrapper in the content channel require an explicit transport compatibility option.
+
+The saved prompt marker selects the contract. Historical sessions, custom prompts, and frozen presets retain their original protocol behavior. Adopting the new format requires a preset revision using the new prompts. The public `raw / body / annotation` data structure remains compatible.
+
+## Current four-stage execution and output budgets
+
+Built-in bidirectional prompt bundle v24 executes review, filter, orchestrate, and assemble in order. One integrated review checks fidelity and logic, naturalness and voice, and task and genre constraints. Filtering independently checks review claims against the full source, orchestration produces a complete working translation, and assembly checks changes against the source, user brief, and selected base candidate for regressions.
+
+Execution reads the frozen `reviewPrompt`. A standalone line must equal `[review:integrated-v1]` after trimming its surrounding whitespace to select integrated review. A marker embedded in an explanatory sentence or present only in another prompt retains the legacy path. Older unmarked sessions make three independent review calls and require at least two successful results before combining them. This marker controls review execution, while `[protocol:json-v1]` controls content format. The two decisions use existing snapshots and require no new database migration.
+
+Role default profiles and workflow presets can save a model binding's `maxOutputTokens`. This is the shared reasoning and response-body allowance per call. A blank field or null value uses the current application default of 4,096 tokens, and an explicit value must be a positive integer. For long DeepSeek reasoning, 32,768 is a suggested setting within the selected model's supported limit. Switching models preserves the saved budget, and existing sessions retain their frozen bindings.
+
+These capabilities belong to current source updates that have not yet been packaged in a new release. The following sections document legacy FSBP syntax and stage conventions for existing records and experimental reproduction.
 
 ## 1. Motivation
 
-Tasks like translation, review, and literary judgment don't have a fixed set of fields. Forcing a model to squeeze its reasoning into a fixed JSON schema conflates two very different success conditions: "does the content make sense" and "does the string comply with the schema." FSBP separates them:
+Early FSBP used free text and a standalone separator to distinguish the deliverable from accompanying notes:
 
 - The Agent's content layer remains free text.
 - System state changes still use tool parameters with a schema.
-- A single minimal delimiter prevents annotations from anchoring subsequent review.
+- Body-only inheritance makes passing annotations downstream an explicit choice.
 
 FSBP is not a general-purpose text parser, nor is it a degraded fallback for JSON. It is a production-grade formal Agent content protocol.
 

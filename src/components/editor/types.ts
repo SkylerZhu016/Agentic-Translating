@@ -25,6 +25,10 @@ export interface ChatMessageView {
   createdAt?: string
   /** 流式进行中（AI 消息追加 delta） */
   streaming?: boolean
+  /** Provider reasoning is a bounded, ephemeral preview, separate from body text. */
+  reasoningPreview?: string
+  reasoningCharacters?: number
+  reasoningTruncated?: boolean
   /** 本轮出错（message_complete.error / 网络失败） */
   error?: string
   /** 本轮发生的工具调用（仅流式期间渲染 badge；历史消息服务端不落 tool_calls） */

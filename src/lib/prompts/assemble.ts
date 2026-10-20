@@ -2,6 +2,13 @@
 // Prompt Assembly — {{var}} interpolation + override priority + stage builder
 // ---------------------------------------------------------------------------
 
+import {
+  SEMANTIC_BOUNDARY_EN,
+  SEMANTIC_BOUNDARY_ZH,
+  STAGE_BOUNDARY_EN,
+  STAGE_BOUNDARY_ZH,
+} from './bidirectional/common'
+
 // ----- Types -----
 
 export interface ChatMessageInput {
@@ -145,6 +152,7 @@ export function resolveTranslatorPrompt(
 export function buildTranslatorPrompt(
   template: string,
   params: TranslatorPromptParams,
+  outputFormat: 'json' | 'legacy' = 'legacy',
 ): { system: ChatMessageInput; user: ChatMessageInput } {
   // Prepare interpolation variables
   // extra_instructions 是可选槽位：缺省置空串，使含 {{extra_instructions}} 的
@@ -174,7 +182,13 @@ export function buildTranslatorPrompt(
     systemParts.push(params.extra_instructions)
   }
   systemParts.push('')
-  systemParts.push('你可以自由输出。如需添加注释/理由，请在正文后用一行 `---`（markdown 水平分割线）分隔，然后写注释。下游审查者只看正文不看注释，注释仅供人类归档参考。')
+  systemParts.push(
+    outputFormat === 'json'
+      ? params.target_lang.toLowerCase().startsWith('en')
+        ? SEMANTIC_BOUNDARY_EN
+        : SEMANTIC_BOUNDARY_ZH
+      : '你可以自由输出。如需添加注释/理由，请在正文后用一行 `---`（markdown 水平分割线）分隔，然后写注释。下游审查者只看正文不看注释，注释仅供人类归档参考。',
+  )
   const system: ChatMessageInput = {
     role: 'system',
     content: systemParts.join('\n'),
@@ -207,15 +221,20 @@ export function buildStagePrompt(
   contextJson: string,
   stageGoal: string,
   promptLanguage: 'zh' | 'en' = 'zh',
+  outputFormat: 'json' | 'legacy' = 'legacy',
 ): { system: ChatMessageInput; user: ChatMessageInput } {
   const system: ChatMessageInput = {
     role: 'system',
     content: [
       stageGoal,
       '',
-      promptLanguage === 'en'
-        ? 'Write freely. If notes are useful, place them after a standalone `---` line. Downstream agents receive only the body before that line; notes remain available to the user.'
-        : '你可以自由输出。如需添加注释/理由，请在正文后用一行 `---`（markdown 水平分割线）分隔，然后写注释。下游审查者只看正文不看注释，注释仅供人类归档参考。',
+      outputFormat === 'json'
+        ? promptLanguage === 'en'
+          ? STAGE_BOUNDARY_EN
+          : STAGE_BOUNDARY_ZH
+        : promptLanguage === 'en'
+          ? 'Write freely. If notes are useful, place them after a standalone `---` line. Downstream agents receive only the body before that line; notes remain available to the user.'
+          : '你可以自由输出。如需添加注释/理由，请在正文后用一行 `---`（markdown 水平分割线）分隔，然后写注释。下游审查者只看正文不看注释，注释仅供人类归档参考。',
     ].join('\n'),
   }
 

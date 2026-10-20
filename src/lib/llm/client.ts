@@ -14,6 +14,8 @@
 
 import { AGENT_MAX_DURATION_MS, AGENT_TIMEOUT_MS } from '../constants';
 import { resolveChatCompletionsUrl } from './endpoint-url';
+import { LeadingThinkFilter } from './reasoning-content';
+import { jsonObjectResponseFormat } from './response-format';
 
 // =============================================================================
 // Error hierarchy
@@ -159,8 +161,12 @@ export interface ChatCompletionRequest {
   maxDurationMs?: number;
   /** Requested visible/reasoning completion budget for compatible providers. */
   maxTokens?: number;
-  /** Heartbeat for response activity, including reasoning chunks that are discarded. */
+  /** Heartbeat for response activity, including independent reasoning chunks. */
   onActivity?: () => void;
+  /** Optional bounded reasoning preview. Never included in visible content. */
+  onReasoning?: (update: ReasoningUpdate) => void;
+  /** Explicit provider compatibility only. Literal content is preserved by default. */
+  reasoningTagMode?: 'leading_think';
   /**
    * Called immediately before the single compatibility retry that omits
    * stream_options. Exceptions are isolated from the provider request.
@@ -210,9 +216,22 @@ export interface ChatCompletionResponse {
   providerDiagnostics?: ProviderDiagnostics;
 }
 
+export type ReasoningSource = 'reasoning_content' | 'thinking' | 'reasoning' | 'think_tag';
+
+/** A bounded tail increment, with full provider counters for this request. */
+export interface ReasoningUpdate {
+  source: ReasoningSource;
+  /** At most 1024 UTF-16 code units from the tail of the current fragment. */
+  delta: string;
+  characters: number;
+  chunks: number;
+  /** True once a fragment has been shortened for this preview channel. */
+  truncated: boolean;
+}
+
 /** Safe shape-only diagnostics. Provider reasoning text is never retained. */
 export interface ProviderDiagnostics {
-  reasoningFields: Array<'reasoning_content' | 'thinking' | 'reasoning'>;
+  reasoningFields: ReasoningSource[];
   reasoningChunks: number;
   reasoningCharacters: number;
 }
@@ -374,6 +393,7 @@ const REASONING_FIELDS: readonly ReasoningField[] = [
   'thinking',
   'reasoning',
 ];
+const MAX_REASONING_DELTA_CHARACTERS = 1024;
 const MAX_SSE_PENDING_CHARACTERS = 8 * 1024 * 1024;
 const MAX_SSE_EVENTS = 100_000;
 const MAX_VISIBLE_CONTENT_CHARACTERS = 8 * 1024 * 1024;
@@ -383,30 +403,79 @@ const MAX_TERMINAL_USAGE_TAIL_EVENTS = 16;
 
 interface MutableProviderDiagnostics {
   reasoningFields: Set<ReasoningField>;
+  reasoningCharactersByField: Map<ReasoningSource, number>;
   reasoningChunks: number;
   reasoningCharacters: number;
+  previewTruncated: boolean;
 }
 
 function createProviderDiagnostics(): MutableProviderDiagnostics {
   return {
     reasoningFields: new Set(),
+    reasoningCharactersByField: new Map(),
     reasoningChunks: 0,
     reasoningCharacters: 0,
+    previewTruncated: false,
   };
+}
+
+function observeReasoningFragment(
+  fragment: string,
+  source: ReasoningSource,
+  diagnostics: MutableProviderDiagnostics,
+  onReasoning?: ChatCompletionRequest['onReasoning'],
+  characterCount = fragment.length,
+): void {
+  if (!characterCount) return;
+  diagnostics.reasoningFields.add(source);
+  diagnostics.reasoningChunks += 1;
+  diagnostics.reasoningCharacters += characterCount;
+  diagnostics.reasoningCharactersByField.set(
+    source,
+    (diagnostics.reasoningCharactersByField.get(source) ?? 0) + characterCount,
+  );
+  const start = Math.max(0, fragment.length - MAX_REASONING_DELTA_CHARACTERS);
+  // Do not start a preview with half of a UTF-16 surrogate pair.
+  const safeStart = start > 0 && /[\uDC00-\uDFFF]/.test(fragment[start])
+    ? start + 1
+    : start;
+  diagnostics.previewTruncated ||= safeStart > 0 || characterCount > fragment.length;
+  if (!onReasoning) return;
+  try {
+    onReasoning({
+      source,
+      delta: fragment.slice(safeStart),
+      characters: diagnostics.reasoningCharacters,
+      chunks: diagnostics.reasoningChunks,
+      truncated: diagnostics.previewTruncated,
+    });
+  } catch {
+    // UI/progress observers must not turn a valid provider response into failure.
+  }
 }
 
 function observeReasoningFields(
   value: unknown,
   diagnostics: MutableProviderDiagnostics,
+  onReasoning?: ChatCompletionRequest['onReasoning'],
+  aggregate = false,
 ): void {
   if (!value || typeof value !== 'object') return;
   const record = value as Record<string, unknown>;
   for (const field of REASONING_FIELDS) {
     const fragment = record[field];
     if (typeof fragment !== 'string' || fragment.length === 0) continue;
-    diagnostics.reasoningFields.add(field);
-    diagnostics.reasoningChunks += 1;
-    diagnostics.reasoningCharacters += fragment.length;
+    // Some gateways repeat the full reasoning in choice.message after deltas.
+    // Account only for the new suffix, using counts rather than retaining text.
+    const observedCharacters = aggregate
+      ? diagnostics.reasoningCharactersByField.get(field) ?? 0
+      : 0;
+    observeReasoningFragment(
+      fragment.slice(observedCharacters),
+      field,
+      diagnostics,
+      onReasoning,
+    );
   }
 }
 
@@ -415,11 +484,48 @@ function snapshotProviderDiagnostics(
 ): ProviderDiagnostics | undefined {
   if (diagnostics.reasoningChunks === 0) return undefined;
   return {
-    reasoningFields: REASONING_FIELDS.filter((field) =>
+    reasoningFields: [...REASONING_FIELDS, 'think_tag' as const].filter((field) =>
       diagnostics.reasoningFields.has(field)),
     reasoningChunks: diagnostics.reasoningChunks,
     reasoningCharacters: diagnostics.reasoningCharacters,
   };
+}
+
+function createReasoningFilter(
+  request: ChatCompletionRequest,
+  diagnostics: MutableProviderDiagnostics,
+): LeadingThinkFilter | undefined {
+  if (request.reasoningTagMode !== 'leading_think') return undefined;
+  return new LeadingThinkFilter((fragment) => {
+    observeReasoningFragment(fragment, 'think_tag', diagnostics, request.onReasoning);
+  });
+}
+
+function finishReasoningFilter(
+  filter: LeadingThinkFilter | undefined,
+  partialContent: string,
+  diagnostics: MutableProviderDiagnostics,
+): string {
+  const result = filter?.finish();
+  if (result?.incomplete) {
+    throw new IncompleteOutputError(
+      'LLM response ended with an incomplete leading <think> block',
+      partialContent,
+      snapshotProviderDiagnostics(diagnostics),
+    );
+  }
+  return result?.content ?? '';
+}
+
+function readMessageContent(
+  message: Record<string, unknown> | undefined,
+  request: ChatCompletionRequest,
+  diagnostics: MutableProviderDiagnostics,
+): string {
+  const rawContent = typeof message?.content === 'string' ? message.content : '';
+  const filter = createReasoningFilter(request, diagnostics);
+  const visible = filter ? filter.push(rawContent) : rawContent;
+  return visible + finishReasoningFilter(filter, visible, diagnostics);
 }
 
 function toolCallsAreComplete(
@@ -621,7 +727,9 @@ async function fetchStreamResponse(
 ): Promise<StreamFetchResult> {
   const fetchOnce = async (includeUsage: boolean): Promise<Response> => {
     const physicalEndpoint = resolvePhysicalEndpoint(endpoint);
-    const response = await fetch(resolveChatCompletionsUrl(physicalEndpoint), {
+    const requestUrl = resolveChatCompletionsUrl(physicalEndpoint);
+    const responseFormat = jsonObjectResponseFormat(requestUrl, request);
+    const response = await fetch(requestUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -633,6 +741,7 @@ async function fetchStreamResponse(
         ...(request.tools ? { tools: request.tools } : {}),
         ...(request.toolChoice ? { tool_choice: request.toolChoice } : {}),
         ...(request.maxTokens ? { max_tokens: request.maxTokens } : {}),
+        ...(responseFormat ? { response_format: responseFormat } : {}),
         stream: true,
         ...(includeUsage
           ? { stream_options: { include_usage: true } }
@@ -780,7 +889,9 @@ async function nonStreamCompletion(
   onActivity: () => void,
 ): Promise<ChatCompletionResponse> {
   const physicalEndpoint = resolvePhysicalEndpoint(endpoint);
-  const response = await fetch(resolveChatCompletionsUrl(physicalEndpoint), {
+  const requestUrl = resolveChatCompletionsUrl(physicalEndpoint);
+  const responseFormat = jsonObjectResponseFormat(requestUrl, request);
+  const response = await fetch(requestUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -792,6 +903,7 @@ async function nonStreamCompletion(
       ...(request.tools ? { tools: request.tools } : {}),
       ...(request.toolChoice ? { tool_choice: request.toolChoice } : {}),
       ...(request.maxTokens ? { max_tokens: request.maxTokens } : {}),
+      ...(responseFormat ? { response_format: responseFormat } : {}),
       stream: false,
     }),
     signal,
@@ -814,9 +926,9 @@ async function nonStreamCompletion(
   const choice = (body.choices as Array<Record<string, unknown>>)?.[0];
   const message = choice?.message as Record<string, unknown> | undefined;
   const mutableDiagnostics = createProviderDiagnostics();
-  observeReasoningFields(message, mutableDiagnostics);
+  observeReasoningFields(message, mutableDiagnostics, request.onReasoning);
+  const content = readMessageContent(message, request, mutableDiagnostics);
   const providerDiagnostics = snapshotProviderDiagnostics(mutableDiagnostics);
-  const content = (message?.content as string) ?? '';
 
   const toolCalls = extractJsonResponseToolCalls(
     message,
@@ -893,9 +1005,9 @@ async function* streamCompletion(
     const choice = (body.choices as Array<Record<string, unknown>>)?.[0];
     const message = choice?.message as Record<string, unknown> | undefined;
     const mutableDiagnostics = createProviderDiagnostics();
-    observeReasoningFields(message, mutableDiagnostics);
+    observeReasoningFields(message, mutableDiagnostics, request.onReasoning);
+    const content = readMessageContent(message, request, mutableDiagnostics);
     const providerDiagnostics = snapshotProviderDiagnostics(mutableDiagnostics);
-    const content = (message?.content as string) ?? '';
 
     // Extract usage
     const usage = parseCompletionUsage(body.usage);
@@ -969,6 +1081,7 @@ async function* streamCompletion(
   let completedNaturally = false;
   let accumulatedUsage: CompletionUsage | undefined;
   const mutableDiagnostics = createProviderDiagnostics();
+  let reasoningFilter = createReasoningFilter(request, mutableDiagnostics);
   const toolCallAccumulator = new Map<
     number,
     { id: string; name: string; argumentsFragments: string[] }
@@ -1103,6 +1216,12 @@ async function* streamCompletion(
       : undefined
   );
   const completionSnapshot = () => {
+    const trailingContent = finishReasoningFilter(
+      reasoningFilter,
+      content(),
+      mutableDiagnostics,
+    );
+    if (trailingContent) appendVisibleContent(trailingContent);
     const finalContent = content();
     const providerDiagnostics = diagnostics();
     const toolCalls = finalToolCalls();
@@ -1321,13 +1440,18 @@ async function* streamCompletion(
         const hasDeltaObject = Boolean(
           deltaObj && typeof deltaObj === 'object' && !Array.isArray(deltaObj),
         );
-        observeReasoningFields(deltaObj, mutableDiagnostics);
-        observeReasoningFields(aggregateMessage, mutableDiagnostics);
+        observeReasoningFields(deltaObj, mutableDiagnostics, request.onReasoning);
+        observeReasoningFields(aggregateMessage, mutableDiagnostics, request.onReasoning, true);
 
         // ---- Text delta ----
         if (typeof deltaObj?.content === 'string' && deltaObj.content.length > 0) {
-          appendVisibleContent(deltaObj.content);
-          yield { type: 'text', content: deltaObj.content };
+          const visible = reasoningFilter
+            ? reasoningFilter.push(deltaObj.content)
+            : deltaObj.content;
+          if (visible) {
+            appendVisibleContent(visible);
+            yield { type: 'text', content: visible };
+          }
         }
 
         // ---- Aggregate message ----
@@ -1336,7 +1460,44 @@ async function* streamCompletion(
           typeof aggregateMessage?.content === 'string' &&
           aggregateMessage.content.length > 0
         ) {
-          const suffix = reconcileAggregateContent(aggregateMessage.content);
+          // An aggregate message is a complete response snapshot. Validate its
+          // leading wrapper independently, without counting streamed reasoning
+          // a second time when the provider repeats it in that snapshot.
+          const aggregateDiagnostics = createProviderDiagnostics();
+          const aggregateReasoning: { update?: ReasoningUpdate } = {};
+          const aggregateRequest: ChatCompletionRequest = {
+            ...request,
+            onReasoning: (update) => { aggregateReasoning.update = update; },
+          };
+          const aggregateFilter = createReasoningFilter(
+            aggregateRequest,
+            aggregateDiagnostics,
+          );
+          const aggregateContent = aggregateFilter
+            ? aggregateFilter.push(aggregateMessage.content)
+            : aggregateMessage.content;
+          const trailingContent = finishReasoningFilter(
+            aggregateFilter,
+            aggregateContent,
+            aggregateDiagnostics,
+          );
+          const suffix = reconcileAggregateContent(aggregateContent + trailingContent);
+          if (aggregateReasoning.update) {
+            const addedCharacters = aggregateReasoning.update.characters -
+              (mutableDiagnostics.reasoningCharactersByField.get('think_tag') ?? 0);
+            if (addedCharacters > 0) {
+              observeReasoningFragment(
+                aggregateReasoning.update.delta.slice(-addedCharacters),
+                'think_tag',
+                mutableDiagnostics,
+                request.onReasoning,
+                addedCharacters,
+              );
+            }
+          }
+          // A validated full snapshot also resolves any partial tag boundary
+          // held by the incremental filter.
+          reasoningFilter = aggregateFilter;
           if (suffix) yield { type: 'text', content: suffix };
           hasAggregateEvidence = true;
         }

@@ -14,6 +14,7 @@
 
 import { isAsyncIterable, ToolsNotSupportedError } from '../llm/client';
 import type { ChatCompletionRequest, ChatCompletionResponse, LLMStreamEvent } from '../llm/client';
+import { createReasoningPreview, type ReasoningPreview } from '../llm/reasoning-preview';
 import { applyExactReplacementBatch, type Edit } from '../editing/replace';
 import { CHAT_TOOLS } from './tools';
 import { executeProgrammaticTool } from './program-tools';
@@ -41,6 +42,8 @@ export interface ChatCallbacks {
   onActivity?: () => void;
   /** Called for each text delta during streaming */
   onDelta?: (text: string) => void;
+  /** Ephemeral bounded provider reasoning preview, never included in chat history. */
+  onReasoning?: (preview: ReasoningPreview) => void;
   /** Called when the model invokes a replace_text tool */
   onToolCall?: (name: string, args: Record<string, unknown>) => void;
   /** Called with the result of applying tool calls */
@@ -345,6 +348,7 @@ async function callWithTools(
   maxTokens?: number,
   signal?: AbortSignal,
   ledgerContext?: BestEffortLlmCallContext,
+  onReasoning?: ChatCompletionRequest['onReasoning'],
 ): Promise<CollectedStreamResult> {
   const request: ChatCompletionRequest = {
     model,
@@ -353,6 +357,7 @@ async function callWithTools(
     maxTokens,
     stream,
     onActivity,
+    onReasoning,
     signal,
   };
 
@@ -373,6 +378,7 @@ async function callJsonFence(
   maxTokens?: number,
   signal?: AbortSignal,
   ledgerContext?: BestEffortLlmCallContext,
+  onReasoning?: ChatCompletionRequest['onReasoning'],
 ): Promise<CollectedStreamResult> {
   const request: ChatCompletionRequest = {
     model,
@@ -380,6 +386,7 @@ async function callJsonFence(
     maxTokens,
     stream: false, // Non-streaming for easier JSON parsing
     onActivity,
+    onReasoning,
     signal,
   };
 
@@ -502,6 +509,7 @@ export async function runChatTurn(
   let fallbackSystemInjected = false;
   let editCorrectionAttempts = 0;
   let physicalRequestCount = 0;
+  let completedReasoningCharacters = 0;
 
   const nextPhysicalRequest = (
     requestMessages: RunChatTurnParams['messages'],
@@ -525,6 +533,15 @@ export async function runChatTurn(
 
   for (let iteration = 0; iteration < CHAT_LOOP_MAX; iteration++) {
     let collected: CollectedStreamResult;
+    // Provider counters restart for every physical request. Keep turn-wide
+    // counters while retaining only the latest request's bounded preview.
+    const reasoning = createReasoningPreview((preview) => {
+      callbacks?.onReasoning?.({
+        ...preview,
+        reasoningCharacters: completedReasoningCharacters + preview.reasoningCharacters,
+        reasoningTruncated: preview.reasoningTruncated || completedReasoningCharacters > 0,
+      });
+    });
 
     // ---------------------------------------------------------------
     // Step 1: Call the LLM (native tools or JSON fence fallback)
@@ -558,6 +575,7 @@ export async function runChatTurn(
           maxTokens,
           params.signal,
           nextPhysicalRequest(messages),
+          reasoning.push,
         );
       } else {
         // Native tools protocol
@@ -572,6 +590,7 @@ export async function runChatTurn(
           maxTokens,
           params.signal,
           nextPhysicalRequest(messages, tools),
+          reasoning.push,
         );
       }
     } catch (error: unknown) {
@@ -587,6 +606,9 @@ export async function runChatTurn(
       }
       // Other errors: propagate
       throw error;
+    } finally {
+      reasoning.dispose();
+      completedReasoningCharacters += reasoning.getSnapshot().reasoningCharacters;
     }
 
     const { content, toolCalls } = collected;

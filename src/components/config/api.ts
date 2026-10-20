@@ -109,7 +109,7 @@ export interface CoordinatorPutPayload {
 
 export const configApi = {
   // ── 端点 ────────────────────────────────────────────────
-  listEndpoints: () => request<Endpoint[]>('/api/endpoints'),
+  listEndpoints: (signal?: AbortSignal) => request<Endpoint[]>('/api/endpoints', { signal }),
   createEndpoint: (data: {
     name: string
     base_url: string
@@ -130,7 +130,7 @@ export const configApi = {
     }),
 
   // ── 翻译 Agent ──────────────────────────────────────────
-  listAgents: () => request<Agent[]>('/api/agents'),
+  listAgents: (signal?: AbortSignal) => request<Agent[]>('/api/agents', { signal }),
   createAgent: (data: {
     name: string
     endpoint_id: number

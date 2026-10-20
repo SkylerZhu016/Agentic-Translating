@@ -74,6 +74,31 @@ function cjkText(count: number): string {
 // =============================================================================
 
 describe('buildStageContext', () => {
+  it('keeps legacy JSON-shaped prose and inherits only valid completed marked stage bodies', () => {
+    const literal = '{"body":"This whole object is prose","annotation":"Literal content"}'
+    const result = buildStageContext('assemble', {
+      sourceText: 'Source',
+      sourceLang: 'en',
+      targetLang: 'zh',
+      translations: [trans({ output_text: literal })],
+      priorStages: [
+        stageOut({ stage: 'review', raw_output: literal, prompt_used: 'Frozen free-form prompt' }),
+        stageOut({
+          stage: 'filter', raw_output: '{"body":"Selected evidence","annotation":"Human note"}',
+          prompt_used: '[protocol:json-v1]',
+        }),
+        stageOut({
+          stage: 'orchestrate', status: 'failed', raw_output: '{"body":"Untrusted","annotation":null}',
+          prompt_used: '[protocol:json-v1]',
+        }),
+      ],
+    })
+    expect(result.json.translations[0].text).toBe(literal)
+    expect(result.json.prior_stages.review?.body).toBe(literal)
+    expect(result.json.prior_stages.filter?.body).toBe('Selected evidence')
+    expect(result.json.prior_stages.orchestrate).toBeUndefined()
+  })
+
   it('should produce correct JSON shape with no truncation', () => {
     const result = buildStageContext('orchestrate', {
       sourceText: 'Hello world',

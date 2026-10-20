@@ -23,21 +23,25 @@ import {
 import { randomBytes } from 'crypto'
 import { createRequire } from 'module'
 import path from 'path'
-import JSZip from 'jszip'
 import {
   createElectronTranslator,
   normalizeElectronLocale,
 } from './i18n.mjs'
 import {
   assertPortAvailable,
+  assertRuntimeAssets,
   createServerEnvironment,
   DESKTOP_PORT,
   DesktopRuntimeError,
   resolveDesktopRuntime,
-  serverEntryFor,
   stopManagedServer,
   waitForManagedServer,
 } from './runtime.mjs'
+import {
+  createWindowCloseHandler,
+  prepareRendererForClose,
+  readRunningWork,
+} from './window-lifecycle.mjs'
 
 let mainWindow = null
 let serverProcess = null
@@ -285,16 +289,7 @@ async function startServer() {
     resourcesPath: process.resourcesPath,
     electronExecutable: process.execPath,
   })
-  const serverFile = serverEntryFor(runtime)
-  if (!existsSync(serverFile)) {
-    if (runtime.kind === 'preview') {
-      throw new DesktopRuntimeError('preview_missing', serverFile, { serverFile })
-    }
-    throw new DesktopRuntimeError('server_missing', serverFile, {
-      serverFile,
-      runtime: runtime.kind,
-    })
-  }
+  assertRuntimeAssets(runtime)
   const userData = app.getPath('userData')
   const logs = path.join(userData, 'logs')
   mkdirSync(logs, { recursive: true })
@@ -312,6 +307,9 @@ async function startServer() {
     }
     throw error
   }
+  // A close request can arrive while the asynchronous port probe is pending.
+  // Do not create a service after Electron has already committed to quitting.
+  if (allowQuit) return
   serverLogStream = createWriteStream(logFile, {
     flags: 'a',
   })
@@ -395,20 +393,10 @@ async function stopServer() {
 }
 
 async function hasRunningWork() {
-  try {
-    const [batches, sessions] = await Promise.all([
-      fetch(`http://127.0.0.1:${port}/api/batches`).then((response) => response.json()),
-      fetch(`http://127.0.0.1:${port}/api/sessions?limit=100`).then((response) => response.json()),
-    ])
-    return (
-      batches.some((batch) => batch.status === 'running') ||
-      sessions.sessions.some((session) =>
-        ['translating', 'coordinating'].includes(session.state),
-      )
-    )
-  } catch {
-    return false
-  }
+  if (!serverProcess) return false
+  return readRunningWork({
+    url: `http://127.0.0.1:${port}/api/desktop/activity`,
+  })
 }
 
 function updateTrayMenu() {
@@ -423,8 +411,12 @@ function updateTrayMenu() {
       {
         label: et('tray.exit'),
         click: () => {
-          allowQuit = true
-          app.quit()
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.show()
+            mainWindow.close()
+          } else {
+            app.quit()
+          }
         },
       },
     ]),
@@ -458,6 +450,60 @@ async function createWindow() {
       sandbox: true,
     },
   })
+  mainWindow.webContents.on('will-prevent-unload', (event) => {
+    // Electron's preventDefault here permits unloading. Only override the
+    // renderer after a successful save or an explicit discard choice.
+    if (allowQuit) event.preventDefault()
+  })
+  mainWindow.on('close', createWindowCloseHandler({
+    canQuit: () => allowQuit,
+    hasRunningWork,
+    prepareToQuit: () => {
+      const contents = mainWindow.webContents
+      // The initial loading document has no editable draft or save handler.
+      if (!contents.getURL().startsWith(`http://127.0.0.1:${port}/`)) {
+        return Promise.resolve()
+      }
+      return prepareRendererForClose(contents, ipcMain)
+    },
+    onPreparationFailed: async () => {
+      mainWindow.show()
+      const result = await dialog.showMessageBox(mainWindow, {
+        type: 'warning',
+        title: et('close.saveFailed.title'),
+        message: et('close.saveFailed.message'),
+        detail: et('close.saveFailed.detail'),
+        buttons: [et('button.returnToWorkspace'), et('button.exitWithoutSaving')],
+        defaultId: 0,
+        cancelId: 0,
+      })
+      return result.response === 1
+    },
+    chooseAction: async (activity) => {
+      const result = await dialog.showMessageBox(mainWindow, {
+        type: 'warning',
+        title: et(activity === 'unknown' ? 'running.unknownTitle' : 'running.title'),
+        message: et(activity === 'unknown' ? 'running.unknownMessage' : 'running.message'),
+        detail: et('running.detail'),
+        buttons: [
+          et('button.minimize'),
+          et('button.cancel'),
+          et('button.exitApp'),
+        ],
+        defaultId: activity === 'unknown' ? 1 : 0,
+        cancelId: 1,
+      })
+      return result.response === 0 ? 'hide' : result.response === 2 ? 'quit' : 'cancel'
+    },
+    hide: () => {
+      ensureTray()
+      mainWindow.hide()
+    },
+    quit: () => {
+      allowQuit = true
+      app.quit()
+    },
+  }))
   await mainWindow.loadURL(
     `data:text/html;charset=utf-8,${encodeURIComponent(`
       <!doctype html>
@@ -477,31 +523,9 @@ async function createWindow() {
       </html>
     `)}`,
   )
+  if (allowQuit) return
   await startServer()
-  mainWindow.on('close', async (event) => {
-    if (allowQuit || !(await hasRunningWork())) return
-    event.preventDefault()
-    const result = await dialog.showMessageBox(mainWindow, {
-      type: 'warning',
-      title: et('running.title'),
-      message: et('running.message'),
-      detail: et('running.detail'),
-      buttons: [
-        et('button.minimize'),
-        et('button.cancel'),
-        et('button.exitApp'),
-      ],
-      defaultId: 0,
-      cancelId: 1,
-    })
-    if (result.response === 0) {
-      ensureTray()
-      mainWindow.hide()
-    } else if (result.response === 2) {
-      allowQuit = true
-      app.quit()
-    }
-  })
+  if (allowQuit || mainWindow.isDestroyed()) return
   await mainWindow.loadURL(`http://127.0.0.1:${port}`)
 }
 
@@ -571,6 +595,7 @@ ipcMain.handle('agentic:export-batch', async (_event, batchId, includeAudit) => 
     `${safeOutputName(detail.batch.name)}-${stamp}`,
   )
   mkdirSync(outputDirectory, { recursive: false })
+  const { default: JSZip } = await import('jszip')
   const zip = await JSZip.loadAsync(await archiveResponse.arrayBuffer())
   for (const [entryName, entry] of Object.entries(zip.files)) {
     if (entry.dir) continue
@@ -606,14 +631,21 @@ app.whenReady().then(() => {
   et = createElectronTranslator(electronLocale)
   return createWindow()
 }).catch((error) => {
+  if (allowQuit) return
   dialog.showErrorBox(
     et('startup.failed'),
     startupErrorMessage(error),
   )
+  allowQuit = true
   app.quit()
 })
 
 app.on('before-quit', (event) => {
+  if (!allowQuit && mainWindow && !mainWindow.isDestroyed()) {
+    event.preventDefault()
+    mainWindow.close()
+    return
+  }
   allowQuit = true
   if (!serverProcess || serverShutdownComplete) return
   event.preventDefault()

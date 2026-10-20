@@ -40,6 +40,12 @@ import {
   DEFAULT_POETRY_CONSTRAINTS,
   hasMeaningfulDraft,
 } from './workspace-draft-state'
+import {
+  registerWorkspaceDraftGuard,
+  recoverDetachedWorkspaceDraft,
+  waitForDetachedWorkspaceDrafts,
+  type WorkspaceDraftRecovery,
+} from './workspace-draft-lifecycle'
 
 export interface TranslatePanelProps {
   className?: string
@@ -161,17 +167,24 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
   const [draftLoadError, setDraftLoadError] = useState<string | null>(null)
   const [draftLoadRevision, setDraftLoadRevision] = useState(0)
   const [draftSaveError, setDraftSaveError] = useState<string | null>(null)
+  const [persistedDraftKey, setPersistedDraftKey] = useState<string | null>(null)
+  const [savingDraftKey, setSavingDraftKey] = useState<string | null>(null)
   const [presetLookupError, setPresetLookupError] = useState<string | null>(null)
   const [presetSelectionBusy, setPresetSelectionBusy] = useState(false)
   const [draftResolutionBusy, setDraftResolutionBusy] = useState(false)
+  const [draftNavigationBusy, setDraftNavigationBusy] = useState(false)
   const [submitPreparing, setSubmitPreparing] = useState(false)
   const [retryAllOpen, setRetryAllOpen] = useState(false)
   const [timelineOpen, setTimelineOpen] = useState(false)
   const pendingDraftSavesRef = useRef<Set<Promise<void>>>(new Set())
+  const draftRequestsRef = useRef<Map<string, Promise<void>>>(new Map())
+  const lastQueuedDraftKeyRef = useRef<string | null>(null)
+  const savedDraftsRef = useRef<Map<string, string>>(new Map())
   const draftSaveQueueRef = useRef<Promise<void>>(Promise.resolve())
   const draftSaveTimerRef = useRef<number | null>(null)
   const submitPreparingRef = useRef(false)
   const draftResolutionBusyRef = useRef(false)
+  const draftNavigationBusyRef = useRef(false)
   const presetSelectionBusyRef = useRef(false)
   const presetLookupErrorRef = useRef<string | null>(null)
   const presetLookupTokenRef = useRef(0)
@@ -186,13 +199,35 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
   const routeSessionId = searchParams.get('session')
   const freshWorkspace = searchParams.get('fresh') === '1' && !routeSessionId
   const draftInteractionLocked =
-    busy || restoredSession || submitPreparing || draftResolutionBusy
+    busy || restoredSession || submitPreparing || draftResolutionBusy ||
+    draftNavigationBusy || recoverableDraft != null
+  const draftBody = useMemo(() => JSON.stringify({
+    sourceText: source,
+    taskBrief,
+    selectedProjectId,
+    selectedPresetRevisionId,
+    promptBundleRevisionId,
+    allowedAgentVariantIds,
+    reviewMode,
+    mainEditorRunMode,
+    constraints,
+  }), [
+    source, taskBrief, selectedProjectId, selectedPresetRevisionId,
+    promptBundleRevisionId, allowedAgentVariantIds, reviewMode,
+    mainEditorRunMode, constraints,
+  ])
+  const draftKey = `${direction}:${draftBody}`
 
   useEffect(() => {
     if (!routeSessionId) return
     return onSessionChanged((detail) => {
       if (!detail.sessionId || detail.sessionId === routeSessionId) {
-        void restoreSession(routeSessionId)
+        void restoreSession(routeSessionId).catch((error: unknown) => {
+          if (error instanceof Error && error.name === 'AbortError') return
+          setDraftLoadError(
+            error instanceof Error ? error.message : 'workspace_draft_load_failed',
+          )
+        })
       }
     })
   }, [restoreSession, routeSessionId])
@@ -202,12 +237,22 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     const presetLookupToken = ++presetLookupTokenRef.current
     setDraftLoaded(false)
     setDraftLoadError(null)
+    setDraftSaveError(null)
+    setPersistedDraftKey(null)
+    setSavingDraftKey(null)
     updatePresetLookupError(null)
     presetSelectionBusyRef.current = false
     setPresetSelectionBusy(false)
     setRecoverableDraft(null)
     const activeSessionId = routeSessionId
-    void Promise.all([
+    let detachedRecovery: Awaited<ReturnType<typeof recoverDetachedWorkspaceDraft>> = null
+    void (
+      activeSessionId
+        ? waitForDetachedWorkspaceDrafts().catch(() => undefined)
+        : recoverDetachedWorkspaceDraft(direction).then((recovery) => { detachedRecovery = recovery })
+    ).then(() => {
+      if (cancelled) throw new DOMException('Workspace load cancelled', 'AbortError')
+      return Promise.all([
       activeSessionId
         ? restoreSession(activeSessionId)
         : fetch(`/api/workspace-drafts/${direction}`).then((response) => {
@@ -240,7 +285,8 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
             ? response.json() as Promise<{ projects: TranslationProject[] }>
             : { projects: [] },
       ),
-    ]).then(([
+      ])
+    }).then(([
       draftOrSession,
       catalogue,
       presetList,
@@ -262,15 +308,38 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
           : null
       const hasSavedDraft = hasMeaningfulDraft(savedDraft, variants)
       setRecoverableDraft(
-        freshWorkspace && hasSavedDraft ? savedDraft : null,
+        detachedRecovery
+          ? detachedRecovery.recoverableDraft
+          : freshWorkspace && hasSavedDraft ? savedDraft : null,
       )
       const visibleState =
-        freshWorkspace && !activeSessionId
+        detachedRecovery?.draft ?? (freshWorkspace && !activeSessionId
           ? null
           : (draftOrSession as
               | WorkspaceDraft
               | RestoredTranslationState
-              | null)
+              | null))
+      if (!activeSessionId && !freshWorkspace && !detachedRecovery) {
+        const initialBody = JSON.stringify({
+          sourceText: visibleState?.sourceText ?? '',
+          taskBrief: visibleState?.taskBrief ?? '',
+          selectedProjectId: visibleState?.selectedProjectId ?? null,
+          selectedPresetRevisionId:
+            visibleState && 'selectedPresetRevisionId' in visibleState
+              ? visibleState.selectedPresetRevisionId : null,
+          promptBundleRevisionId:
+            visibleState && 'promptBundleRevisionId' in visibleState
+              ? visibleState.promptBundleRevisionId ?? null : null,
+          allowedAgentVariantIds:
+            savedDraft?.allowedAgentVariantIds.length
+              ? savedDraft.allowedAgentVariantIds : variants.map((variant) => variant.id),
+          reviewMode: visibleState?.reviewMode ?? 'main_editor',
+          mainEditorRunMode: visibleState?.mainEditorRunMode ?? 'fixed_pipeline',
+          constraints: { ...DEFAULT_POETRY_CONSTRAINTS, ...(visibleState?.constraints ?? {}) },
+        })
+        savedDraftsRef.current.set(direction, initialBody)
+        setPersistedDraftKey(`${direction}:${initialBody}`)
+      }
       setSource(visibleState?.sourceText ?? '')
       setTaskBrief(visibleState?.taskBrief ?? '')
       setSelectedProjectId(visibleState?.selectedProjectId ?? null)
@@ -301,6 +370,9 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
           : null,
       )
       setSelectedPresetId('')
+      if (detachedRecovery?.presetLookupError) {
+        updatePresetLookupError(detachedRecovery.presetLookupError)
+      }
       const draftRevisionId =
         visibleState && 'selectedPresetRevisionId' in visibleState
           ? (visibleState as WorkspaceDraft).selectedPresetRevisionId
@@ -332,8 +404,10 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
       setRestoredSession(Boolean(activeSessionId))
       setDraftLoadError(null)
       setDraftLoaded(true)
+      detachedRecovery?.release()
     }).catch((error: unknown) => {
       if (cancelled) return
+      if (error instanceof Error && error.name === 'AbortError') return
       setDraftLoadError(
         error instanceof Error ? error.message : 'workspace_draft_load_failed',
       )
@@ -495,28 +569,25 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     ) return
     const ignoredDraft = recoverableDraft
     const ignoredDirection = direction
+    const ignoredDraftKey = `${direction}:${draftBody}`
     draftResolutionBusyRef.current = true
     setDraftResolutionBusy(true)
+    setSavingDraftKey(ignoredDraftKey)
+    lastQueuedDraftKeyRef.current = ignoredDraftKey
     const request = draftSaveQueueRef.current.catch(() => undefined).then(async () => {
       const response = await fetch(`/api/workspace-drafts/${direction}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sourceText: source,
-          taskBrief,
-          selectedProjectId,
-          selectedPresetRevisionId,
-          promptBundleRevisionId,
-          allowedAgentVariantIds,
-          reviewMode,
-          mainEditorRunMode,
-          constraints,
-        }),
+        body: draftBody,
       })
       if (!response.ok) {
         throw new Error(`workspace_draft_discard_failed:${response.status}`)
       }
-      setDraftSaveError(null)
+      savedDraftsRef.current.set(ignoredDirection, draftBody)
+      if (directionRef.current === ignoredDirection) {
+        setPersistedDraftKey(ignoredDraftKey)
+        setDraftSaveError(null)
+      }
     })
     draftSaveQueueRef.current = request
     pendingDraftSavesRef.current.add(request)
@@ -535,12 +606,15 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
       setRecoverableDraft(null)
       removeFreshMarker()
     } catch (error: unknown) {
-      setDraftSaveError(
-        error instanceof Error
-          ? error.message
-          : 'workspace_draft_discard_failed',
-      )
+      if (directionRef.current === ignoredDirection) {
+        setDraftSaveError(
+          error instanceof Error
+            ? error.message
+            : 'workspace_draft_discard_failed',
+        )
+      }
     } finally {
+      setSavingDraftKey((current) => current === ignoredDraftKey ? null : current)
       draftResolutionBusyRef.current = false
       setDraftResolutionBusy(false)
     }
@@ -548,6 +622,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     allowedAgentVariantIds,
     constraints,
     direction,
+    draftBody,
     draftResolutionBusy,
     mainEditorRunMode,
     promptBundleRevisionId,
@@ -581,17 +656,14 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     ) {
       return Promise.resolve()
     }
-    const body = JSON.stringify({
-      sourceText: source,
-      taskBrief,
-      selectedProjectId,
-      selectedPresetRevisionId,
-      promptBundleRevisionId,
-      allowedAgentVariantIds,
-      reviewMode,
-      mainEditorRunMode,
-      constraints,
-    })
+    const body = draftBody
+    const key = `${direction}:${body}`
+    if (savedDraftsRef.current.get(direction) === body &&
+      pendingDraftSavesRef.current.size === 0) return Promise.resolve()
+    const existingRequest = draftRequestsRef.current.get(key)
+    if (existingRequest && lastQueuedDraftKeyRef.current === key) return existingRequest
+    lastQueuedDraftKeyRef.current = key
+    setSavingDraftKey(key)
     const request = draftSaveQueueRef.current.catch(() => undefined).then(
       async () => {
         const response = await fetch(`/api/workspace-drafts/${direction}`, {
@@ -602,15 +674,23 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
         if (!response.ok) {
           throw new Error(`workspace_draft_save_failed:${response.status}`)
         }
-        setDraftSaveError(null)
+        savedDraftsRef.current.set(direction, body)
+        if (directionRef.current === direction) {
+          setPersistedDraftKey(key)
+          setDraftSaveError(null)
+        }
       },
     ).catch((error: unknown) => {
       const message = error instanceof Error
         ? error.message
         : 'workspace_draft_save_failed'
-      setDraftSaveError(message)
+      if (directionRef.current === direction) setDraftSaveError(message)
       throw error
+    }).finally(() => {
+      if (draftRequestsRef.current.get(key) === request) draftRequestsRef.current.delete(key)
+      setSavingDraftKey((current) => current === key ? null : current)
     })
+    draftRequestsRef.current.set(key, request)
     draftSaveQueueRef.current = request
     pendingDraftSavesRef.current.add(request)
     void request.then(
@@ -622,6 +702,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     allowedAgentVariantIds,
     busy,
     direction,
+    draftBody,
     draftLoadError,
     draftLoaded,
     promptBundleRevisionId,
@@ -637,6 +718,77 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     source,
     taskBrief,
   ])
+
+  const flushBeforeLeave = useCallback(async () => {
+    draftNavigationBusyRef.current = true
+    setDraftNavigationBusy(true)
+    if (draftSaveTimerRef.current != null) {
+      window.clearTimeout(draftSaveTimerRef.current)
+      draftSaveTimerRef.current = null
+    }
+    try {
+      if (presetSelectionBusyRef.current || draftResolutionBusyRef.current ||
+        submitPreparingRef.current) {
+        throw new Error(t('translate.draft.leaveBusy'))
+      }
+      if (presetLookupErrorRef.current) {
+        throw new Error(t('translate.draft.presetLookupFailed'))
+      }
+      if (recoverableDraftRef.current) {
+        throw new Error(t('translate.draft.resolveBeforeLeave'))
+      }
+      await Promise.all([...pendingDraftSavesRef.current])
+      await flushDraft()
+    } catch (error: unknown) {
+      setDraftSaveError(
+        error instanceof Error ? error.message : 'workspace_draft_save_failed',
+      )
+      throw error
+    } finally {
+      draftNavigationBusyRef.current = false
+      setDraftNavigationBusy(false)
+    }
+  }, [flushDraft, t])
+
+  const draftGuardRef = useRef<{
+    hasUnsavedChanges: () => boolean
+    flush: () => Promise<void>
+    recovery: () => WorkspaceDraftRecovery
+  }>({
+    hasUnsavedChanges: () => false,
+    flush: async () => {},
+    recovery: () => ({
+      draft: {} as WorkspaceDraft,
+      recoverableDraft: null as WorkspaceDraft | null,
+      presetLookupError: null as string | null,
+    }),
+  })
+  draftGuardRef.current = {
+    hasUnsavedChanges: () => {
+      if (pendingDraftSavesRef.current.size > 0) return true
+      if (presetLookupErrorRef.current || presetSelectionBusyRef.current) return true
+      if (!draftLoaded || draftLoadError || restoredSession) return false
+      if (recoverableDraftRef.current) {
+        return hasMeaningfulDraft({
+          sourceText: source, taskBrief, selectedProjectId, selectedPresetRevisionId,
+          allowedAgentVariantIds, reviewMode, mainEditorRunMode, promptBundleRevisionId,
+          constraints,
+        }, catalog)
+      }
+      return savedDraftsRef.current.get(direction) !== draftBody
+    },
+    flush: flushBeforeLeave,
+    recovery: () => ({
+      draft: { ...JSON.parse(draftBody), direction, updatedAt: new Date().toISOString() } as WorkspaceDraft,
+      recoverableDraft: recoverableDraftRef.current,
+      presetLookupError: presetLookupErrorRef.current,
+    }),
+  }
+  useEffect(() => registerWorkspaceDraftGuard({
+    hasUnsavedChanges: () => draftGuardRef.current.hasUnsavedChanges(),
+    flush: () => draftGuardRef.current.flush(),
+    recovery: () => draftGuardRef.current.recovery(),
+  }), [])
 
   useEffect(() => {
     const currentDraft = {
@@ -654,10 +806,19 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
       dirty:
         !restoredSession &&
         hasMeaningfulDraft(currentDraft, catalog),
-      flush: flushDraft,
+      flush: async () => {
+        if (draftGuardRef.current.hasUnsavedChanges()) {
+          await draftGuardRef.current.flush()
+          if (draftGuardRef.current.hasUnsavedChanges()) {
+            throw new Error(t('translate.draft.leaveBusy'))
+          }
+        }
+      },
       isInteractionLocked: () =>
         submitPreparingRef.current ||
         draftResolutionBusyRef.current ||
+        draftNavigationBusyRef.current ||
+        recoverableDraftRef.current != null ||
         presetSelectionBusyRef.current ||
         presetLookupErrorRef.current != null,
     })
@@ -665,7 +826,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
   }, [
     allowedAgentVariantIds,
     catalog,
-    flushDraft,
+    flushBeforeLeave,
     registerDraftController,
     promptBundleRevisionId,
     restoredSession,
@@ -676,6 +837,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     selectedPresetRevisionId,
     source,
     taskBrief,
+    t,
   ])
 
   useEffect(() => {
@@ -685,6 +847,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
       restoredSession ||
       submitPreparing ||
       draftResolutionBusy ||
+      draftNavigationBusy ||
       presetSelectionBusy
     ) return
     const timer = window.setTimeout(() => {
@@ -708,6 +871,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
     reviewMode,
     mainEditorRunMode,
     draftResolutionBusy,
+    draftNavigationBusy,
     restoredSession,
     source,
     submitPreparing,
@@ -776,6 +940,10 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
         promptBundleRevisionId,
         projectId: selectedProjectId,
       })
+    } catch (error: unknown) {
+      setDraftSaveError(
+        error instanceof Error ? error.message : 'workspace_draft_save_failed',
+      )
     } finally {
       submitPreparingRef.current = false
       setSubmitPreparing(false)
@@ -941,11 +1109,11 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
   if (configStatus === 'unconfigured') {
     return (
       <Card overline={t('translate.setup.overline')} title={t('translate.setup.title')} className={className}>
-        <div className="flex min-h-56 flex-col items-center justify-center gap-3 text-center">
-          <p className="max-w-md text-sm leading-6 text-ink-3">
+        <div className="flex flex-col items-start justify-between gap-4 py-1 sm:flex-row sm:items-center">
+          <p className="max-w-2xl text-sm leading-6 text-ink-3">
             {t('translate.setup.description')}
           </p>
-          <Button href="/config#compatibility-doctor" className="mt-2">
+          <Button href="/config#compatibility-doctor" className="shrink-0">
             {t('translate.setup.open')}
           </Button>
         </div>
@@ -1035,15 +1203,75 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
           />
         </div>
       )}
-      <Textarea
-        testId={TID.translate.sourceInput}
-        rows={9}
-        value={source}
-        onChange={(e) => setSource(e.target.value)}
-        disabled={draftInteractionLocked}
-        placeholder={t('translate.source.placeholder')}
-        aria-label={t('translate.source.aria')}
-      />
+      <div
+        className="grid min-w-0 items-start gap-4 lg:grid-cols-[minmax(0,1.8fr)_minmax(260px,1fr)]"
+        onKeyDown={(event) => {
+          if ((event.ctrlKey || event.metaKey) && event.key === 'Enter' && canSubmit) {
+            event.preventDefault()
+            void handleTranslate()
+          }
+        }}
+      >
+        <div className="min-w-0">
+          <Textarea
+            testId={TID.translate.sourceInput}
+            rows={10}
+            value={source}
+            onChange={(e) => setSource(e.target.value)}
+            disabled={draftInteractionLocked}
+            placeholder={t('translate.source.placeholder')}
+            aria-label={t('translate.source.aria')}
+            className="min-h-64 resize-y text-base leading-7"
+          />
+          <div className="mt-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-xs text-ink-4">
+            <p className="tabular-nums">
+              {t('translate.counts', {
+                characters: formatNumber(charCount),
+                tokens: formatNumber(tokenCount),
+              })}
+            </p>
+            {!restoredSession && !recoverableDraft && (source.length > 0 || taskBrief.length > 0) && (
+              <span role="status" aria-live="polite" className={draftSaveError ? 'text-cinnabar' : 'text-ink-4'}>
+                {draftSaveError ? t('translate.draft.saveFailed')
+                  : draftNavigationBusy ? t('translate.draft.leaving')
+                    : savingDraftKey === draftKey ? t('translate.draft.saving')
+                    : persistedDraftKey === draftKey ? t('translate.draft.saved')
+                      : t('translate.draft.unsaved')}
+              </span>
+            )}
+          </div>
+        </div>
+        <aside className="min-w-0 rounded-lg border border-line bg-paper/70 p-4">
+          <label htmlFor="translation-task-brief" className="block text-sm font-medium text-ink">
+            {t('translate.taskBrief.label')}
+          </label>
+          <p className="mb-3 mt-1 text-xs leading-5 text-ink-3">
+            {t('translate.taskBrief.hint')}
+          </p>
+          <Textarea
+            id="translation-task-brief"
+            rows={6}
+            value={taskBrief}
+            onChange={(event) => setTaskBrief(event.target.value)}
+            disabled={draftInteractionLocked}
+            aria-label={t('translate.taskBrief.aria')}
+            placeholder={t('translate.taskBrief.placeholder')}
+            className="resize-y"
+          />
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+            <span className="text-[0.6875rem] text-ink-4">{t('translate.shortcut')}</span>
+            <Button
+              testId={TID.translate.translateButton}
+              disabled={!canSubmit}
+              onClick={() => void handleTranslate()}
+            >
+              {busy || submitPreparing ? (
+                <><Spinner size="sm" /> {t('translate.action.running')}</>
+              ) : t('translate.action.start')}
+            </Button>
+          </div>
+        </aside>
+      </div>
 
       <details
         data-testid={TID.translate.requirementsDetails}
@@ -1052,7 +1280,7 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
         <summary className="cursor-pointer px-3 py-2 text-sm font-medium text-ink-2">
           {t('translate.requirements.summary')}
         </summary>
-        <div className="min-w-0 space-y-4 border-t border-line px-3 py-3">
+        <div className="min-w-0 space-y-4 border-t border-line px-4 py-4">
           <div className="min-w-0 rounded-sm border border-line bg-paper/70 px-3 py-3">
             <label className="block text-xs font-medium text-ink-3">
               {t('translate.project.label')}
@@ -1142,14 +1370,6 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
               ))}
             </select>
           </label>
-          <Textarea
-            rows={4}
-            value={taskBrief}
-            onChange={(event) => setTaskBrief(event.target.value)}
-            disabled={draftInteractionLocked}
-            aria-label={t('translate.taskBrief.aria')}
-            placeholder={t('translate.taskBrief.placeholder')}
-          />
           <details className="min-w-0 rounded-sm border border-line bg-paper/70">
             <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-ink-2">
               {t('translate.poetry.summary')}
@@ -1476,34 +1696,6 @@ export function TranslatePanel({ className = '', onAllCompleteChange }: Translat
           )}
         </div>
       </details>
-
-      {/* 计数 + 主 CTA */}
-      <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
-        <p
-          className={[
-            'text-xs leading-5 tabular-nums',
-            'text-ink-4',
-          ].join(' ')}
-        >
-          {t('translate.counts', {
-            characters: formatNumber(charCount),
-            tokens: formatNumber(tokenCount),
-          })}
-        </p>
-        <Button
-          testId={TID.translate.translateButton}
-          disabled={!canSubmit}
-          onClick={handleTranslate}
-        >
-          {busy || submitPreparing ? (
-            <>
-              <Spinner size="sm" /> {t('translate.action.running')}
-            </>
-          ) : (
-            t('translate.action.start')
-          )}
-        </Button>
-      </div>
 
       {preflight && (
         <details

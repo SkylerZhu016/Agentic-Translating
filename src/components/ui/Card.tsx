@@ -38,11 +38,11 @@ export function Card({
       {...rest}
     >
       {hasHeader && (
-        <header className="flex min-w-0 flex-col items-stretch gap-3 border-b border-line px-5 pb-3 pt-4 sm:flex-row sm:items-end sm:justify-between sm:gap-4">
+        <header className="flex min-w-0 flex-col items-stretch gap-2 border-b border-line px-5 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
           <div className="min-w-0 max-w-full">
             {overline != null && <p className="overline-label">{overline}</p>}
             {title != null && (
-              <h2 className="mt-1 break-words font-serif text-base font-medium text-ink">{title}</h2>
+              <h2 className="break-words text-sm font-semibold leading-6 text-ink">{title}</h2>
             )}
           </div>
           {actions != null && (

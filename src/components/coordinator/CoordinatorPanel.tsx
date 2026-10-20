@@ -10,7 +10,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import type { Stage, StageOutputRow } from '@/src/lib/contracts/types'
-import { useSessionFull } from './use-session'
+import { useSessionFull, useStageStreams } from './use-session'
 import { emitSessionChanged } from './session-bus'
 import { runStageStream } from './run-stage'
 import {
@@ -22,17 +22,18 @@ import {
 import { StageStepper } from './StageStepper'
 import { StageOutputPanel } from './StageOutputPanel'
 import { Badge, Button, Modal, Spinner } from '@/src/components/ui'
-import { parseSemanticAgentOutput } from '@/src/lib/protocol/semantic-output'
 import type { CandidateAnnotationMode } from '@/src/lib/contracts/vnext'
 import { useI18n } from '@/src/i18n/LocaleProvider'
 import { localizeDiagnosticError } from '@/src/i18n/diagnostic'
 import type { Translator } from '@/src/i18n/types'
 import { localizedStageMeta } from './localized-stage'
+import {
+  createStageStreamBatcher,
+  emptyStageStreams,
+  type StageStreamMap,
+} from './stage-stream-state'
 
-type StreamTextMap = Record<Stage, string>
 type NoteMap = Partial<Record<Stage, string | null>>
-
-const EMPTY_STREAM: StreamTextMap = { review: '', filter: '', orchestrate: '', assemble: '' }
 
 function readableWorkflowError(error: string, t: Translator) {
   if (/504 Gateway Time-?out/i.test(error)) {
@@ -59,6 +60,7 @@ function AutomaticWorkflowProgress({
   onRegenerate,
   onRegenerateCurrent,
   onRestart,
+  stageStreams,
 }: {
   data: NonNullable<ReturnType<typeof useSessionFull>['data']>
   action: string | null
@@ -73,34 +75,40 @@ function AutomaticWorkflowProgress({
   onRegenerate: () => void
   onRegenerateCurrent: () => void
   onRestart: () => void
+  stageStreams: StageStreamMap
 }) {
   const { t } = useI18n()
-  const snapshot = JSON.parse(data.session.config_snapshot) as {
-    orchestrationPolicy?: { reviewMode?: 'main_editor' | 'four_stage' }
-    agentVariantSnapshots?: Array<{
-      id: string
-      catalogName: string
-    }>
-  }
+  const snapshot = useMemo(() => {
+    try {
+      return JSON.parse(data.session.config_snapshot) as {
+        orchestrationPolicy?: { reviewMode?: 'main_editor' | 'four_stage' }
+        agentVariantSnapshots?: Array<{ id: string; catalogName: string }>
+      }
+    } catch {
+      return {}
+    }
+  }, [data.session.config_snapshot])
   const reviewMode =
     snapshot.orchestrationPolicy?.reviewMode ??
     data.session.review_mode ??
     'main_editor'
-  const invocations = data.invocations ?? []
-  const isContextAnalysis = (item: typeof invocations[number]) => {
-    try {
-      return (
-        (JSON.parse(item.agent_snapshot) as { roleKind?: string }).roleKind ===
-        'context_analysis'
-      )
-    } catch {
-      return false
+  const { contextInvocations, translationInvocations } = useMemo(() => {
+    const context: NonNullable<typeof data.invocations> = []
+    const translation: NonNullable<typeof data.invocations> = []
+    for (const invocation of data.invocations ?? []) {
+      let contextAnalysis = false
+      try {
+        contextAnalysis = (
+          JSON.parse(invocation.agent_snapshot) as { roleKind?: string }
+        ).roleKind === 'context_analysis'
+      } catch {
+        // A malformed historical snapshot remains an ordinary candidate.
+      }
+      if (contextAnalysis) context.push(invocation)
+      else translation.push(invocation)
     }
-  }
-  const contextInvocations = invocations.filter(isContextAnalysis)
-  const translationInvocations = invocations.filter(
-    (item) => !isContextAnalysis(item),
-  )
+    return { contextInvocations: context, translationInvocations: translation }
+  }, [data.invocations])
   const completedContext = contextInvocations.filter(
     (item) => item.status === 'complete',
   ).length
@@ -138,7 +146,7 @@ function AutomaticWorkflowProgress({
     completedTranslations >= 2 &&
     !runActive &&
     ['translated', 'assembled', 'refining'].includes(data.session.state)
-  const teamDecision = (() => {
+  const teamDecision = useMemo(() => {
     const decisionEvent = [...(data.events ?? [])]
       .reverse()
       .find((event) => {
@@ -171,7 +179,7 @@ function AutomaticWorkflowProgress({
     } catch {
       return []
     }
-  })()
+  }, [data.events, snapshot.agentVariantSnapshots, t])
   const preAnalysisStep = {
     label: t('coordinator.step.context'),
     complete: contextSettled && completedContext > 0,
@@ -205,6 +213,7 @@ function AutomaticWorkflowProgress({
       label: localizedStageMeta(meta.key, t).label,
       complete: row?.status === 'complete',
       failed: row?.status === 'failed',
+      stage: meta.key,
       row,
     }
   })
@@ -322,7 +331,7 @@ function AutomaticWorkflowProgress({
           {actionError}
         </p>
       )}
-      <ol className="space-y-2">
+      <ol className="grid items-start gap-3 sm:grid-cols-2 xl:grid-cols-3">
         {steps.map((step, index) => {
           const stageRow =
             'row' in step
@@ -333,10 +342,47 @@ function AutomaticWorkflowProgress({
             !step.complete &&
             !failed &&
             index === steps.findIndex((item) => !item.complete)
+          if ('stage' in step) {
+            const stage = step.stage as Stage
+            const stream = stageStreams[stage]
+            const visibleStageRow = stageRow?.status === 'running' &&
+                !runActive && runRecoverable
+              ? {
+                  ...stageRow,
+                  status: 'failed' as const,
+                  error: stageRow.error ?? latestRun?.error ?? null,
+                }
+              : stageRow
+            return (
+              <li key={stage} className="min-w-0">
+                <StageOutputPanel
+                  stage={stage}
+                  row={visibleStageRow ?? null}
+                  running={runActive &&
+                    (stream.running || stageRow?.status === 'running')}
+                  streamText={stream.body}
+                  streamAnnotation={stream.annotation}
+                  reasoningPreview={stream.reasoningPreview}
+                  reasoningCharacters={stream.reasoningCharacters}
+                  reasoningTruncated={stream.reasoningTruncated}
+                  canRun={false}
+                  showRunAction={false}
+                  onRun={() => {}}
+                />
+              </li>
+            )
+          }
           return (
             <li
               key={step.label}
-              className="rounded-sm border border-line bg-paper-raise px-3 py-2.5"
+              aria-current={running && runActive ? 'step' : undefined}
+              className={[
+                'min-w-0 rounded-lg border px-4 py-3',
+                step.complete ? 'border-pine/20 bg-pine/5'
+                  : failed ? 'border-cinnabar/30 bg-cinnabar/5'
+                    : running && runActive ? 'border-pine/40 bg-paper-raise shadow-sm'
+                      : 'border-line bg-paper/40',
+              ].join(' ')}
             >
               <div className="flex items-center justify-between gap-3">
                 <span className="text-sm font-medium text-ink">
@@ -354,16 +400,6 @@ function AutomaticWorkflowProgress({
                         : t('coordinator.status.waiting')}
                 </Badge>
               </div>
-              {stageRow?.raw_output && (
-                <details className="mt-2">
-                  <summary className="cursor-pointer text-xs text-ink-3">
-                    {t('coordinator.output.open')}
-                  </summary>
-                  <p className="mt-2 whitespace-pre-wrap text-xs leading-5 text-ink-2">
-                    {parseSemanticAgentOutput(stageRow.raw_output).body}
-                  </p>
-                </details>
-              )}
               {'showTeamDecision' in step &&
                 step.showTeamDecision &&
                 teamDecision.length > 0 && (
@@ -407,9 +443,10 @@ function AutomaticWorkflowProgress({
 export function CoordinatorPanel() {
   const { t } = useI18n()
   const { data, sessionId, refresh } = useSessionFull()
+  const automaticStreams = useStageStreams()
   const router = useRouter()
   const [runningStage, setRunningStage] = useState<Stage | null>(null)
-  const [streamText, setStreamText] = useState<StreamTextMap>(EMPTY_STREAM)
+  const [manualStreams, setManualStreams] = useState(emptyStageStreams)
   const [notes, setNotes] = useState<NoteMap>({})
   const [completionNotice, setCompletionNotice] = useState<string | null>(null)
   const [workflowAction, setWorkflowAction] = useState<string | null>(null)
@@ -418,6 +455,24 @@ export function CoordinatorPanel() {
   const [restartConfirmOpen, setRestartConfirmOpen] = useState(false)
   const [workflowActionError, setWorkflowActionError] =
     useState<string | null>(null)
+  const workflowRequestRef = useRef<AbortController | null>(null)
+  const stageRequestRef = useRef<AbortController | null>(null)
+
+  useEffect(() => {
+    setRunningStage(null)
+    setWorkflowAction(null)
+    setWorkflowActionError(null)
+    setManualStreams(emptyStageStreams())
+    setNotes({})
+    setCompletionNotice(null)
+    setRestartConfirmOpen(false)
+    return () => {
+      workflowRequestRef.current?.abort()
+      workflowRequestRef.current = null
+      stageRequestRef.current?.abort()
+      stageRequestRef.current = null
+    }
+  }, [sessionId])
 
   useEffect(() => {
     if (!data) return
@@ -444,7 +499,9 @@ export function CoordinatorPanel() {
       | 'regenerate-current'
       | 'restart',
   ) => {
-    if (!sessionId || workflowAction) return
+    if (!sessionId || workflowRequestRef.current) return
+    const controller = new AbortController()
+    workflowRequestRef.current = controller
     setWorkflowAction(action)
     setWorkflowActionError(null)
     try {
@@ -458,6 +515,7 @@ export function CoordinatorPanel() {
               : action
       const response = await fetch(`/api/sessions/${sessionId}/${path}`, {
         method: 'POST',
+        signal: controller.signal,
         headers: { 'Content-Type': 'application/json' },
         ...(action === 'pause'
           ? { body: JSON.stringify({ action: 'pause' }) }
@@ -477,6 +535,7 @@ export function CoordinatorPanel() {
         error?: string
         sessionId?: string
       }
+      if (controller.signal.aborted) return
       if (!response.ok) {
         throw new Error(localizeDiagnosticError(
           t,
@@ -489,20 +548,24 @@ export function CoordinatorPanel() {
         return
       }
       await refresh()
-      emitSessionChanged(sessionId)
+      if (!controller.signal.aborted) emitSessionChanged(sessionId)
     } catch (error) {
-      setWorkflowActionError(
-        error instanceof Error ? error.message : String(error),
-      )
+      if (!controller.signal.aborted) {
+        setWorkflowActionError(
+          error instanceof Error ? error.message : String(error),
+        )
+      }
     } finally {
-      setWorkflowAction(null)
+      if (workflowRequestRef.current === controller) {
+        workflowRequestRef.current = null
+        setWorkflowAction(null)
+      }
     }
   }, [
     refresh,
     regenerationAnnotationMode,
     router,
     sessionId,
-    workflowAction,
     t,
   ])
 
@@ -521,39 +584,72 @@ export function CoordinatorPanel() {
     } catch {
       return false
     }
-  }, [data])
+  }, [data?.session.config_snapshot])
 
   const run = useCallback(
     async (stage: Stage) => {
-      if (!sessionId || runningStage !== null) return
+      if (!sessionId || stageRequestRef.current) return
       if (!canRunStage(stage, stageRows, sessionState, null)) return
+      const controller = new AbortController()
+      stageRequestRef.current = controller
 
       justRanRef.current = true
       setRunningStage(stage)
       setCompletionNotice(null)
-      setStreamText((prev) => ({ ...prev, [stage]: '' }))
       setNotes((prev) => ({ ...prev, [stage]: null }))
 
-      await runStageStream(sessionId, stage, {
-        onDelta: (s, content) =>
-          setStreamText((prev) => ({ ...prev, [s]: prev[s] + content })),
-        onError: (s, message) => setNotes((prev) => ({ ...prev, [s]: message })),
-        messages: {
-          network: t('stage.error.network'),
-          request: (status) => t('stage.error.request', { status }),
-          stage: t('stage.error.run'),
-          connection: t('stage.error.connection'),
-        },
-        localizeError: (value, fallback) =>
-          localizeDiagnosticError(t, value, fallback),
+      const batcher = createStageStreamBatcher((streams) => {
+        if (!controller.signal.aborted) {
+          setManualStreams((previous) => ({ ...previous, [stage]: streams[stage] }))
+        }
       })
+      const queue = (event: string, payload: Record<string, unknown> = {}) => {
+        if (!controller.signal.aborted) {
+          batcher.push({ sessionId, stage, event, data: payload })
+        }
+      }
+      queue('stage.started')
+      const disposeOnAbort = () => batcher.dispose()
+      controller.signal.addEventListener('abort', disposeOnAbort, { once: true })
+      try {
+        await runStageStream(sessionId, stage, {
+          signal: controller.signal,
+          onDelta: (_s, content) => queue('stage.delta', { delta: content }),
+          onAnnotation: (_s, content) => queue('stage.annotation', { delta: content }),
+          onReasoning: (_s, preview) => queue('stage.reasoning', { ...preview }),
+          onReset: () => queue('stage.reset'),
+          onComplete: () => queue('stage.completed'),
+          onError: (s, message) => {
+            queue('stage.failed')
+            if (!controller.signal.aborted) {
+              setNotes((prev) => ({ ...prev, [s]: message }))
+            }
+          },
+          messages: {
+            network: t('stage.error.network'),
+            request: (status) => t('stage.error.request', { status }),
+            stage: t('stage.error.run'),
+            connection: t('stage.error.connection'),
+          },
+          localizeError: (value, fallback) =>
+            localizeDiagnosticError(t, value, fallback),
+        })
+        batcher.flush()
+        if (controller.signal.aborted) return
 
-      // 服务端为准：重取全量会话（含 stale 级联与 assemble 产生的新版本）
-      await refresh()
-      emitSessionChanged(sessionId)
-      setRunningStage(null)
+        // 服务端为准：重取工作区（含 stale 级联与 assemble 产生的新版本）
+        await refresh()
+        if (!controller.signal.aborted) emitSessionChanged(sessionId)
+      } finally {
+        controller.signal.removeEventListener('abort', disposeOnAbort)
+        batcher.dispose()
+        if (stageRequestRef.current === controller) {
+          stageRequestRef.current = null
+          setRunningStage(null)
+        }
+      }
     },
-    [sessionId, runningStage, stageRows, sessionState, refresh, t],
+    [sessionId, stageRows, sessionState, refresh, t],
   )
 
   // 全部完成 → 滚动到最终文本区 + 对话提示
@@ -561,10 +657,15 @@ export function CoordinatorPanel() {
     if (!allComplete || !justRanRef.current) return
     justRanRef.current = false
     setCompletionNotice(t('coordinator.complete'))
-    document
-      .querySelector('[data-testid="final-text"]')
-      ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   }, [allComplete, t])
+
+  if (!data) {
+    return (
+      <p className="rounded-lg border border-dashed border-line-2 bg-paper/60 px-5 py-8 text-center text-sm leading-6 text-ink-3">
+        {t('coordinator.noSession')}
+      </p>
+    )
+  }
 
   if (data && isVNext) {
     return (
@@ -583,6 +684,7 @@ export function CoordinatorPanel() {
             void postWorkflowAction('regenerate-current')
           }
           onRestart={() => setRestartConfirmOpen(true)}
+          stageStreams={automaticStreams}
         />
         <Modal
           open={restartConfirmOpen}
@@ -636,11 +738,6 @@ export function CoordinatorPanel() {
       )}
 
       {/* 无会话 / 翻译未就绪引导 */}
-      {!data && (
-        <p className="rounded-sm border border-dashed border-line-2 bg-paper/60 px-4 py-4 text-center text-xs leading-5 text-ink-4">
-          {t('coordinator.noSession')}
-        </p>
-      )}
       {data && (sessionState === 'draft' || sessionState === 'translating') && (
         <p className="rounded-sm border border-dashed border-line-2 bg-paper/60 px-4 py-3 text-center text-xs text-ink-4">
           {t('coordinator.translationRunning')}
@@ -648,19 +745,23 @@ export function CoordinatorPanel() {
       )}
 
       {/* 四张输出面板常驻渲染（R3：中间产物全部可见，不折叠） */}
-      <div className="space-y-3">
+      {data && <div className="grid items-start gap-3 lg:grid-cols-2">
         {STAGES.map((meta) => (
           <StageOutputPanel
             key={meta.key}
             stage={meta.key}
             row={stageRows[meta.key]}
             running={runningStage === meta.key}
-            streamText={streamText[meta.key]}
+            streamText={manualStreams[meta.key].body}
+            streamAnnotation={manualStreams[meta.key].annotation}
+            reasoningPreview={manualStreams[meta.key].reasoningPreview}
+            reasoningCharacters={manualStreams[meta.key].reasoningCharacters}
+            reasoningTruncated={manualStreams[meta.key].reasoningTruncated}
             canRun={canRunStage(meta.key, stageRows, sessionState, runningStage)}
             onRun={run}
           />
         ))}
-      </div>
+      </div>}
     </div>
   )
 }

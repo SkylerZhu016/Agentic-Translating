@@ -19,7 +19,12 @@ import {
 import { runFanOut, type AgentRuntime, type LLMCaller } from './fanout'
 import { estimateTokens, resolveCompletionTokenBudget } from '../guards/tokens'
 import { detectSystemPromptLeak } from '../guards/prompt-leak'
-import { parseSemanticAgentOutput } from '../protocol/semantic-output'
+import { parseSemanticAgentOutput, semanticOutputFormatForPrompt } from '../protocol/semantic-output'
+import { createSemanticOutputStreamDecoder } from '../protocol/semantic-output-stream'
+import { createReasoningPreview } from '../llm/reasoning-preview'
+import { publishReasoningPreview } from './live-preview'
+import { STAGE_BOUNDARY_EN, STAGE_BOUNDARY_ZH } from '../prompts/bidirectional/common'
+import { reviewExecutionStrategy } from '../prompts/review-strategy'
 import {
   checkTranslationEvidence,
   type TranslationEvidenceReport,
@@ -169,6 +174,12 @@ class RunPausedError extends Error {
   constructor() {
     super('run_paused')
     this.name = 'RunPausedError'
+  }
+}
+
+class SemanticResponseError extends LLMError {
+  constructor(readonly rawOutput: string, message: string) {
+    super('semantic_output_invalid', message, { retryable: true })
   }
 }
 
@@ -401,6 +412,111 @@ function emitEvent(
   )
 }
 
+/** Coalesce readable deltas before writing the replayable event log. */
+function createOutputPreview(
+  context: VNextLlmLedgerContext | undefined,
+  format: 'json' | 'auto' | 'legacy',
+  enabled: boolean,
+  integratedReview = false,
+) {
+  // Parallel independent review audits share a stage. Their final combined
+  // body is authoritative; interleaving three draft bodies would be misleading.
+  const independentReview = context?.operation === 'stage_review' &&
+    !context.invocationId && !integratedReview
+  enabled = enabled && !independentReview
+  const decoder = format === 'json' ? createSemanticOutputStreamDecoder() : null
+  let body = ''
+  let annotation = ''
+  let invalidPreview = false
+  let timer: ReturnType<typeof setTimeout> | null = null
+  const stage = context && ['stage_review', 'filter', 'orchestrate', 'assemble'].includes(context.operation)
+    ? context.operation === 'stage_review' ? 'review' : context.operation
+    : undefined
+  const target = context?.invocationId
+    ? { invocationId: context.invocationId }
+    : stage ? { stage } : null
+  const prefix = context?.invocationId ? 'agent' : 'stage'
+  const flush = () => {
+    if (timer) clearTimeout(timer)
+    timer = null
+    if (!context || !target || !enabled) return
+    try {
+      if (body) emitEvent(context.db, context.runId, context.sessionId, `${prefix}.delta`, { ...target, delta: body })
+      if (annotation) emitEvent(context.db, context.runId, context.sessionId, `${prefix}.annotation`, { ...target, delta: annotation })
+    } catch {
+      // Preview delivery is best effort. The terminal result is saved separately.
+    } finally {
+      body = ''
+      annotation = ''
+    }
+  }
+  const reset = () => {
+    if (timer) clearTimeout(timer)
+    timer = null
+    body = ''
+    annotation = ''
+    if (context && target && enabled) {
+      emitEvent(context.db, context.runId, context.sessionId, `${prefix}.reset`, target)
+      publishReasoningPreview(
+        context.sessionId,
+        context.invocationId ?? `stage:${stage}`,
+        { reasoningPreview: '', reasoningCharacters: 0, reasoningTruncated: false },
+        context.invocationId ? undefined : stage,
+      )
+    }
+  }
+  const reasoning = createReasoningPreview((preview) => {
+    if (!context || !target || independentReview) return
+    publishReasoningPreview(
+      context.sessionId,
+      context.invocationId ?? `stage:${stage}`,
+      preview,
+      context.invocationId ? undefined : stage,
+    )
+  })
+  return {
+    reasoning,
+    reset,
+    push(delta: string) {
+      if (!enabled || !target) return
+      if (decoder) {
+        const next = decoder.push(delta)
+        if (next.invalid) {
+          if (!invalidPreview) reset()
+          invalidPreview = true
+          return
+        }
+        body += next.bodyDelta
+        annotation += next.annotationDelta
+      } else {
+        body += delta
+      }
+      if (timer === null && (body || annotation)) timer = setTimeout(flush, 50)
+    },
+    pushAnnotation(delta: string) {
+      if (!enabled || !target) return
+      annotation += delta
+      if (timer === null && annotation) timer = setTimeout(flush, 50)
+    },
+    finish() {
+      flush()
+      reasoning.dispose()
+      const preview = reasoning.getSnapshot()
+      if (context && target && preview.reasoningCharacters > 0) {
+        try {
+          emitEvent(context.db, context.runId, context.sessionId, `${prefix}.reasoning.completed`, {
+            ...target,
+            reasoningCharacters: preview.reasoningCharacters,
+            reasoningTruncated: preview.reasoningTruncated,
+          })
+        } catch {
+          // Optional statistics may not replace a successful model result.
+        }
+      }
+    },
+  }
+}
+
 function updateRunPhase(
   db: Database.Database,
   runId: string,
@@ -444,7 +560,7 @@ function assertContextFits(
   )
   if (estimate > endpoint.contextWindow) {
     throw new Error(
-      `上下文估算为 ${estimate} tokens，超过端点上限 ${endpoint.contextWindow}；未对正文做任何裁剪。`,
+      `上下文估算为 ${estimate} tokens，超过端点上限 ${endpoint.contextWindow}。正文已完整保留。`,
     )
   }
 }
@@ -702,6 +818,16 @@ export async function complete(
     .filter((message) => message.role === 'system')
     .map((message) => message.content)
     .join('\n')
+  const format = semanticOutputFormatForPrompt(systemPrompt)
+  const enforceSemanticOutput = format === 'json' && !request.tools?.length
+  const assertSemanticOutput = (content: string) => {
+    if (!enforceSemanticOutput) return
+    try {
+      parseSemanticAgentOutput(content, { format: 'json' })
+    } catch (error) {
+      throw new SemanticResponseError(content, error instanceof Error ? error.message : 'Invalid structured output')
+    }
+  }
   const assertVisibleOutputIntegrity = (content: string) => {
     const leak = detectSystemPromptLeak(content, systemPrompt)
     if (!leak) return
@@ -715,6 +841,13 @@ export async function complete(
   const maxAttempts = RETRY_DELAYS_MS.length + 1
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     let ledgerAttempt: LedgerAttempt | null = null
+    const preview = createOutputPreview(
+      ledgerContext,
+      format,
+      !request.tools?.length,
+      reviewExecutionStrategy(systemPrompt) === 'integrated',
+    )
+    if (attempt > 0) preview.reset()
     try {
       const maxTokens = resolveCompletionTokenBudget(
         request.messages.map((message) => message.content).join('\n') +
@@ -756,11 +889,16 @@ export async function complete(
             markLedgerReceiving(ledgerAttempt)
             request.onActivity?.()
           },
+          onReasoning(update) {
+            preview.reasoning.push(update)
+            request.onReasoning?.(update)
+          },
         },
       )
       if (!isAsyncIterable(response)) {
         markLedgerReceiving(ledgerAttempt)
         assertVisibleOutputIntegrity(response.content)
+        assertSemanticOutput(response.content)
         if (!response.content?.trim() && !response.toolCalls?.length) {
           failLedgerAttempt(
             ledgerAttempt,
@@ -780,6 +918,7 @@ export async function complete(
             { retryable: false },
           )
         }
+        preview.push(response.content)
         completeLedgerAttempt(ledgerAttempt, response.usage)
         return response
       }
@@ -788,7 +927,10 @@ export async function complete(
       let usage: ChatCompletionResponse['usage']
       for await (const event of response) {
         markLedgerReceiving(ledgerAttempt)
-        if (event.type === 'text') content += event.content
+        if (event.type === 'text') {
+          content += event.content
+          preview.push(event.content)
+        }
         if (event.type === 'done') {
           content = event.content || content
           toolCalls = event.toolCalls
@@ -815,6 +957,7 @@ export async function complete(
         )
       }
       assertVisibleOutputIntegrity(content)
+      assertSemanticOutput(content)
       completeLedgerAttempt(ledgerAttempt, usage)
       return {
         content,
@@ -822,11 +965,14 @@ export async function complete(
         ...(usage ? { usage } : {}),
       }
     } catch (error) {
+      if (error instanceof SemanticResponseError) preview.reset()
       failLedgerAttempt(ledgerAttempt, error)
       if (!(error instanceof LLMError) || !error.retryable || attempt === maxAttempts - 1) {
         throw error
       }
       await new Promise((resolve) => setTimeout(resolve, RETRY_DELAYS_MS[attempt]))
+    } finally {
+      preview.finish()
     }
   }
   throw new Error('LLM completion retry loop exhausted')
@@ -1326,21 +1472,24 @@ async function runImageryPrepass(
         invocationId,
         operation: 'context_analysis',
       })
-      const content = response.content.trim()
+      const semantic = parseSemanticAgentOutput(response.content, {
+        format: semanticOutputFormatForPrompt(variant.rolePrompt),
+      })
+      const content = semantic.body
       if (!content) throw new Error('意象助手返回了空分析')
       const latencyMs = Math.round(performance.now() - startedAt)
       db.prepare(`
         UPDATE agent_invocations
         SET status='complete', raw_output=?, body_output=?,
-            annotation_output=NULL, latency_ms=?, updated_at=datetime('now')
+            annotation_output=?, latency_ms=?, updated_at=datetime('now')
         WHERE id=?
-      `).run(content, content, latencyMs, invocationId)
+      `).run(semantic.raw, content, semantic.annotation, latencyMs, invocationId)
       emitEvent(db, runId, session.id, 'agent.completed', {
         invocationId,
         agentVariantId: variant.id,
-        raw: content,
+        raw: semantic.raw,
         body: content,
-        annotation: null,
+        annotation: semantic.annotation,
         latencyMs,
         roleKind: 'context_analysis',
       })
@@ -1414,7 +1563,7 @@ async function runPoetryPlanning(
 Do not recommend or introduce a dash or semicolon when it is absent from the source. For a continuing poetic line, prefer a comma, an open line ending, or enjambment.`
     : `原文标点检查：破折号=${sourceHasDash ? '存在' : '不存在'}，分号=${sourceHasSemicolon ? '存在' : '不存在'}。
 原文不存在某类标点时，不得建议或新增该类破折号或分号；诗行尚未收束时优先使用逗号、开放行末或跨行延续。`
-  const rolePrompt = english
+  const legacyRolePrompt = english
     ? `You are the Prosody and Rhyme Planner for a difficult Chinese-to-English poetry translation.
 Do not translate the complete poem. Produce a concise, executable planning document for independent translators: identify form, stanza and line structure, syntactic continuation across line breaks, rhyme positions, rhyme scheme, acceptable exact or near-rhyme policy, rhythm priorities, and likely trade-offs.
 Target-language rhyme is conditional, not a default hard target. Treat a fixed rhyme scheme as binding only when the user explicitly requests it or the source analysis marks the source rhyme as highly stable. Otherwise document rhyme as optional sound evidence and prefer free or partial rhyme. Judge English rhyme by pronunciation (identical stressed vowel plus following consonants for perfect rhyme; near rhyme such as move/love is acceptable when meaning requires it). For a binding rhyme task, propose a concrete rhyme scheme (e.g., AABB, ABAB, ABBA, AAAA, XAXA) and at least two possible ending words per position so translators keep freedom. Rhyme is subordinate to meaning and naturalness and is realized in a "sentences first, scheme second" order: settle each line for semantic accuracy and structural correspondence, letting line endings take their most faithful words without pre-committing to a scheme; then mark the sounds of the settled endings, find the rhyme pairs that already hold, and enumerate viable schemes (AAAA, AABB, ABAB, ABBA, AABA, AXBX, XAXA), preferring the one that changes the fewest settled endings at the least semantic cost; fill only the positions the scheme requires, with words that are simultaneously faithful; when a position cannot be filled without semantic damage or forced English, drop it (mark X, downgrading the scheme to partial or motif rhyme) rather than revising settled lines backward to force rhyme. Resolve unclear relations inside a line through grammar, voice, or prepositions rather than vague wording.
@@ -1435,6 +1584,14 @@ Write freely. Optional human notes may follow a standalone "---" line.`
 ${punctuationInstruction}
 歌词可唱性、旋律适配和音符级音节对齐不在当前产品范围内。
 自由输出；可在独立一行“---”之后添加仅供用户查看的注释。`
+  const rolePrompt = semanticOutputFormatForPrompt(baseVariant.rolePrompt) === 'json'
+    ? legacyRolePrompt.replace(
+        english
+          ? 'Write freely. Optional human notes may follow a standalone "---" line.'
+          : '自由输出；可在独立一行“---”之后添加仅供用户查看的注释。',
+        english ? STAGE_BOUNDARY_EN : STAGE_BOUNDARY_ZH,
+      )
+    : legacyRolePrompt
   const plannerVariant = {
     ...baseVariant,
     id:
@@ -1530,7 +1687,9 @@ ${punctuationInstruction}
       invocationId,
       operation: 'poetry_plan',
     })
-    const semantic = parseSemanticAgentOutput(response.content)
+    const semantic = parseSemanticAgentOutput(response.content, {
+      format: semanticOutputFormatForPrompt(rolePrompt),
+    })
     if (!semantic.body.trim()) throw new Error('诗体与韵律规划正文为空')
     const latencyMs = Math.round(performance.now() - startedAt)
     db.prepare(`
@@ -1691,6 +1850,7 @@ async function callTeam(
       },
       model: binding.model,
       maxTokens: endpoint.maxOutputTokens,
+      outputFormat: semanticOutputFormatForPrompt(system),
       messages: [
         { role: 'system', content: system },
         { role: 'user', content: user },
@@ -1709,6 +1869,14 @@ async function callTeam(
   })
   const startedAt = new Map<string, number>()
   const lastActivityEventAt = new Map<string, number>()
+  const displays = new Map(runtimes.map((runtime) => [
+    runtime.agentKey,
+    createOutputPreview({
+      db, runId, sessionId: session.id,
+      invocationId: invocationIds.get(runtime.agentKey),
+      operation: 'worker',
+    }, 'auto', true),
+  ]))
   const ledgerCaller: LLMCaller = (runtimeEndpoint, request) => {
     const state = ledgerByEndpoint.get(runtimeEndpoint)
     if (!state) {
@@ -1754,16 +1922,31 @@ async function callTeam(
           receivedAt: new Date(now).toISOString(),
         })
       },
+      onAgentAttemptStart(agentKey, attempt) {
+        if (attempt > 0) {
+          displays.get(agentKey)?.reset()
+          publishReasoningPreview(session.id, invocationIds.get(agentKey)!, {
+            reasoningPreview: '', reasoningCharacters: 0, reasoningTruncated: false,
+          })
+        }
+      },
+      onAgentOutputInvalid(agentKey) {
+        displays.get(agentKey)?.reset()
+      },
+      onAgentReasoning(agentKey, preview) {
+        publishReasoningPreview(session.id, invocationIds.get(agentKey)!, preview)
+      },
       onToken(agentKey, delta) {
-        emitEvent(db, runId, session.id, 'agent.delta', {
-          invocationId: invocationIds.get(agentKey),
-          delta,
-        })
+        displays.get(agentKey)?.push(delta)
+      },
+      onAnnotation(agentKey, delta) {
+        displays.get(agentKey)?.pushAnnotation(delta)
       },
     },
     ledgerCaller,
     { sessionId: session.id },
   )
+  for (const display of displays.values()) display.finish()
 
   const completed: InvocationResult[] = []
   for (const result of summary.results) {
@@ -1775,7 +1958,9 @@ async function callTeam(
       performance.now() - (startedAt.get(result.agentKey) ?? performance.now()),
     )
     if (result.status === 'complete') {
-      const semantic = parseSemanticAgentOutput(result.content ?? '')
+      const semantic = parseSemanticAgentOutput(result.content ?? '', {
+        format: runtimes.find((runtime) => runtime.agentKey === result.agentKey)?.outputFormat,
+      })
       const success = semantic.body.trim().length > 0
       db.prepare(`
         UPDATE agent_invocations
@@ -1803,6 +1988,7 @@ async function callTeam(
           body: semantic.body,
           annotation: semantic.annotation,
           latencyMs: elapsed,
+          reasoningCharacters: result.reasoningCharacters,
         },
       )
       if (success) {
@@ -1827,9 +2013,11 @@ async function callTeam(
         })
       }
     } else {
-      const partial = result.content
-        ? parseSemanticAgentOutput(result.content)
-        : null
+      const raw = result.content
+      // Invalid/incomplete JSON is diagnostic raw output, never downstream body.
+      const partial = raw && runtimes.find((runtime) => runtime.agentKey === result.agentKey)?.outputFormat !== 'json'
+        ? parseSemanticAgentOutput(raw, { format: 'legacy' })
+        : raw ? { raw, body: '', annotation: null } : null
       db.prepare(`
         UPDATE agent_invocations
         SET status='failed', raw_output=?, body_output=?, annotation_output=?,
@@ -2355,7 +2543,7 @@ async function createToolEnabledMainDraft(
           invocationId,
           operation: 'stage_review',
         })
-        const semantic = parseSemanticAgentOutput(response.content)
+        const semantic = parseSemanticAgentOutput(response.content, { format: 'legacy' })
         if (!semantic.body) throw new Error('只读审校子 Agent 返回空正文')
         db.prepare(`
           UPDATE agent_invocations
@@ -2668,6 +2856,7 @@ export function combineIndependentReviews(
     annotation: string | null
   }>,
   failures: Array<{ lensId: string; error: unknown }>,
+  outputFormat: 'json' | 'auto' | 'legacy' = 'legacy',
 ) {
   const safeFailures = failures.map((failure) => ({
     lensId: failure.lensId,
@@ -2696,7 +2885,9 @@ export function combineIndependentReviews(
   }
   const annotation = notes.length > 0 ? notes.join('\n\n') : null
   return {
-    raw: annotation ? `${body}\n\n---\n${annotation}` : body,
+    raw: outputFormat === 'json'
+      ? JSON.stringify({ body, annotation })
+      : annotation ? `${body}\n\n---\n${annotation}` : body,
     body,
     annotation,
   }
@@ -2727,7 +2918,9 @@ async function runIndependentReviewAudits(params: {
             role: 'system',
             content:
               `${reviewPrompt}\n\n${promptLanguage === 'en' ? lens.instructionEn : lens.instructionZh}\n\n` +
-              (promptLanguage === 'en'
+              (semanticOutputFormatForPrompt(reviewPrompt) === 'json'
+                ? promptLanguage === 'en' ? STAGE_BOUNDARY_EN : STAGE_BOUNDARY_ZH
+                : promptLanguage === 'en'
                 ? 'Write freely. Notes may follow a standalone --- line; only the body continues downstream.'
                 : '自由输出；注释可置于独立一行的 --- 之后，只有正文继续传给下游。'),
           },
@@ -2739,7 +2932,9 @@ async function runIndependentReviewAudits(params: {
         runId,
         operation: 'stage_review',
       })
-      const semantic = parseSemanticAgentOutput(response.content)
+      const semantic = parseSemanticAgentOutput(response.content, {
+        format: semanticOutputFormatForPrompt(reviewPrompt),
+      })
       assertRunMayContinue(db, session.id)
       if (!semantic.body.trim()) throw new Error(`${lens.id} review body is empty`)
       emitEvent(db, runId, session.id, 'stage.audit.completed', {
@@ -2776,10 +2971,13 @@ async function runIndependentReviewAudits(params: {
     throw new Error(
       promptLanguage === 'en'
         ? `Independent review requires at least two successful audits; received ${completed.length}.`
-        : `独立审查至少需要两个成功结果；本次仅完成 ${completed.length} 个。`,
+        : `独立审查至少需要两个成功结果，本次仅完成 ${completed.length} 个。`,
     )
   }
-  return combineIndependentReviews(db, promptLanguage, completed, failures)
+  return combineIndependentReviews(
+    db, promptLanguage, completed, failures,
+    semanticOutputFormatForPrompt(reviewPrompt),
+  )
 }
 
 async function runFourStages(
@@ -2803,13 +3001,19 @@ async function runFourStages(
   const prior: Partial<Record<Stage, string>> = {}
   const storedStages = reuseCompletedStages
     ? db.prepare(`
-        SELECT stage, raw_output
+        SELECT stage, raw_output, prompt_used
         FROM stage_outputs
         WHERE session_id=? AND status='complete' AND raw_output IS NOT NULL
-      `).all(session.id) as Array<{ stage: Stage; raw_output: string }>
+      `).all(session.id) as Array<{ stage: Stage; raw_output: string; prompt_used: string | null }>
     : []
   for (const stored of storedStages) {
-    prior[stored.stage] = parseSemanticAgentOutput(stored.raw_output).body
+    // A checkpoint follows the protocol it was generated with. Valid-looking
+    // JSON in an older free-form body must not be reinterpreted on resume.
+    prior[stored.stage] = parseSemanticAgentOutput(stored.raw_output, {
+      format: semanticOutputFormatForPrompt(stored.prompt_used ?? '') === 'json'
+        ? 'json'
+        : 'legacy',
+    }).body
   }
   db.prepare(
     "UPDATE sessions SET state='coordinating', updated_at=datetime('now') WHERE id=?",
@@ -2839,7 +3043,9 @@ async function runFourStages(
           role: 'system',
           content:
             `${templates[stage]}\n\n` +
-            (bundle.promptLanguage === 'en'
+            (semanticOutputFormatForPrompt(templates[stage]) === 'json'
+              ? bundle.promptLanguage === 'en' ? STAGE_BOUNDARY_EN : STAGE_BOUNDARY_ZH
+              : bundle.promptLanguage === 'en'
               ? 'Write freely. Notes may follow a standalone --- line; only the body continues downstream.'
               : '自由输出；注释可置于独立一行的 --- 之后，只有正文继续传给下游。'),
         },
@@ -2880,7 +3086,8 @@ async function runFourStages(
         },
         ],
       }
-      const semantic = stage === 'review'
+      const semantic = stage === 'review' &&
+        reviewExecutionStrategy(templates.review) === 'independent_lenses'
         ? await runIndependentReviewAudits({
             db,
             runId,
@@ -2895,8 +3102,8 @@ async function runFourStages(
             db,
             sessionId: session.id,
             runId,
-            operation: stage,
-          })).content)
+            operation: stage === 'review' ? 'stage_review' : stage,
+          })).content, { format: semanticOutputFormatForPrompt(templates[stage]) })
       assertRunMayContinue(db, session.id)
       if (!semantic.body.trim()) throw new Error(`${stage} 阶段正文为空`)
       db.prepare(`
@@ -2923,11 +3130,17 @@ async function runFourStages(
       db.prepare(`
         INSERT INTO stage_outputs
           (session_id, stage, status, prompt_used, raw_output, error)
-        VALUES (?, ?, 'failed', ?, NULL, ?)
+        VALUES (?, ?, 'failed', ?, ?, ?)
         ON CONFLICT(session_id, stage) DO UPDATE SET
           status='failed', prompt_used=excluded.prompt_used,
-          raw_output=NULL, error=excluded.error
-      `).run(session.id, stage, templates[stage], message)
+          raw_output=excluded.raw_output, error=excluded.error
+      `).run(
+        session.id, stage, templates[stage],
+        error instanceof SemanticResponseError
+          ? redactCredentialValueForDb(db, error.rawOutput)
+          : null,
+        message,
+      )
       emitEvent(db, runId, session.id, 'stage.failed', {
         stage,
         endpointId: binding.endpointId,
@@ -2994,7 +3207,7 @@ async function executeRun(
       snapshotOverride ??
       (JSON.parse(session.config_snapshot) as ConfigSnapshot)
     if (snapshot.version !== 3) {
-      throw new Error('旧会话不支持 vNext 动态运行；仍可查看或使用原四阶段流程')
+      throw new Error('旧会话不支持 vNext 动态运行，仍可查看或使用原四阶段流程')
     }
     const checkpoint = loadCheckpointOutputs(db, session, snapshot)
     let contextAnalyses = checkpoint.contextAnalyses
@@ -3721,6 +3934,10 @@ async function executeInvocationRetry(
     const startedAt = performance.now()
     let lastActivityEventAt = 0
     let nextRetryCount = 0
+    const display = createOutputPreview({
+      db, runId, sessionId: session.id, invocationId: newInvocationId,
+      operation: isContextAnalysis ? 'context_analysis' : isPoetryPlan ? 'poetry_plan' : 'worker',
+    }, 'auto', true)
     const ledgerCaller: LLMCaller = (_runtimeEndpoint, request) => {
       const retryCount = nextRetryCount
       nextRetryCount += 1
@@ -3752,12 +3969,25 @@ async function executeInvocationRetry(
         },
         model: source.model,
         maxTokens: endpoint.maxOutputTokens,
+        outputFormat: semanticOutputFormatForPrompt(system),
         messages: [
           { role: 'system', content: system },
           { role: 'user', content: user },
         ],
       }],
       {
+        onAgentAttemptStart(_agentKey, attempt) {
+          if (attempt > 0) {
+            display.reset()
+            publishReasoningPreview(session.id, newInvocationId, {
+              reasoningPreview: '', reasoningCharacters: 0, reasoningTruncated: false,
+            })
+          }
+        },
+        onAgentOutputInvalid() { display.reset() },
+        onAgentReasoning(_agentKey, preview) {
+          publishReasoningPreview(session.id, newInvocationId, preview)
+        },
         onAgentActivity() {
           const now = Date.now()
           if (now - lastActivityEventAt < 5_000) return
@@ -3768,27 +3998,24 @@ async function executeInvocationRetry(
           })
         },
         onToken(_agentKey, delta) {
-          emitEvent(db, runId, session.id, 'agent.delta', {
-            invocationId: newInvocationId,
-            delta,
-          })
+          display.push(delta)
+        },
+        onAnnotation(_agentKey, delta) {
+          display.pushAnnotation(delta)
         },
       },
       ledgerCaller,
       { sessionId: session.id },
     )
+    display.finish()
     const result = summary.results[0]
     const elapsed = Math.round(performance.now() - startedAt)
     if (!result || result.status !== 'complete') {
       throw new Error(result?.error ?? 'Agent retry failed')
     }
-    const semantic = isContextAnalysis
-      ? {
-          raw: result.content ?? '',
-          body: result.content ?? '',
-          annotation: null,
-        }
-      : parseSemanticAgentOutput(result.content ?? '')
+    const semantic = parseSemanticAgentOutput(result.content ?? '', {
+      format: semanticOutputFormatForPrompt(system),
+    })
     if (!semantic.body.trim()) {
       throw new Error('Agent returned an empty body before the FSBP boundary')
     }
@@ -3814,6 +4041,7 @@ async function executeInvocationRetry(
       annotation: semantic.annotation,
       latencyMs: elapsed,
       roleKind: variant.roleKind,
+      reasoningCharacters: result.reasoningCharacters,
     })
     if (!isAuxiliary) {
       const evidence = checkTranslationEvidence({

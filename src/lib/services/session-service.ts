@@ -76,6 +76,21 @@ export class SessionIdempotencyConflictError extends Error {
   }
 }
 
+export class PresetPromptBundleNotFoundError extends Error {
+  readonly code = 'preset_prompt_bundle_not_found'
+
+  constructor(
+    readonly direction: TranslationDirection,
+    readonly version: number,
+    readonly presetRevisionId: string,
+  ) {
+    super(
+      `This preset requires ${direction} prompt bundle version ${version}, which is missing. Restore that version or explicitly create a new preset revision using an available prompt bundle, then retry.`,
+    )
+    this.name = 'PresetPromptBundleNotFoundError'
+  }
+}
+
 // ===========================================================================
 // Public Types
 // ===========================================================================
@@ -475,12 +490,6 @@ export function createSessionService(
             'Prompt bundle revision is missing or does not match the session direction.',
           )
         }
-        const promptBundle = selectedPromptRevision
-          ? JSON.parse(selectedPromptRevision.payload_json)
-          : vnext.directionPrompts.getLatest(direction)
-        if (!promptBundle) {
-          throw new Error(`Missing direction prompt bundle: ${direction}`)
-        }
         const requestedIds = new Set(input.allowedAgentVariantIds ?? [])
         const selectedVariants =
           requestedIds.size > 0
@@ -511,6 +520,27 @@ export function createSessionService(
               'A preset revision cannot mix translation directions.',
             )
           }
+        }
+        // A preset freezes its prompt version as well as its agent roles.
+        // An explicitly selected prompt revision remains a deliberate user
+        // override. Only sessions without a preset default to the latest seed.
+        const promptBundle = selectedPromptRevision
+          ? JSON.parse(selectedPromptRevision.payload_json)
+          : presetRevision
+            ? vnext.directionPrompts.getVersion(
+                direction,
+                presetRevision.contract.promptBundleVersion,
+              )
+            : vnext.directionPrompts.getLatest(direction)
+        if (!promptBundle) {
+          if (presetRevision) {
+            throw new PresetPromptBundleNotFoundError(
+              direction,
+              presetRevision.contract.promptBundleVersion,
+              presetRevision.id,
+            )
+          }
+          throw new Error(`Missing direction prompt bundle: ${direction}`)
         }
         const executionVariants =
           presetRevision?.contract.agentVariantSnapshots ?? selectedVariants
@@ -831,12 +861,18 @@ export function createSessionService(
     // listSessions — paginated session list (most recent first)
     // ──────────────────────────────────────────────────────────
     listSessions(
-      options?: { limit?: number; offset?: number },
+      options?: {
+        limit?: number
+        offset?: number
+        direction?: SessionRow['direction']
+        order?: 'updated' | 'created'
+      },
     ): SessionRow[] {
       const limit = options?.limit ?? 20
       const offset = options?.offset ?? 0
-      const all = repos.sessions.list()
-      return all.slice(offset, offset + limit)
+      return repos.sessions.listPage({
+        limit, offset, direction: options?.direction, order: options?.order,
+      })
     },
 
     // ──────────────────────────────────────────────────────────

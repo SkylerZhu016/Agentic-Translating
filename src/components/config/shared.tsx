@@ -7,6 +7,7 @@
 
 import {
   useCallback,
+  useEffect,
   useRef,
   useState,
   type ReactNode,
@@ -121,8 +122,16 @@ export type NotifyFn = (
 export function useToasts() {
   const [toasts, setToasts] = useState<ToastItem[]>([])
   const idRef = useRef(0)
+  const timers = useRef(new Map<number, ReturnType<typeof setTimeout>>())
+
+  useEffect(() => () => {
+    for (const timer of timers.current.values()) clearTimeout(timer)
+    timers.current.clear()
+  }, [])
 
   const dismiss = useCallback((id: number) => {
+    clearTimeout(timers.current.get(id))
+    timers.current.delete(id)
     setToasts((list) => list.filter((t) => t.id !== id))
   }, [])
 
@@ -130,9 +139,11 @@ export function useToasts() {
     idRef.current += 1
     const id = idRef.current
     setToasts((list) => [...list, { id, title, message: opts?.message, tone: opts?.tone }])
-    setTimeout(() => {
+    const timer = setTimeout(() => {
       setToasts((list) => list.filter((t) => t.id !== id))
+      timers.current.delete(id)
     }, 3600)
+    timers.current.set(id, timer)
   }, [])
 
   return { toasts, push, dismiss }

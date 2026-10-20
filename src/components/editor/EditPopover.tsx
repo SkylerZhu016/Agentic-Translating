@@ -124,11 +124,15 @@ export function EditPopover({
   }, [onClose, returnFocusRef])
 
   const viewportWidth = typeof window === 'undefined' ? POPOVER_WIDTH : window.innerWidth
+  const panelWidth = Math.min(POPOVER_WIDTH, viewportWidth - VIEWPORT_MARGIN * 2)
   const centerX = anchor.left + anchor.width / 2
-  const left = clamp(centerX - POPOVER_WIDTH / 2, VIEWPORT_MARGIN, viewportWidth - POPOVER_WIDTH - VIEWPORT_MARGIN)
+  const left = clamp(centerX - panelWidth / 2, VIEWPORT_MARGIN, viewportWidth - panelWidth - VIEWPORT_MARGIN)
   const placeAbove = anchor.top - ANCHOR_GAP - panelHeight >= VIEWPORT_MARGIN
-  const top = placeAbove ? anchor.top - ANCHOR_GAP : anchor.bottom + ANCHOR_GAP
-  const caretLeft = clamp(centerX - left, 18, POPOVER_WIDTH - 18)
+  const viewportHeight = typeof window === 'undefined' ? 800 : window.innerHeight
+  const top = placeAbove
+    ? anchor.top - ANCHOR_GAP
+    : clamp(anchor.bottom + ANCHOR_GAP, VIEWPORT_MARGIN, viewportHeight - panelHeight - VIEWPORT_MARGIN)
+  const caretLeft = clamp(centerX - left, 18, panelWidth - 18)
 
   const submit = () => {
     const value = instruction.trim()
@@ -142,12 +146,14 @@ export function EditPopover({
       style={{
         left,
         top,
-        width: POPOVER_WIDTH,
+        width: panelWidth,
         transform: placeAbove ? 'translateY(-100%)' : 'none',
       }}
       role="presentation"
       /* 拦截 mousedown，避免点击浮层时塌陷文本选区（快照已存，但保留可视反馈） */
-      onMouseDown={(e) => e.preventDefault()}
+      onMouseDown={(e) => {
+        if (!(e.target instanceof HTMLElement) || !e.target.closest('input, textarea, button')) e.preventDefault()
+      }}
     >
       <div
         ref={panelRef}
@@ -195,7 +201,7 @@ export function EditPopover({
               value={instruction}
               onChange={(e) => setInstruction(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === 'Enter') {
+                if (e.key === 'Enter' && !e.nativeEvent.isComposing && e.keyCode !== 229) {
                   e.preventDefault()
                   submit()
                 }

@@ -242,6 +242,18 @@ describe('GET /api/sessions', () => {
     const res2 = await GET(req2)
     expect(res2.status).toBe(200)
   })
+
+  it('treats sessions from legacy schemas as English-to-Chinese when filtering', async () => {
+    service.createSession(DEF_INPUT)
+    const original = await GET(
+      new NextRequest('http://localhost/api/sessions?direction=en_to_zh'),
+    )
+    expect((await original.json()).total).toBe(1)
+    const other = await GET(
+      new NextRequest('http://localhost/api/sessions?direction=zh_to_en'),
+    )
+    expect(await other.json()).toEqual({ sessions: [], total: 0 })
+  })
 })
 
 // ==================================================================

@@ -200,6 +200,15 @@ describe('buildTranslatorPrompt', () => {
     expect(result.system.content).not.toContain('extra_instructions')
   })
 
+  it('uses JSON only when the caller explicitly selects the new contract', () => {
+    const legacy = buildTranslatorPrompt(template, params)
+    const structured = buildTranslatorPrompt(template, params, 'json')
+    expect(legacy.system.content).not.toContain('[protocol:json-v1]')
+    expect(structured.system.content).toContain('[protocol:json-v1]')
+    expect(structured.system.content).toContain('"body"')
+    expect(structured.system.content).toContain('"annotation"')
+  })
+
   it('throws PromptAssemblyError if template references missing var', () => {
     expect(() =>
       buildTranslatorPrompt('Text: {{missing_var}}', params),
@@ -249,6 +258,22 @@ describe('buildStagePrompt', () => {
   it('system contains the --- separator convention for body+notes', () => {
     const result = buildStagePrompt(stageTemplate, contextJson, stageSchema)
     expect(result.system.content).toContain('---')
+  })
+
+  it('supports an explicit JSON stage contract in either prompt language', () => {
+    for (const language of ['zh', 'en'] as const) {
+      const result = buildStagePrompt(
+        stageTemplate,
+        contextJson,
+        'Stage goal',
+        language,
+        'json',
+      )
+      expect(result.system.content).toContain('[protocol:json-v1]')
+      expect(result.system.content).toContain('"body"')
+      expect(result.system.content).toContain('"annotation"')
+      expect(result.system.content).not.toContain('standalone `---` line')
+    }
   })
 
   it('user contains the context JSON', () => {

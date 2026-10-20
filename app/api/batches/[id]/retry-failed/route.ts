@@ -17,9 +17,16 @@ export async function POST(
       WHERE batch_id=? AND status='failed'
     `).run(id)
     db.prepare(`
-      UPDATE batch_jobs SET status='queued', error=NULL, updated_at=datetime('now')
-      WHERE id=?
-    `).run(id)
+      UPDATE batch_jobs
+      SET status='queued', error=NULL, updated_at=datetime('now'),
+          completed_count=(
+            SELECT COUNT(*) FROM batch_items WHERE batch_id=@id AND status='completed'
+          ),
+          failed_count=(
+            SELECT COUNT(*) FROM batch_items WHERE batch_id=@id AND status='failed'
+          )
+      WHERE id=@id
+    `).run({ id })
   })()
   startBatch(db, id)
   return Response.json({ ok: true })

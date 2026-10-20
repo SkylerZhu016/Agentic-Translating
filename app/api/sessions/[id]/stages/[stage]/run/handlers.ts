@@ -17,7 +17,11 @@ import type Database from 'better-sqlite3'
 import { NextResponse } from 'next/server'
 import { createRepositories } from '@/src/lib/db/repositories'
 import { createSessionService } from '@/src/lib/services/session-service'
-import { runStage, markDownstreamStale } from '@/src/lib/orchestration/pipeline'
+import {
+  buildPipelineStagePrompt,
+  runStage,
+  markDownstreamStale,
+} from '@/src/lib/orchestration/pipeline'
 import { buildStageContext } from '@/src/lib/context/stage-context'
 import { chatCompletion } from '@/src/lib/llm/client'
 import { encodeSSE } from '@/src/lib/contracts/sse'
@@ -100,22 +104,21 @@ function getPrerequisite(stage: Stage): Stage | null {
 
 /** Build the prompt_used string for persisting (system + user content) */
 function buildPromptUsed(
+  stage: Stage,
   stageTemplate: string,
   contextJson: string,
   promptLanguage: 'zh' | 'en' = 'zh',
 ): string {
-  const system =
-    promptLanguage === 'en'
-      ? [
-          'Write freely. If you add notes, put them after a standalone --- line.',
-          'Downstream stages receive only the body before that boundary.',
-        ].join('\n')
-      : [
-          '你可以自由输出。如需添加注释/理由，请在正文后用一行 ---（markdown 水平分割线）分隔，然后写注释。',
-          '下游审查者只看正文不看注释，注释仅供人类归档参考。',
-        ].join('\n')
-
-  return `SYSTEM:\n${system}\n\nUSER:\n${stageTemplate.replace('{{context}}', contextJson)}`
+  try {
+    const { system, user } = buildPipelineStagePrompt(
+      stage, stageTemplate, contextJson, promptLanguage,
+    )
+    return `SYSTEM:\n${system.content}\n\nUSER:\n${user.content}`
+  } catch {
+    // runStage reports invalid templates through the existing stage failure
+    // path. Recording that template must not strand the row at "running".
+    return `USER:\n${stageTemplate}`
+  }
 }
 
 // =============================================================================
@@ -373,6 +376,7 @@ export function createHandlers(db: Database.Database) {
     const contextJson = JSON.stringify(contextResult.json)
 
     const promptUsedText = buildPromptUsed(
+      stage,
       stageTemplate,
       contextJson,
       sessionContext.promptLanguage,
@@ -421,8 +425,16 @@ export function createHandlers(db: Database.Database) {
                 // Already emitted above
               },
               onDelta(s, content) {
-                // Only emit for streaming stages (orchestrate, assemble)
                 sseStream(controller, 'stage_delta', { stage: s, content })
+              },
+              onAnnotation(s, content) {
+                sseStream(controller, 'stage_annotation', { stage: s, content })
+              },
+              onReasoning(s, preview) {
+                sseStream(controller, 'stage_reasoning', { stage: s, ...preview })
+              },
+              onReset(s) {
+                sseStream(controller, 'stage_reset', { stage: s })
               },
               onStageComplete(_s, _result) {
                 // Handled after runStage returns

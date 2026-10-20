@@ -206,7 +206,7 @@ test.describe('AC18 — single card retry', () => {
           },
           mainAgentBinding: defaultBinding,
           editingAgentBinding: defaultBinding,
-          promptBundleVersion: 1,
+          promptBundleVersion: (await (await request.get('/api/direction-prompt-bundles?direction=' + 'en_to_zh')).json()).version,
           maxAgentCalls: 5,
           batchConcurrency: 2,
           constraints: {},

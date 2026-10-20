@@ -1,5 +1,4 @@
-import { dictionary } from 'cmu-pronouncing-dictionary'
-import { getInitialAndFinal, pinyin } from 'pinyin-pro'
+import { chineseRhyme, englishRhyme } from './pronunciation'
 import type {
   TranslationConstraints,
   TranslationDirection,
@@ -89,37 +88,9 @@ function finalHan(text: string) {
   return Array.from(text.match(/[\p{Script=Han}]/gu) ?? []).at(-1) ?? ''
 }
 
-function mandarinFinal(character: string) {
-  if (!character) return null
-  const reading = pinyin(character, { toneType: 'none' })
-  if (!reading || reading === character) return null
-  return getInitialAndFinal(reading).final || null
-}
-
-function englishRhyme(word: string) {
-  const pronunciation = dictionary[word.toLowerCase()]
-  if (!pronunciation) return null
-  const phones = pronunciation
-    .replace(/\s+#.*$/, '')
-    .split(/\s+/)
-    .filter(Boolean)
-  let vowelIndex = -1
-  for (let index = phones.length - 1; index >= 0; index--) {
-    if (/[012]$/.test(phones[index])) {
-      vowelIndex = index
-      if (/[12]$/.test(phones[index])) break
-    }
-  }
-  if (vowelIndex < 0) return null
-  return phones
-    .slice(vowelIndex)
-    .map((phone) => phone.replace(/[012]/g, ''))
-    .join('-')
-}
-
 function sourceRhymeSignature(line: PoetrySourceLine) {
   const han = finalHan(line.text)
-  if (han) return mandarinFinal(han)
+  if (han) return chineseRhyme(han)
   const ending = line.text.match(/[A-Za-z]+(?:['’-][A-Za-z]+)*$/)?.[0]
   return ending ? englishRhyme(ending.replace(/’/g, "'")) : null
 }
@@ -455,7 +426,9 @@ export function analyzePoetrySource(input: {
             : lineSignal
               ? '检测到多行诗体排版'
               : '未检测到足够强的诗歌信号'
-  const sourceRhyme = stableSourceRhyme(lines)
+  const sourceRhyme = isPoetry
+    ? stableSourceRhyme(lines)
+    : { stable: false, rhymeLines: [], signatures: lines.map(() => null) }
   const sourceStableScheme = schemeFor(
     lines,
     sourceRhyme.rhymeLines,

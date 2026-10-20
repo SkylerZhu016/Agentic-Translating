@@ -37,6 +37,10 @@ export function resolveDesktopRuntime(options: {
 }): DesktopRuntime
 
 export function serverEntryFor(runtime: DesktopRuntime): string
+export function assertRuntimeAssets(
+  runtime: DesktopRuntime,
+  existsImpl?: (path: string) => boolean,
+): void
 export function sanitizeRuntimeEnvironment(env?: RuntimeEnvironment): RuntimeEnvironment
 
 export function createServerEnvironment(

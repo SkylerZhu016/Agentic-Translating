@@ -25,7 +25,7 @@ test('100 UTF-8 TXT/Markdown files complete with frozen preset and mirrored ZIP 
   await setMockBehavior(request, {
     behavior: 'json_content',
     model: 'batch-stage',
-    jsonContent: 'A stable translated batch result.\nSecond translated line.',
+    jsonContent: JSON.stringify({ body: 'A stable translated batch result.\nSecond translated line.', annotation: null }),
   })
   const endpointResponse = await request.post('/api/endpoints', {
     data: { name: 'Batch Mock', base_url: MOCK_URL, api_key: 'sk-batch' },
@@ -63,7 +63,7 @@ test('100 UTF-8 TXT/Markdown files complete with frozen preset and mirrored ZIP 
         agentBindingOverrides: {},
         mainAgentBinding: stageBinding,
         editingAgentBinding: stageBinding,
-        promptBundleVersion: 1,
+        promptBundleVersion: (await (await request.get('/api/direction-prompt-bundles?direction=' + 'en_to_zh')).json()).version,
         maxAgentCalls: 5,
         batchConcurrency: 2,
         constraints: { preserveParagraphs: true },

@@ -496,7 +496,7 @@ describe('translation tool migration 16 compatibility', () => {
     ]))
     expect(db.prepare(
       'SELECT MAX(version) FROM migrations',
-    ).pluck().get()).toBe(18)
+    ).pluck().get()).toBe(19)
 
     const repository = createTranslationToolRepository(db)
     expect(repository.getCall('legacy-complete-call')).toMatchObject({

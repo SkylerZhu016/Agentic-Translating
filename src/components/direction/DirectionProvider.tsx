@@ -124,7 +124,7 @@ export function DirectionProvider({ children }: { children: ReactNode }) {
       setPending(target)
       return
     }
-    void performSwitch(target, false)
+    void performSwitch(target, false).catch(() => undefined)
   }, [direction, pathname, performSwitch, searchParams, suppressed])
 
   const registerDraftController = useCallback((controller: DraftController | null) => {
@@ -159,7 +159,7 @@ export function DirectionProvider({ children }: { children: ReactNode }) {
             <Button
               size="sm"
               testId={TID.direction.confirmButton}
-              onClick={() => pending && void performSwitch(pending, suppressChecked)}
+              onClick={() => pending && void performSwitch(pending, suppressChecked).catch(() => undefined)}
             >
               {pending === 'zh_to_en'
                 ? t('direction.warning.confirmZhToEn')

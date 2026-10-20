@@ -6,6 +6,9 @@
   "license": "MIT",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "main": "electron/main.mjs",
   "scripts": {
     "dev": "node scripts/launch-desktop.mjs --web-dev",
@@ -21,6 +24,7 @@
     "verify:release-tree": "node scripts/verify-release-tree.mjs",
     "verify:standalone-smoke": "node scripts/smoke-standalone.mjs",
     "desktop": "node scripts/launch-desktop.mjs",
+    "desktop:dev": "node scripts/launch-desktop.mjs --dev",
     "desktop:preview": "node scripts/launch-desktop.mjs --preview",
     "icon:build": "node scripts/generate-icon.mjs",
     "package:win": "node scripts/package-win.mjs",

@@ -1,6 +1,8 @@
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:net'
+import { existsSync } from 'node:fs'
 import path from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 
 export const DESKTOP_PORT = 3210
 export const DESKTOP_RUNTIME_ENV = 'AGENTIC_DESKTOP_RUNTIME'
@@ -85,6 +87,21 @@ export function resolveDesktopRuntime({
 
 export function serverEntryFor(runtime) {
   return runtime.args[0]
+}
+
+export function assertRuntimeAssets(runtime, existsImpl = existsSync) {
+  const entry = serverEntryFor(runtime)
+  const required = runtime.kind === 'development'
+    ? [entry]
+    : [entry, path.join(runtime.root, '.next', 'static'), runtime.migrationsDir]
+  const missing = required.find((asset) => !existsImpl(asset))
+  if (missing) {
+    throw new DesktopRuntimeError(
+      runtime.kind === 'preview' ? 'preview_missing' : 'server_missing',
+      missing,
+      { serverFile: missing, runtime: runtime.kind },
+    )
+  }
 }
 
 export function sanitizeRuntimeEnvironment(env = process.env) {
@@ -218,22 +235,28 @@ async function pollReady(url, {
   fetchImpl,
   timeoutMs,
   intervalMs,
+  signal,
 }) {
   const deadline = Date.now() + timeoutMs
   let lastFailure = 'not_ready'
   while (Date.now() < deadline) {
+    signal.throwIfAborted()
     try {
       const response = await fetchImpl(url, {
         cache: 'no-store',
-        signal: AbortSignal.timeout(Math.min(1_500, timeoutMs)),
+        signal: AbortSignal.any([
+          signal,
+          AbortSignal.timeout(Math.max(1, Math.min(1_500, deadline - Date.now()))),
+        ]),
       })
       const payload = await response.json().catch(() => null)
       if (isReadyHealthPayload(response, payload, expectedNonce)) return payload
       lastFailure = `health_${response.status}: ${JSON.stringify(payload)}`
     } catch (error) {
+      signal.throwIfAborted()
       lastFailure = error instanceof Error ? error.message : String(error)
     }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs))
+    await delay(Math.max(0, Math.min(intervalMs, deadline - Date.now())), undefined, { signal })
   }
   throw new DesktopRuntimeError(
     'health_timeout',
@@ -251,9 +274,16 @@ export async function waitForManagedServer(child, {
   intervalMs = 250,
 }) {
   const failure = childFailure(child, logFile)
+  const controller = new AbortController()
   try {
     return await Promise.race([
-      pollReady(url, { expectedNonce, fetchImpl, timeoutMs, intervalMs }),
+      pollReady(url, {
+        expectedNonce,
+        fetchImpl,
+        timeoutMs,
+        intervalMs,
+        signal: controller.signal,
+      }),
       failure.promise,
     ])
   } catch (error) {
@@ -266,6 +296,7 @@ export async function waitForManagedServer(child, {
     }
     throw error
   } finally {
+    controller.abort()
     failure.cleanup()
   }
 }

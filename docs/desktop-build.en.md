@@ -21,15 +21,18 @@ In production web environments, a strong random `AGENTIC_SECRET_KEY` must be set
 
 ## 3. Build
 
-Source development and standalone preview are deliberately separate:
+Daily desktop use runs the production standalone build:
 
 ```bash
-npm run desktop
 npm run build:standalone
-npm run desktop:preview
+npm run desktop
 ```
 
-`desktop` starts Electron plus a managed Next.js development server and uses `.next-electron-dev`; no standalone build is required. The normal `dev` command uses `.next-web-dev`, so simultaneous source entry points do not write the same Next cache. `desktop:preview` reads only the existing `.next/standalone` tree. If it is missing, the app explains which two commands to run and exits without building anything. Packaged applications always start `resources/app/server.js` and never fall back to a source or development server.
+`desktop` reads the existing `.next/standalone` tree, which avoids keeping the development compiler and source-file watchers in memory. Build once before the first launch and rebuild after changing the source. If the build is missing, the app explains the preparation commands and exits without an implicit build. `desktop:preview` remains an alias for the same production mode. Packaged applications always start `resources/app/server.js`.
+
+For source development with live updates, use `npm run desktop:dev`. It starts Electron with a managed Next.js development server and the isolated `.next-electron-dev` cache. The normal `dev` command uses `.next-web-dev`, so the two development entry points keep separate caches. This mode needs no standalone build and uses more memory for development tooling.
+
+Closing the desktop checks only whether active work exists, without loading translation history or configuration snapshots. Running work offers the tray, cancel, and exit choices. If the local service does not return a valid status within three seconds, the window stays open until the user chooses what to do. Before exiting, the desktop asks the editor to finish saving the latest draft, including edits made immediately before closing. A failed save or an eight-second timeout keeps the window open and offers returning to the workspace or explicitly discarding unsaved changes. Confirmed exit waits for the managed service to stop and its local port to be released.
 
 ```bash
 npm ci
@@ -48,7 +51,7 @@ Current Windows x64 artifacts live under `dist-electron/`:
 - `Agentic Translating-0.1.1-setup-x64.exe`
 - `Agentic Translating-0.1.1-portable-x64.exe`
 
-At runtime, the desktop app starts the standalone server from `resources/app` and resolves server dependencies through read-only `app.asar/node_modules`. `better-sqlite3` is placed in `app.asar.unpacked` by electron-builder. The build machine requires Node.js 22 or later and a working Windows C++ build toolchain, so that prebuilt packages can be rebuilt from source when missing.
+At runtime, the desktop app starts the standalone server from `resources/app` and resolves server dependencies through read-only `app.asar/node_modules`. `better-sqlite3` is placed in `app.asar.unpacked` by electron-builder. The build machine requires Node.js 22.12.0 or later and a working Windows C++ build toolchain, so that prebuilt packages can be rebuilt from source when missing.
 
 ## 4. Docker
 

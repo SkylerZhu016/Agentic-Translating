@@ -2,7 +2,7 @@
 
 ## Abstract
 
-This project is positioned as a multi-option translation decision workbench for difficult texts. It covers bidirectional translation across literature, poetry, normative texts, and academic technical writing — domains where no single correct answer exists. Rather than treating multiple agents as independent task parallelizers, the system uses them as candidate generators that examine the same problem from different angles. The master agent handles casting, comparison, deliberation, fusion, and versioned revision. The core method, FSBP, combines free text, a stage-body semantic contract, the final standalone `---` boundary, raw archival, and explicit separation of body and annotation. Workflows default to body-only inheritance and may explicitly pass annotations downstream as untrusted supporting material; the disagreement map always compares bodies only.
+This project is a personal Chinese–English translation workbench. Multiple roles produce candidates for the same source, and a fixed deliberation workflow compares and assembles them after a single user submission. New built-in prompts use JSON to separate the deliverable from brief notes. Provider reasoning has a separate, bounded live preview. Candidate outputs, stages, and text versions remain traceable, while tool collaboration is an optional exploratory mode. Historical FSBP sessions and presets retain their frozen protocols.
 
 vNext adds 10 agent prototypes, 20 language-direction variants, bidirectional prompt packs, dynamic/fixed teaming, two drafting pipelines, evidence-based editing, revision presets, batch queuing, history recovery, Windows Electron, and Docker self-deployment. The fourth iteration further introduces a disagreement map, project-level translation archives, a first-run guide with an endpoint compatibility doctor, and local analytics backed by actual call records. These capabilities share candidate, version, project-snapshot, and call-ledger data rather than forming disconnected feature islands.
 
@@ -23,9 +23,15 @@ This project therefore addresses four questions simultaneously:
 
 10 agent prototypes cover foundational, expressive, domain-specific, creative, and adversarial perspectives. The master agent's persistent context contains only a brief directory; full role prompts are injected on demand. The backend guarantees at least two successful candidates from distinct prototypes, falling back to a "faithful + natural" strategy when dynamic selection fails.
 
-### 2.2 FSBP
+### 2.2 JSON Content Contract and Historical Compatibility
 
-Models return complete free-form text. The system saves the raw output and parses the body and annotation separately. The default policy passes only the body to downstream agents; users may explicitly select `body_and_annotation` in a workflow preset to pass the separated annotation as supporting material that still requires independent verification. The protocol does not mandate fixed fields, but it does assign a stable purpose to each stage body: review carries error and risk evidence, filtering carries keep and repair decisions, orchestration carries a complete working translation, and assembly carries the final translation. Process notes and self-evaluation belong in the annotation. Precise state changes are still handled by minimal tool JSON.
+Prompts marked `[protocol:json-v1]` require exactly `body` and `annotation`. The program preserves the original content-channel response, validates the completed object, and incrementally decodes readable text while streaming. Downstream stages inherit the body by default. A preset may explicitly pass annotations as supporting material requiring independent verification.
+
+The client automatically enables `json_object` only for requests matching the official DeepSeek origin, path, and model allowlists, with a JSON-marked system prompt and no tools or tool choice. Third-party gateways retain their existing request format. Provider JSON mode and strict application field validation remain separate checks. The [protocol specification](protocol-spec.en.md) gives the exact conditions.
+
+Stage deliverables remain distinct: review provides issues and evidence, filtering records keep/repair decisions, orchestration produces a working translation, and assembly produces the final text. Provider reasoning is handled separately with bounded live previews and persistent diagnostic counts. Historical prompts and frozen presets retain their original format. Exports and chat evidence use the saved prompt contract, preserving old prose that happens to look like a JSON object.
+
+The four-stage workflow in built-in bidirectional prompt bundle v24 uses one integrated review covering fidelity and logic, naturalness and voice, and task and genre constraints. Filtering independently checks review claims against the full source, and assembly checks the result against the source, user brief, and selected base candidate for regressions. A standalone `[review:integrated-v1]` line in the frozen `reviewPrompt` selects this strategy. Older unmarked sessions retain three independent review calls with at least two successful results. The strategy uses existing snapshots and requires no new database migration.
 
 ### 2.3 Bidirectional Prompts
 
@@ -40,6 +46,8 @@ The English-to-Chinese orchestration chain uses Chinese prompts; the Chinese-to-
 The server owns running tasks; SSE is merely a reconnectable subscription channel. Events carry monotonically increasing sequence numbers and are persisted to the database. Browser departure does not cancel a running task; on startup, any remaining `running` flag is marked as `interrupted`. Configuration snapshots freeze actual endpoints and model bindings; public DTOs expose only endpoint summaries and `hasApiKey`.
 
 SQLite stores sessions, candidate raw/body/annotation, stage outputs, tool events, versions, Patches, drafts, preset revisions, and batches. Old schemas remain read-compatible; migrations avoid destructive deletions.
+
+Role default profiles and workflow presets store a per-call output budget in the model binding's `maxOutputTokens`. Reasoning and the response body share this allowance. A null value uses the current application default of 4,096 tokens, while a positive integer sets an explicit budget. The suggested 32,768 setting for long DeepSeek reasoning remains subject to the selected model's supported limit. Switching models preserves the budget, and historical sessions continue to use frozen bindings.
 
 ### 3.1 Disagreement Map
 
@@ -69,7 +77,9 @@ The History page displays only aggregates from recorded ledger entries: recorded
 
 The direction toggle in the top bar adds no navigation hierarchy. When switching with a non-empty draft or existing session, a modal clearly states that the previous progress has been saved; "Don't ask again" is persisted only after confirming the switch. Each direction has its own SQLite draft.
 
-New UI reuses existing Card, Badge, Modal, Button, Textarea, and Spinner components and the paper-ink color palette. The disagreement map sits in the final translation and evidence area; project archives plus onboarding and compatibility checks live on the Configuration page; call analytics live on the History page. They add no top-level navigation and do not alter the main two-column skeleton.
+The workbench organizes a session into Source & candidates, Generation progress, and Translation editor. Panels stay mounted to retain drafts and streaming state while switching steps. Source text and the translation brief appear together, with advanced workflow options available on demand. The editor offers a source reference, translation copying, and passage-level revision, while versions, evidence, and candidate disagreements remain accessible without filling the initial screen. Shared UI components use white reading surfaces, a muted background, and green primary actions.
+
+Settings are grouped into setup, connections, workflows, project memory, agents, prompts, and preferences. Each panel loads on its first visit and retains its unsaved form afterward. History separates sessions, batches, and usage, and offers pagination, search within loaded sessions, and workflow recovery from the recycle bin. The daily desktop entry uses a production build, with a separate development entry. Background pages pause polling, active workspaces request only the team decision they need, and event subscriptions replay bounded batches on demand.
 
 ## 5. Deterministic Checks
 
@@ -80,7 +90,9 @@ The backend checks paragraphs/sections, non-empty lines, required/forbidden word
 
 Checkers do not modify or reject candidates; they only pass natural-language evidence to the deliberation agent.
 
-## 6. FSBP Validation Plan
+## 6. Historical FSBP Validation Plan
+
+The following section records earlier experimental plans and materials. The [protocol specification](protocol-spec.en.md) documents the current content contract and compatibility rules. Formal translation-quality evaluation of the current source changes is still pending, and the material below remains historical development evidence.
 
 The samples, runner, and outputs from the early pilot have been retired and
 must not be treated as quality evidence for the current architecture. The
@@ -114,7 +126,9 @@ frozen holdout that no participant has reviewed or used for tuning.
 
 ## 8. Engineering Completeness
 
-This delivery expands the prototype into a complete system encompassing data migration, protocols, bidirectional agents, server-side orchestration, auditable versioning, batch processing, desktop distribution, self-deployment, and dataset validation tooling, together with project archives, endpoint capability profiles, a derived disagreement view, and a unified call ledger. The 2026-08-11 candidate-source gates completed with all 911 tests in 91 Vitest files passing, TypeScript type checking passing, and the standalone production build, 2,402-file release-tree scan, and isolated migration-14 startup smoke passing. Playwright reported 21 passes and 13 explicit skips out of 34 cases; the skipped fixtures target legacy manual workflows superseded by v3. The single-Agent retry path also passed ten consecutive repetitions after its ordering-race fix. Windows installer packaging and Docker health checks were not rerun for this candidate-source validation, so this report does not present them as completed gates for the iteration.
+The system includes data migration, protocols, bidirectional agents, server-side orchestration, auditable versioning, batch processing, desktop distribution, self-deployment, and dataset validation tooling, together with project archives, endpoint capability profiles, a derived disagreement view, and a unified call ledger. Historical candidate-source validation on 2026-08-11 recorded 911 passing tests in 91 Vitest files, TypeScript validation, a standalone production build, a 2,402-file release-tree scan, and an isolated migration-14 startup smoke. Playwright reported 21 passes and 13 explicit skips out of 34 cases, with skipped fixtures targeting legacy manual workflows superseded by v3. The single-Agent retry path passed ten consecutive repetitions after its ordering-race fix. Windows installer packaging and Docker health checks were not rerun for that validation.
+
+Current source includes migration 19. An earlier full-suite run during this source iteration recorded 1,416 passing Vitest tests, with subsequent targeted regression checks recorded separately. The JSON content contract, integrated review, role output budgets, appearance themes, and bounded reasoning/streaming previews have not yet been packaged in a new release, and public downloads remain v0.2.0. Each record describes engineering validation at its tested revision. Formal translation-quality evaluation is still pending.
 
 ## 9. Future Work
 
@@ -123,4 +137,4 @@ This delivery expands the prototype into a complete system encompassing data mig
 - More precise vendor tokenizer and cost estimation;
 - DOCX/PDF format-preserving import and export;
 - EPUB support is deferred; future work should evaluate a mature, clearly licensed parser and round-trip implementation instead of rebuilding the format pipeline from scratch;
-- Multi-device encrypted sync and team review permissions.
+- Further improvements to personal workflows, long-session resource use, and interruption recovery.

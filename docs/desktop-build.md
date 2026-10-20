@@ -21,15 +21,18 @@ Web 生产环境必须显式设置强随机的 `AGENTIC_SECRET_KEY`。开发环�
 
 ## 3. 构建
 
-源码开发和 standalone 预览采用两个明确入口：
+日常使用采用已构建的 standalone 桌面版本：
 
 ```bash
-npm run desktop
 npm run build:standalone
-npm run desktop:preview
+npm run desktop
 ```
 
-`desktop` 直接启动 Electron 和由其托管的 Next.js 开发服务，使用 `.next-electron-dev`，无需先构建。普通 `dev` 命令使用 `.next-web-dev`，两个源码入口不会写入同一份 Next 缓存。`desktop:preview` 只读取已有的 `.next/standalone`；缺失时会提示应执行的两条命令并退出，不会隐式构建。打包应用始终只启动 `resources/app/server.js`，不会回退到源码或开发服务。
+`desktop` 读取已有的 `.next/standalone`，日常运行时无需让开发编译器和源码文件监听常驻内存。首次使用前构建一次，修改源码后重新构建。缺少产物时，应用会给出上述准备命令并退出，由用户明确执行构建。`desktop:preview` 保留为同一生产模式的兼容入口。打包应用始终启动 `resources/app/server.js`。
+
+修改代码并实时查看效果时，使用 `npm run desktop:dev`。它启动 Electron 和由其托管的 Next.js 开发服务，使用独立的 `.next-electron-dev` 缓存。普通 `dev` 命令使用 `.next-web-dev`，两个开发入口分别维护缓存。开发模式可以直接启动，额外的编译和监听功能会占用更多内存。
+
+关闭窗口时，桌面只查询是否有活动任务，无需加载翻译历史与配置快照。有工作正在运行时，可以选择最小化到托盘、取消关闭或退出。如果本地服务在三秒内没有返回有效状态，窗口会保留，等待用户选择。实际退出前，桌面会等待编辑器保存最新草稿，覆盖刚输入就关闭窗口的情形。保存失败或等待超过八秒时，窗口会保留，用户可以返回工作台，或明确选择放弃尚未保存的更改。确认退出后，桌面会等待本地服务及其子进程停止，并确认端口已释放。
 
 ```bash
 npm ci
@@ -48,7 +51,7 @@ npm run package:win
 - `Agentic Translating-0.2.0-setup-x64.exe`
 - `Agentic Translating-0.2.0-portable-x64.exe`
 
-桌面运行时从 `resources/app` 启动 standalone 服务，并通过只读的 `app.asar/node_modules` 解析服务器依赖。`better-sqlite3` 仍由 electron-builder 放入 `app.asar.unpacked`。构建机需要 Node.js 22 或更高版本，以及可用的 Windows C++ 构建工具链，以便在预编译包缺失时从源码重建。
+桌面运行时从 `resources/app` 启动 standalone 服务，并通过只读的 `app.asar/node_modules` 解析服务器依赖。`better-sqlite3` 仍由 electron-builder 放入 `app.asar.unpacked`。构建机需要 Node.js 22.12.0 或更高版本，以及可用的 Windows C++ 构建工具链，以便在预编译包缺失时从源码重建。
 
 ## 4. Docker
 

@@ -15,6 +15,24 @@ import {
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
+export function parseLaunchArguments(args = []) {
+  const [flag, ...rest] = args
+  const modes = {
+    '--dev': 'development',
+    '--preview': 'preview',
+    '--web-dev': 'web-dev',
+    '--build': 'build',
+  }
+  if (!flag) return { mode: 'preview', forwardedArgs: [] }
+  const mode = modes[flag]
+  if (!mode) {
+    throw new Error(
+      `Unknown launch option: ${flag}. Use npm run desktop for daily use, or npm run desktop:dev for development.`,
+    )
+  }
+  return { mode, forwardedArgs: rest }
+}
+
 export function desktopLaunchSpec(mode, {
   cwd = root,
   env = process.env,
@@ -179,16 +197,12 @@ const isMain = process.argv[1] &&
   pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url
 
 if (isMain) {
-  const flag = process.argv[2]
-  const mode = flag === '--web-dev'
-    ? 'web-dev'
-    : flag === '--preview'
-      ? 'preview'
-      : flag === '--build'
-        ? 'build'
-        : 'development'
-  const forwardedArgs = flag?.startsWith('--')
-    ? process.argv.slice(3)
-    : process.argv.slice(2)
+  const [major, minor] = process.versions.node.split('.').map(Number)
+  if (major < 22 || (major === 22 && minor < 12)) {
+    throw new Error(
+      `Agentic Translating requires Node.js 22.12.0 or later (current: ${process.versions.node}). Update Node.js before starting or building the app.`,
+    )
+  }
+  const { mode, forwardedArgs } = parseLaunchArguments(process.argv.slice(2))
   await launch(mode, forwardedArgs)
 }

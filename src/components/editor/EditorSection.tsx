@@ -13,10 +13,11 @@
 // ---------------------------------------------------------------------------
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { parseSSEChunk } from '@/src/lib/contracts/sse'
+import { parseSSEChunk, takeCompleteSSEText } from '@/src/lib/contracts/sse'
+import { REASONING_PREVIEW_LIMIT } from '@/src/lib/llm/reasoning-preview'
 import type { SessionState } from '@/src/lib/contracts/types'
 import { emitSessionChanged, useSessionFull, type SessionFullResponse } from '@/src/components/coordinator'
-import { Badge, Card } from '@/src/components/ui'
+import { Badge, Button, Card } from '@/src/components/ui'
 import { changedRange } from './changed-range'
 import { ChatPanel } from './ChatPanel'
 import { FinalTextPanel } from './FinalTextPanel'
@@ -35,6 +36,7 @@ import { localizeEvidenceSummary } from '@/src/i18n/evidence'
 
 /** 高亮停留时长（ms） */
 const HIGHLIGHT_DURATION = 2600
+const STREAM_RENDER_INTERVAL = 50
 
 // ── 服务端历史消息 → 视图模型 ─────────────────────────────────
 function toView(message: ChatMessage): ChatMessageView {
@@ -57,8 +59,8 @@ type ChatActivityPhase =
   | 'generating'
   | 'applying_edits'
 
-export function EditorSection() {
-  const { t } = useI18n()
+export function EditorSection({ className = '' }: { className?: string }) {
+  const { t, formatNumber } = useI18n()
   const { data, sessionId, candidateRevision, refresh } = useSessionFull()
 
   /** 本地流式叠加层：乐观用户消息 + 流式 AI 消息；服务端落库后清空 */
@@ -67,13 +69,34 @@ export function EditorSection() {
   const [localChatStartedAt, setLocalChatStartedAt] = useState<number | null>(null)
   const [localChatPhase, setLocalChatPhase] = useState<ChatActivityPhase>('waiting_for_model')
   const [highlight, setHighlight] = useState<{ start: number; end: number } | null>(null)
+  const [chatError, setChatError] = useState<string | null>(null)
+  const [showSource, setShowSource] = useState(true)
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'error'>('idle')
+  const [mutating, setMutating] = useState(false)
 
   const highlightTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const toolSeq = useRef(0)
+  const currentSessionRef = useRef(sessionId)
+  currentSessionRef.current = sessionId
+  const activeChat = useRef<{ controller: AbortController; sessionId: string } | null>(null)
+  const restoreInFlight = useRef<string | null>(null)
+  const suggestionController = useRef<AbortController | null>(null)
+  const chatBaselineIds = useRef<Set<number> | null>(null)
+  const mutationLock = useRef(false)
+  const onMutationChange = useCallback((value: boolean) => {
+    mutationLock.current = value
+    setMutating(value)
+  }, [])
 
   const sessionState = (data?.session.state ?? null) as SessionState | null
   const versions = useMemo(() => data?.versions ?? [], [data?.versions])
-  const serverMessages = useMemo(() => (data?.messages ?? []).map(toView), [data?.messages])
+  const serverMessages = useMemo(
+    () => (data?.messages ?? [])
+      .filter((message) => !streaming || !chatBaselineIds.current || chatBaselineIds.current.has(message.id))
+      .map(toView),
+    [data?.messages, streaming],
+  )
   const messages = useMemo(() => [...serverMessages, ...live], [serverMessages, live])
 
   // ── 派生：当前版本 / 当前文本 ───────────────────────────────
@@ -82,6 +105,7 @@ export function EditorSection() {
     [data?.finalVersion],
   )
   const currentText = currentVersion?.text ?? ''
+  const characterCount = useMemo(() => Array.from(currentText).length, [currentText])
   const currentVersionNo = currentVersion?.version_no ?? null
   const remoteChatActive = data?.chatActivity?.active === true && !streaming
   const chatBusy = streaming || remoteChatActive
@@ -103,19 +127,27 @@ export function EditorSection() {
       ? t('editor.disabled.done')
       : t('editor.disabled.waitAssembly')
 
-  // ── 流式叠加层局部更新（最后一条 streaming 消息）────────────
-  const patchStreamingMessage = useCallback((patch: (msg: ChatMessageView) => ChatMessageView) => {
-    setLive((prev) => {
-      const next = [...prev]
-      for (let i = next.length - 1; i >= 0; i--) {
-        if (next[i].streaming) {
-          next[i] = patch(next[i])
-          return next
-        }
-      }
-      return prev
-    })
-  }, [])
+  useEffect(() => {
+    setLive([])
+    setStreaming(false)
+    setChatError(null)
+    setHighlight(null)
+    setCopyState('idle')
+    mutationLock.current = false
+    setMutating(false)
+    setLocalChatStartedAt(null)
+    setLocalChatPhase('waiting_for_model')
+    chatBaselineIds.current = null
+    return () => {
+      activeChat.current?.controller.abort()
+      activeChat.current = null
+      suggestionController.current?.abort()
+      suggestionController.current = null
+      restoreInFlight.current = null
+      if (highlightTimer.current) clearTimeout(highlightTimer.current)
+      if (copyTimer.current) clearTimeout(copyTimer.current)
+    }
+  }, [sessionId])
 
   // ── 编辑生效：对新旧文本求变更区间 → 滚动 + 高亮 ─────────────
   const flashChange = useCallback((before: string, after: string) => {
@@ -126,14 +158,35 @@ export function EditorSection() {
     highlightTimer.current = setTimeout(() => setHighlight(null), HIGHLIGHT_DURATION)
   }, [])
 
-  useEffect(() => () => {
-    if (highlightTimer.current) clearTimeout(highlightTimer.current)
-  }, [])
-
   // ── 发送聊天（可带选中片段）─────────────────────────────────
   const sendChat = useCallback(
     async (message: string, selection?: SelectionSnapshot) => {
-      if (!canChat || streaming || !sessionId) return
+      if (!message.trim() || !canChat || chatBusy || !sessionId || activeChat.current || mutationLock.current) return
+
+      const request = { controller: new AbortController(), sessionId }
+      activeChat.current = request
+      chatBaselineIds.current = new Set((data?.messages ?? []).map((entry) => entry.id))
+      const isCurrent = () => activeChat.current === request &&
+        currentSessionRef.current === sessionId && !request.controller.signal.aborted
+      const aiId = `local-ai-${crypto.randomUUID()}`
+      const patchMessage = (patch: (msg: ChatMessageView) => ChatMessageView) => {
+        if (!isCurrent()) return
+        setLive((previous) => previous.map((msg) => msg.id === aiId ? patch(msg) : msg))
+      }
+      let deltaBuffer = ''
+      let renderTimer: ReturnType<typeof setTimeout> | null = null
+      let completed = false
+      let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
+      const flushDelta = () => {
+        if (renderTimer != null) clearTimeout(renderTimer)
+        renderTimer = null
+        const text = deltaBuffer
+        deltaBuffer = ''
+        if (text) patchMessage((msg) => ({ ...msg, content: msg.content + text }))
+      }
+      const fail = (note: string) => {
+        if (isCurrent()) setChatError(note)
+      }
 
       const beforeText = currentText
       const userContent = selection
@@ -142,8 +195,9 @@ export function EditorSection() {
 
       setLive([
         { id: `local-user-${Date.now()}`, role: 'user', content: userContent },
-        { id: `local-ai-${Date.now()}`, role: 'assistant', content: '', streaming: true, toolCalls: [] },
+        { id: aiId, role: 'assistant', content: '', streaming: true, toolCalls: [] },
       ])
+      setChatError(null)
       setStreaming(true)
       setLocalChatStartedAt(Date.now())
       setLocalChatPhase('waiting_for_model')
@@ -153,7 +207,9 @@ export function EditorSection() {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(selection ? { message, selection } : { message }),
+          signal: request.controller.signal,
         })
+        if (!isCurrent()) return
 
         if (!res.ok || !res.body) {
           let note = t('editor.error.request', { status: res.status })
@@ -161,35 +217,59 @@ export function EditorSection() {
             const errBody = (await res.json()) as { message?: string; error?: string }
             note = localizeDiagnosticError(t, errBody.error, note)
           } catch { /* 非 JSON 错误体 */ }
-          patchStreamingMessage((msg) => ({ ...msg, streaming: false, error: note }))
+          fail(note)
           return
         }
 
         // ── SSE 消费：message_start/delta/tool_call/tool_result/message_complete/done
-        const reader = res.body.getReader()
+        reader = res.body.getReader()
         const decoder = new TextDecoder()
         let pending = ''
 
         const handleEvent = (event: string, raw: string) => {
+          if (!isCurrent()) return
           let data: Record<string, unknown> = {}
           try {
-            data = raw ? (JSON.parse(raw) as Record<string, unknown>) : {}
-          } catch { /* 容错：忽略坏帧 */ }
+            const payload: unknown = raw ? JSON.parse(raw) : {}
+            if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return
+            data = payload as Record<string, unknown>
+          } catch { return }
 
           switch (event) {
             case 'activity': {
               if (data.phase === 'thinking') setLocalChatPhase('thinking')
               break
             }
+            case 'reasoning': {
+              if (typeof data.reasoningPreview !== 'string' ||
+                typeof data.reasoningCharacters !== 'number' ||
+                !Number.isFinite(data.reasoningCharacters) ||
+                data.reasoningCharacters < 0) break
+              const preview = data.reasoningPreview.slice(-REASONING_PREVIEW_LIMIT)
+              const characters = Math.floor(data.reasoningCharacters)
+              const truncated = data.reasoningTruncated === true ||
+                data.reasoningPreview.length > preview.length
+              // Bounded snapshots arrive at most every 200 ms. Never concatenate
+              // this channel into the assistant body or the next chat request.
+              patchMessage((msg) => ({
+                ...msg,
+                reasoningPreview: preview,
+                reasoningCharacters: Math.max(msg.reasoningCharacters ?? 0, characters),
+                reasoningTruncated: truncated,
+              }))
+              break
+            }
             case 'delta': {
               const text = (data as DeltaData).text ?? ''
-              if (text) {
+              if (typeof text === 'string' && text) {
                 setLocalChatPhase('generating')
-                patchStreamingMessage((msg) => ({ ...msg, content: msg.content + text }))
+                deltaBuffer += text
+                if (renderTimer == null) renderTimer = setTimeout(flushDelta, STREAM_RENDER_INTERVAL)
               }
               break
             }
             case 'tool_call': {
+              flushDelta()
               setLocalChatPhase('applying_edits')
               const payload = data as ToolCallData
               const call: ToolCallView = {
@@ -199,14 +279,14 @@ export function EditorSection() {
                 newString: typeof payload.arguments?.new_string === 'string' ? payload.arguments.new_string : '',
                 status: 'pending',
               }
-              patchStreamingMessage((msg) => ({ ...msg, toolCalls: [...(msg.toolCalls ?? []), call] }))
+              patchMessage((msg) => ({ ...msg, toolCalls: [...(msg.toolCalls ?? []), call] }))
               break
             }
             case 'tool_result': {
               setLocalChatPhase('applying_edits')
               const payload = data as ToolResultData
               if (payload.version_no != null) break // 落库确认帧：refresh 后整体呈现
-              patchStreamingMessage((msg) => {
+              patchMessage((msg) => {
                 const calls = [...(msg.toolCalls ?? [])]
                 const idx = calls.map((c) => c.status).lastIndexOf('pending')
                 if (idx === -1) return msg
@@ -219,20 +299,21 @@ export function EditorSection() {
               break
             }
             case 'message_complete': {
+              flushDelta()
+              completed = true
               const payload = data as CompleteData
               if (payload.error) {
-                patchStreamingMessage((msg) => ({
-                  ...msg,
-                  streaming: false,
-                  error: localizeDiagnosticError(
-                    t,
-                    payload.error,
-                    t('editor.error.reply'),
-                  ),
-                }))
+                fail(localizeDiagnosticError(
+                  t,
+                  payload.error,
+                  t('editor.error.reply'),
+                ))
               }
               break
             }
+            case 'done':
+              completed = true
+              break
             default:
               break // message_start / done / 未知事件
           }
@@ -241,55 +322,76 @@ export function EditorSection() {
         for (;;) {
           const { done, value } = await reader.read()
           if (done) break
+          if (!isCurrent()) return
           pending += decoder.decode(value, { stream: true })
-          const cut = pending.lastIndexOf('\n\n')
-          if (cut === -1) continue
-          const complete = pending.slice(0, cut + 2)
-          pending = pending.slice(cut + 2)
-          for (const evt of parseSSEChunk(complete)) handleEvent(evt.event, evt.data)
+          const { completeText, remainder } = takeCompleteSSEText(pending)
+          pending = remainder
+          for (const evt of parseSSEChunk(completeText)) handleEvent(evt.event, evt.data)
         }
         pending += decoder.decode()
         if (pending.trim().length > 0) {
           for (const evt of parseSSEChunk(pending + '\n\n')) handleEvent(evt.event, evt.data)
         }
+        if (!completed) fail(t('editor.error.interrupted'))
       } catch {
-        patchStreamingMessage((msg) => ({
-          ...msg,
-          streaming: false,
-          error: t('editor.error.connection'),
-        }))
+        if (!request.controller.signal.aborted) fail(t('editor.error.connection'))
       } finally {
-        patchStreamingMessage((msg) => ({ ...msg, streaming: false }))
-        setStreaming(false)
-        setLocalChatStartedAt(null)
-        setLocalChatPhase('waiting_for_model')
-        // 服务端为准重载（用户/AI 消息落库 + 可能的新版本），成功则撤下叠加层
-        const full = await refresh()
-        if (full) setLive([])
-        flashChange(beforeText, latestTextOf(full))
-        emitSessionChanged(sessionId)
+        flushDelta()
+        reader?.releaseLock()
+        if (isCurrent()) {
+          patchMessage((msg) => ({ ...msg, streaming: false }))
+          // Keep the send lock through reconciliation, so a second click cannot race the refresh.
+          const full = await refresh()
+          if (isCurrent()) {
+            if (full?.session.id === sessionId) {
+              setLive([])
+              flashChange(beforeText, latestTextOf(full))
+            }
+            setStreaming(false)
+            setLocalChatStartedAt(null)
+            setLocalChatPhase('waiting_for_model')
+            activeChat.current = null
+            chatBaselineIds.current = null
+            emitSessionChanged(sessionId)
+          }
+        }
       }
     },
-    [canChat, streaming, sessionId, currentText, refresh, patchStreamingMessage, flashChange, t],
+    [canChat, chatBusy, sessionId, currentText, data?.messages, refresh, flashChange, t],
   )
 
   // ── 恢复版本 ────────────────────────────────────────────────
   const restoreVersion = useCallback(
     async (versionNo: number) => {
       if (!sessionId) throw new Error(t('editor.error.noSession'))
-      const res = await fetch(`/api/sessions/${sessionId}/versions/${versionNo}/restore`, { method: 'POST' })
-      if (!res.ok) {
-        let note = t('editor.error.restore', { status: res.status })
-        try {
-          const errBody = (await res.json()) as { message?: string; error?: string }
-          note = localizeDiagnosticError(t, errBody.error, note)
-        } catch { /* 非 JSON 错误体 */ }
-        throw new Error(note)
+      if (restoreInFlight.current || activeChat.current || chatBusy || mutationLock.current) return
+      const requestId = crypto.randomUUID()
+      restoreInFlight.current = requestId
+      onMutationChange(true)
+      try {
+        const res = await fetch(`/api/sessions/${sessionId}/versions/${versionNo}/restore`, { method: 'POST' })
+        if (!res.ok) {
+          let note = t('editor.error.restore', { status: res.status })
+          try {
+            const errBody = (await res.json()) as { message?: string; error?: string }
+            note = localizeDiagnosticError(t, errBody.error, note)
+          } catch { /* 非 JSON 错误体 */ }
+          throw new Error(note)
+        }
+        if (currentSessionRef.current !== sessionId) return
+        const full = await refresh()
+        if (currentSessionRef.current === sessionId && full?.session.id === sessionId) {
+          flashChange(currentText, latestTextOf(full))
+          emitSessionChanged(sessionId)
+        }
+      } finally {
+        if (restoreInFlight.current === requestId) {
+          restoreInFlight.current = null
+          onMutationChange(false)
+        }
       }
-      await refresh()
-      emitSessionChanged(sessionId)
     },
-    [sessionId, refresh, t],
+    [sessionId, chatBusy, currentText, refresh, flashChange, onMutationChange, t],
   )
 
   const popoverSubmit = useCallback(
@@ -300,49 +402,62 @@ export function EditorSection() {
   const suggestRevision = useCallback(
     async (message: string): Promise<string> => {
       if (!sessionId) throw new Error(t('editor.error.noSession'))
-      const response = await fetch(
-        `/api/sessions/${sessionId}/revision-suggestions`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message }),
-        },
-      )
-      let body: {
-        feedback?: string
-        message?: string
-        error?: string
-      } = {}
+      suggestionController.current?.abort()
+      const controller = new AbortController()
+      suggestionController.current = controller
       try {
-        body = await response.json()
-      } catch {
-        // 非 JSON 错误体由下方统一处理。
-      }
-      if (!response.ok) {
-        throw new Error(
-          localizeDiagnosticError(
-            t,
-            body.error,
-            t('editor.error.suggestion', { status: response.status }),
-          ),
+        const response = await fetch(
+          `/api/sessions/${sessionId}/revision-suggestions`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message }),
+            signal: controller.signal,
+          },
         )
+        const body = await response.json().catch(() => ({})) as {
+          feedback?: string
+          error?: string
+        }
+        if (!response.ok) {
+          throw new Error(localizeDiagnosticError(
+            t, body.error, t('editor.error.suggestion', { status: response.status }),
+          ))
+        }
+        if (!body.feedback?.trim()) throw new Error(t('editor.error.emptySuggestion'))
+        return body.feedback
+      } finally {
+        if (suggestionController.current === controller) suggestionController.current = null
       }
-      if (!body.feedback?.trim()) throw new Error(t('editor.error.emptySuggestion'))
-      return body.feedback
     },
     [sessionId, t],
   )
 
+  const copyText = async () => {
+    const copiedSession = sessionId
+    try {
+      await navigator.clipboard.writeText(currentText)
+      if (currentSessionRef.current !== copiedSession) return
+      setCopyState('copied')
+    } catch {
+      if (currentSessionRef.current !== copiedSession) return
+      setCopyState('error')
+    }
+    if (copyTimer.current) clearTimeout(copyTimer.current)
+    copyTimer.current = setTimeout(() => setCopyState('idle'), 3000)
+  }
+
+  const sourceText = data?.session.source_text ?? ''
+
   return (
-    <div className="grid grid-cols-1 gap-5 lg:col-span-12 lg:grid-cols-12">
+    <div className={`grid min-w-0 grid-cols-1 items-start gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(19rem,0.45fr)] ${className}`}>
       {/* 最终译文 */}
       <Card
-        overline={t('editor.final.overline')}
         title={t('editor.final.title')}
-        className="lg:col-span-7"
+        className="overflow-hidden"
         actions={
           currentVersionNo != null ? (
-            <div className="flex items-center gap-1.5">
+            <div className="flex flex-wrap items-center gap-1.5">
               {data?.final_evidence && (
                 <Badge variant="outline">
                   {localizeEvidenceSummary(t, data.final_evidence.summary)}
@@ -365,60 +480,109 @@ export function EditorSection() {
           ) : undefined
         }
       >
-        <FinalTextPanel
-          text={currentText}
-          emptyHint={
-            data
-              ? t('editor.final.waitingState', { state: data.session.state })
-              : t('editor.final.waitingTask')
-          }
-          readonly={readonly}
-          busy={chatBusy}
-          highlight={highlight}
-          onSubmitEdit={popoverSubmit}
-        />
+        {currentText && (
+          <div className="mb-4 flex flex-wrap items-center gap-2 border-b border-line pb-3">
+            <span className="mr-auto text-xs tabular-nums text-ink-4">
+              {t('editor.final.characters', { count: formatNumber(characterCount) })}
+            </span>
+            {sourceText && (
+              <Button size="sm" variant="ghost" aria-pressed={showSource} onClick={() => setShowSource((value) => !value)}>
+                {t(showSource ? 'editor.source.hide' : 'editor.source.show')}
+              </Button>
+            )}
+            <Button size="sm" variant="outline" onClick={() => void copyText()}>
+              {t(copyState === 'copied' ? 'editor.final.copied' : 'editor.final.copy')}
+            </Button>
+            {copyState === 'error' && (
+              <p role="alert" className="w-full text-xs text-cinnabar">{t('editor.final.copyError')}</p>
+            )}
+          </div>
+        )}
+        <div className={showSource && currentText && sourceText ? 'grid min-w-0 gap-5 xl:grid-cols-2' : ''}>
+          {showSource && currentText && sourceText && (
+            <section className="min-w-0 border-b border-line pb-4 xl:border-b-0 xl:border-r xl:pb-0 xl:pr-5" aria-label={t('editor.source.title')}>
+              <h3 className="mb-3 text-xs font-medium text-ink-3">{t('editor.source.title')}</h3>
+              <div className="max-h-64 overflow-y-auto whitespace-pre-wrap break-words font-serif text-[0.9375rem] leading-8 text-ink-3 xl:max-h-[65vh]">
+                {sourceText}
+              </div>
+            </section>
+          )}
+          <div className="min-w-0">
+            {showSource && currentText && sourceText && (
+              <h3 className="mb-3 text-xs font-medium text-pine">{t('editor.final.title')}</h3>
+            )}
+            <FinalTextPanel
+              key={sessionId}
+              text={currentText}
+              emptyHint={data ? t('editor.final.defaultEmpty') : t('editor.final.waitingTask')}
+              readonly={readonly}
+              busy={chatBusy || mutating}
+              highlight={highlight}
+              onSubmitEdit={popoverSubmit}
+            />
+          </div>
+        </div>
+        {currentText && canChat && (
+          <p className="mt-4 border-t border-line pt-3 text-xs leading-5 text-ink-4">{t('editor.final.selectionHint')}</p>
+        )}
       </Card>
 
       {/* 右侧栏：对话修订 + 版本历史 */}
-      <div className="flex flex-col gap-5 lg:col-span-5">
-        <Card overline={t('editor.chat.overline')} title={t('editor.chat.title')} padded={false}>
+      <div className="flex min-w-0 flex-col gap-3">
+        <Card title={t('editor.chat.title')} padded={false}>
+          {chatError && (
+            <p role="alert" className="mx-4 mt-3 rounded-md border border-cinnabar/20 bg-cinnabar/5 px-3 py-2 text-xs leading-5 text-cinnabar">
+              {chatError}
+            </p>
+          )}
           <ChatPanel
+            key={sessionId}
             messages={messages}
             streaming={chatBusy}
             remoteStreaming={remoteChatActive}
             activityStartedAt={chatStartedAt}
             activityPhase={chatPhase}
             canChat={canChat}
+            disabled={mutating}
             disabledHint={disabledHint}
             onSend={(msg) => void sendChat(msg)}
             onSuggest={suggestRevision}
           />
         </Card>
 
-        <Card overline={t('editor.versions.overline')} title={t('editor.versions.title')} padded={false}>
+        <details className="group overflow-hidden rounded-md border border-line bg-paper-raise">
+          <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-3 text-sm font-medium text-ink-2 hover:bg-paper-sink/50">
+            <span className="text-ink-4 transition-transform group-open:rotate-90" aria-hidden>▸</span>
+            <span className="min-w-0 flex-1">{t('editor.tools.summary')}</span>
+            {versions.length > 0 && <Badge variant="subtle">{formatNumber(versions.length)}</Badge>}
+          </summary>
           <VersionHistory
+            key={sessionId}
             versions={currentVersion ? versions : []}
             currentVersionNo={currentVersionNo}
+            busy={chatBusy || readonly || mutating}
             onRestore={restoreVersion}
           />
           <RevisionEvidence
+            key={sessionId}
             sessionId={sessionId}
             patches={data?.patches ?? []}
             currentVersionId={currentVersion?.id ?? null}
+            disabled={chatBusy || readonly || mutating}
+            onBusyChange={onMutationChange}
             onChanged={refresh}
           />
-        </Card>
+        </details>
 
         <DisagreementMap
+          key={sessionId}
           sessionId={sessionId}
           finalVersionId={currentVersion?.id ?? null}
           candidateRevision={candidateRevision}
           currentText={currentText}
           canAdopt={canChat}
-          busy={chatBusy}
-          onAdopt={(instruction, selection) => {
-            void sendChat(instruction, selection)
-          }}
+          busy={chatBusy || mutating}
+          onAdopt={popoverSubmit}
         />
       </div>
     </div>

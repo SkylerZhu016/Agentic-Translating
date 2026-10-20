@@ -1,6 +1,9 @@
 import type Database from 'better-sqlite3'
 import { chatCompletion, isAsyncIterable } from '../llm/client'
-import { parseSemanticAgentOutput } from '../protocol/semantic-output'
+import {
+  parseSemanticAgentOutput,
+  semanticOutputFormatForPrompt,
+} from '../protocol/semantic-output'
 import { resolveCompletionTokenBudget } from '../guards/tokens'
 import { beginBestEffortLlmCall } from './llm-call-ledger'
 import { currentRuntimeEndpoint } from './runtime-endpoint-credentials'
@@ -104,8 +107,17 @@ export async function runIndependentAgentTest(input: {
       )
       throw new Error('empty_response')
     }
+    let semantic
+    try {
+      semantic = parseSemanticAgentOutput(response.content, {
+        format: semanticOutputFormatForPrompt(messages.system),
+      })
+    } catch (error) {
+      ledger?.fail(error, response.usage)
+      throw error
+    }
     ledger?.complete(response.usage)
-    return parseSemanticAgentOutput(response.content)
+    return semantic
   } catch (error) {
     ledger?.fail(error)
     throw error

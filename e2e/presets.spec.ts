@@ -44,7 +44,7 @@ async function contract(
     agentBindingOverrides: {},
     mainAgentBinding: binding,
     editingAgentBinding: binding,
-    promptBundleVersion: 1,
+    promptBundleVersion: (await (await request.get('/api/direction-prompt-bundles?direction=' + direction)).json()).version,
     maxAgentCalls: 5,
     batchConcurrency: 2,
     constraints: { preserveParagraphs: true },
